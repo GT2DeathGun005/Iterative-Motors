@@ -154,6 +154,7 @@ def flatten_state(state_dict: Dict) -> np.ndarray:
 def main():
     parser = argparse.ArgumentParser(description="Data Collection for TORCS")
     parser.add_argument("--episodes", type=int, default=5, help="Number of episodes to record")
+    parser.add_argument("--steps", type=int, default=100000, help="Max steps per episode")
     parser.add_argument("--output", type=str, default="human_expert.h5", help="Output HDF5 file")
     args = parser.parse_args()
 
@@ -162,7 +163,7 @@ def main():
     
     # Inizializza l'ambiente TORCS con rendering attivo (vision=False è solo per le telecamere, 
     # di solito il gioco apre la finestra 3D da solo)
-    env = TorcsEnv(vision=False, throttle=True, gear_change=True)
+    env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=False)
     
     print("Inizio fase di Data Collection.")
     print("Premi CTRL+C nel terminale per fermare e salvare anticipatamente.")
@@ -180,7 +181,7 @@ def main():
             state_vec = flatten_state(ob)
             
             step_count = 0
-            while True:
+            while step_count < args.steps:
                 step_count += 1
                 action = controller.get_action()
                 
