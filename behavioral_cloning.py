@@ -1,187 +1,354 @@
 """
-Modulo di Behavioral Cloning (Imitation Learning)
-Addestra una Policy Network utilizzando le dimostrazioni umane raccolte in data_collection.py.
-Ottimizzato con split di validazione, early stopping e salvataggio dei pesi per il warm start del SAC.
+Behavioral Cloning (Imitation Learning) — TORCS Giro Secco
+
+Addestra una PolicyNetwork sulle dimostrazioni umane (HDF5) per il warm start del SAC.
+
+Caratteristiche:
+  - Supporto multi-file: accetta sia un singolo .h5 sia una directory di lap_*.h5
+  - Normalizzazione corretta delle azioni per Tanh output [-1, 1]
+  - Sanity check preventivi (NaN, Inf, gruppi mancanti)
+  - Device CPU/CUDA coerente in tutta la pipeline
+  - Early stopping con validation split
+
+Mapping delle azioni:
+  [0] steering  [-1, 1]  → diretto (già in range Tanh)
+  [1] accel     [0, 1]   → scalato a [-1, 1] con x*2-1
+  [2] brake     [0, 1]   → scalato a [-1, 1] con x*2-1
+  [3] gear      [0, 6]   → scalato a [-1, 1] con (x/3)-1
+
+Inversione (per inferenza):
+  steering = output[0]
+  accel    = (output[1] + 1) / 2
+  brake    = (output[2] + 1) / 2
+  gear     = round((output[3] + 1) * 3)   → clamp [0, 6]
 """
 
 import os
+import glob
 import argparse
 import numpy as np
 import h5py
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, random_split
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Dataset HDF5
+# ──────────────────────────────────────────────────────────────────────
 
 class TorcsHDF5Dataset(Dataset):
-    """Dataset personalizzato per leggere in modo efficiente i chunk HDF5."""
+    """Dataset da un singolo file HDF5 con gruppi 'states' e 'actions'.
+
+    Esegue sanity check all'inizializzazione:
+      - Verifica presenza dei gruppi richiesti
+      - Verifica assenza di NaN e Inf
+      - Clamp del gear a [0, 6] (esclude retromarcia)
+    """
+
     def __init__(self, file_path: str):
         super().__init__()
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File dataset non trovato: {file_path}")
-            
+
         self.file_path = file_path
-        # Apriamo in read-only. Usiamo in-memory loading per dataset piccoli (es. < 1-2GB)
-        # per evitare colli di bottiglia I/O.
+
         with h5py.File(self.file_path, 'r') as h5f:
-            self.states = torch.tensor(h5f['states'][:], dtype=torch.float32)
-            self.actions = torch.tensor(h5f['actions'][:], dtype=torch.float32)
-            
+            # ── Verifica gruppi ──
+            if 'states' not in h5f:
+                raise KeyError(f"Gruppo 'states' mancante in {file_path}")
+            if 'actions' not in h5f:
+                raise KeyError(f"Gruppo 'actions' mancante in {file_path}")
+
+            states_np = h5f['states'][:]
+            actions_np = h5f['actions'][:]
+
+            # ── Sanity check numerici ──
+            if np.any(np.isnan(states_np)):
+                raise ValueError(f"NaN rilevati in 'states' di {file_path}")
+            if np.any(np.isinf(states_np)):
+                raise ValueError(f"Inf rilevati in 'states' di {file_path}")
+            if np.any(np.isnan(actions_np)):
+                raise ValueError(f"NaN rilevati in 'actions' di {file_path}")
+            if np.any(np.isinf(actions_np)):
+                raise ValueError(f"Inf rilevati in 'actions' di {file_path}")
+
+            # ── Clamp gear a [0, 6] (ignora retromarcia -1) ──
+            actions_np[:, 3] = np.clip(actions_np[:, 3], 0.0, 6.0)
+
+            self.states = torch.tensor(states_np, dtype=torch.float32)
+            self.actions = torch.tensor(actions_np, dtype=torch.float32)
+
         self.length = self.states.shape[0]
-        
+
     def __len__(self) -> int:
         return self.length
 
     def __getitem__(self, idx: int):
         return self.states[idx], self.actions[idx]
 
+
+def load_dataset(path: str) -> Dataset:
+    """Carica un dataset da un file .h5 o da una directory di file lap_*.h5.
+
+    Se `path` è una directory, concatena tutti i file lap_*.h5 trovati.
+    Se `path` è un singolo file, lo carica direttamente.
+    """
+    if os.path.isdir(path):
+        h5_files = sorted(glob.glob(os.path.join(path, "lap_*.h5")))
+        if not h5_files:
+            raise FileNotFoundError(
+                f"Nessun file lap_*.h5 trovato in {path}"
+            )
+        print(f"  Trovati {len(h5_files)} file HDF5 nella directory:")
+        datasets = []
+        total_samples = 0
+        for f in h5_files:
+            ds = TorcsHDF5Dataset(f)
+            datasets.append(ds)
+            total_samples += len(ds)
+            print(f"    ✓ {os.path.basename(f)}: {len(ds)} campioni")
+        print(f"  Totale: {total_samples} campioni")
+        return ConcatDataset(datasets), total_samples
+    else:
+        ds = TorcsHDF5Dataset(path)
+        print(f"  Caricato {os.path.basename(path)}: {len(ds)} campioni")
+        return ds, len(ds)
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Policy Network
+# ──────────────────────────────────────────────────────────────────────
+
 class PolicyNetwork(nn.Module):
+    """Rete Actor per Behavioral Cloning: stato → azione continua.
+
+    Architettura feed-forward con LayerNorm e output Tanh [-1, 1].
+    Struttura del Sequential (per riferimento nel warm start SAC):
+      net.0: Linear(state_dim → hidden)
+      net.1: LayerNorm(hidden)
+      net.2: ReLU
+      net.3: Linear(hidden → hidden)
+      net.4: LayerNorm(hidden)
+      net.5: ReLU
+      net.6: Linear(hidden → action_dim)
+      net.7: Tanh
     """
-    Rete Neurale Actor (Policy) che mappa lo stato nell'azione continua.
-    Architettura feed-forward ottimizzata per state vectors continui.
-    Output: [steering, accel, brake, gear]
-    """
-    def __init__(self, state_dim: int = 29, action_dim: int = 4, hidden_size: int = 256):
+
+    def __init__(self, state_dim: int = 29, action_dim: int = 4,
+                 hidden_size: int = 256):
         super(PolicyNetwork, self).__init__()
-        
+
         self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, action_dim),
-            nn.Tanh()  # Tanh comprime l'output tra -1 e 1
+            nn.Linear(state_dim, hidden_size),       # 0
+            nn.LayerNorm(hidden_size),                # 1
+            nn.ReLU(),                                # 2
+            nn.Linear(hidden_size, hidden_size),      # 3
+            nn.LayerNorm(hidden_size),                # 4
+            nn.ReLU(),                                # 5
+            nn.Linear(hidden_size, action_dim),       # 6
+            nn.Tanh()                                 # 7
         )
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        """
-        Calcola l'azione. NOTA: L'output di Tanh è in [-1, 1].
-        L'azione reale richiede un mapping dipendente dall'asse (es: accel [0,1], steer [-1,1]).
-        Nel behavior cloning mappiamo semplicemente sul target, ma il wrapper RL dovrà scalare l'azione.
-        """
         return self.net(state)
 
+
+# ──────────────────────────────────────────────────────────────────────
+#  Normalizzazione azioni (target mapping per Tanh)
+# ──────────────────────────────────────────────────────────────────────
+
+def normalize_actions(actions: torch.Tensor) -> torch.Tensor:
+    """Normalizza il tensore azioni dal range naturale al range Tanh [-1, 1].
+
+    Input ranges:
+      [0] steering: [-1, 1]  → invariato
+      [1] accel:    [0, 1]   → [-1, 1]  con x*2-1
+      [2] brake:    [0, 1]   → [-1, 1]  con x*2-1
+      [3] gear:     [0, 6]   → [-1, 1]  con (x/3)-1
+
+    Gear mapping: 0→-1.0, 1→-0.667, 2→-0.333, 3→0.0, 4→0.333, 5→0.667, 6→1.0
+    Tutti i valori sono raggiungibili da Tanh.
+    """
+    norm = actions.clone()
+    norm[:, 1] = actions[:, 1] * 2.0 - 1.0    # accel [0,1] → [-1,1]
+    norm[:, 2] = actions[:, 2] * 2.0 - 1.0    # brake [0,1] → [-1,1]
+    norm[:, 3] = actions[:, 3] / 3.0 - 1.0    # gear  [0,6] → [-1,1]
+    return norm
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Trainer
+# ──────────────────────────────────────────────────────────────────────
+
 class BehaviorCloningTrainer:
-    def __init__(self, model: nn.Module, dataset: TorcsHDF5Dataset, 
-                 batch_size: int = 128, val_split: float = 0.2, 
+    """Addestra la PolicyNetwork con MSE loss su azioni normalizzate.
+
+    Features:
+      - Validation split con seed fisso per riproducibilità
+      - Early stopping basato sulla val loss
+      - Salvataggio automatico del miglior checkpoint
+    """
+
+    def __init__(self, model: nn.Module, dataset: Dataset,
+                 batch_size: int = 128, val_split: float = 0.2,
                  lr: float = 3e-4, device: str = "cpu"):
-        self.model = model.to(device)
-        self.device = device
+        self.device = torch.device(device)
+        self.model = model.to(self.device)
+        print(f"  Modello spostato su: {self.device}")
+
         self.criterion = nn.MSELoss()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=1e-5)
-        
-        # Validation split
-        val_size = int(len(dataset) * val_split)
-        train_size = len(dataset) - val_size
-        
+        self.optimizer = optim.Adam(
+            self.model.parameters(), lr=lr, weight_decay=1e-5
+        )
+
+        # ── Validation split ──
+        total = len(dataset)
+        val_size = int(total * val_split)
+        train_size = total - val_size
+
         self.train_dataset, self.val_dataset = random_split(
-            dataset, [train_size, val_size], 
+            dataset, [train_size, val_size],
             generator=torch.Generator().manual_seed(42)
         )
-        
-        self.train_loader = DataLoader(self.train_dataset, batch_size=batch_size, shuffle=True)
-        self.val_loader = DataLoader(self.val_dataset, batch_size=batch_size, shuffle=False)
-        
+
+        self.train_loader = DataLoader(
+            self.train_dataset, batch_size=batch_size,
+            shuffle=True, num_workers=2, pin_memory=(device != "cpu")
+        )
+        self.val_loader = DataLoader(
+            self.val_dataset, batch_size=batch_size,
+            shuffle=False, num_workers=2, pin_memory=(device != "cpu")
+        )
+
         self.best_val_loss = float('inf')
         self.patience_counter = 0
+
+        print(f"  Split: {train_size} train / {val_size} val")
 
     def train_epoch(self) -> float:
         self.model.train()
         total_loss = 0.0
-        
+
         for states, targets in self.train_loader:
-            states, targets = states.to(self.device), targets.to(self.device)
-            
-            # Map targets to [-1, 1] for Tanh if they are [0, 1]
-            # Assumiamo che il dataset abbia:
-            # - steer: [-1, 1]
-            # - accel: [0, 1] -> scalato a [-1, 1]
-            # - brake: [0, 1] -> scalato a [-1, 1]
-            # - gear: da normalizzare
-            # Per semplicità, qui l'MSE agisce direttamente sui target come sono,
-            # ma è meglio avere i target normalizzati in [-1, 1].
-            # Lo facciamo qui al volo:
-            targets_norm = targets.clone()
-            targets_norm[:, 1] = targets[:, 1] * 2.0 - 1.0  # accel da [0,1] a [-1,1]
-            targets_norm[:, 2] = targets[:, 2] * 2.0 - 1.0  # brake da [0,1] a [-1,1]
-            # Normalizziamo gear (0..6) tra -1 e 1
-            targets_norm[:, 3] = (targets[:, 3] / 3.0) - 1.0 
-            
+            states = states.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
+
+            # Normalizza i target nel range [-1, 1] per il Tanh
+            targets_norm = normalize_actions(targets)
+
             self.optimizer.zero_grad()
             predictions = self.model(states)
             loss = self.criterion(predictions, targets_norm)
-            
             loss.backward()
             self.optimizer.step()
-            
+
             total_loss += loss.item()
-            
+
         return total_loss / len(self.train_loader)
 
     def validate(self) -> float:
         self.model.eval()
         total_loss = 0.0
-        
+
         with torch.no_grad():
             for states, targets in self.val_loader:
-                states, targets = states.to(self.device), targets.to(self.device)
-                
-                targets_norm = targets.clone()
-                targets_norm[:, 1] = targets[:, 1] * 2.0 - 1.0
-                targets_norm[:, 2] = targets[:, 2] * 2.0 - 1.0
-                targets_norm[:, 3] = (targets[:, 3] / 3.0) - 1.0 
-                
+                states = states.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+
+                targets_norm = normalize_actions(targets)
                 predictions = self.model(states)
                 loss = self.criterion(predictions, targets_norm)
                 total_loss += loss.item()
-                
+
         return total_loss / len(self.val_loader)
 
-    def train(self, max_epochs: int = 200, patience: int = 15, checkpoint_path: str = "bc_policy.pth"):
-        print(f"Inizio training Behavior Cloning su {self.device}...")
-        
+    def train(self, max_epochs: int = 200, patience: int = 15,
+              checkpoint_path: str = "train_set/bc_policy.pth"):
+        print(f"\n  Inizio training Behavioral Cloning su {self.device}...")
+        print(f"  Max epochs: {max_epochs} | Patience: {patience}\n")
+
         for epoch in range(max_epochs):
             train_loss = self.train_epoch()
             val_loss = self.validate()
-            
-            print(f"Epoch {epoch+1:03d}/{max_epochs} | Train MSE: {train_loss:.5f} | Val MSE: {val_loss:.5f}")
-            
+
+            improved = ""
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.patience_counter = 0
                 torch.save(self.model.state_dict(), checkpoint_path)
-                print(f"  -> Model improved. Saved checkpoint to {checkpoint_path}")
+                improved = " ★ saved"
             else:
                 self.patience_counter += 1
-                if self.patience_counter >= patience:
-                    print(f"Early stopping triggerato all'epoca {epoch+1}. Miglior Val Loss: {self.best_val_loss:.5f}")
-                    break
+
+            print(
+                f"  Epoch {epoch+1:03d}/{max_epochs} | "
+                f"Train MSE: {train_loss:.6f} | "
+                f"Val MSE: {val_loss:.6f}{improved}"
+            )
+
+            if self.patience_counter >= patience:
+                print(
+                    f"\n  Early stopping all'epoca {epoch+1}. "
+                    f"Miglior Val Loss: {self.best_val_loss:.6f}"
+                )
+                break
+
+        print(f"\n  Training completato. Miglior checkpoint: {checkpoint_path}")
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Main
+# ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Behavior Cloning for TORCS agent")
-    parser.add_argument("--dataset", type=str, default="human_expert.h5", help="Path to HDF5 dataset")
-    parser.add_argument("--epochs", type=int, default=150, help="Max training epochs")
+    parser = argparse.ArgumentParser(
+        description="Behavioral Cloning per agente TORCS (Giro Secco)"
+    )
+    parser.add_argument(
+        "--dataset", type=str, default="train_set",
+        help="Path al dataset HDF5 (file singolo o directory di lap_*.h5)"
+    )
+    parser.add_argument("--epochs", type=int, default=200, help="Max epoche")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--output", type=str, default="bc_policy.pth", help="Output model weights file")
-    
+    parser.add_argument(
+        "--output", type=str, default="train_set/bc_policy.pth",
+        help="Path di output per i pesi del modello"
+    )
     args = parser.parse_args()
-    
+
+    # ── Device ──
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    print(f"Caricamento dataset {args.dataset}...")
-    dataset = TorcsHDF5Dataset(args.dataset)
-    print(f"Dataset caricato: {len(dataset)} campioni totali.")
-    
-    # State_dim e action_dim devono corrispondere ai dati salvati
-    state_dim = dataset.states.shape[1]
-    action_dim = dataset.actions.shape[1]
-    print(f"Dimensioni rilevate - State: {state_dim}, Action: {action_dim}")
-    
+    print(f"\n{'=' * 64}")
+    print(f"  🧠 BEHAVIORAL CLONING — TORCS Giro Secco")
+    print(f"  Device: {device}")
+    if device == "cuda":
+        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    print(f"{'=' * 64}\n")
+
+    # ── Caricamento dataset ──
+    print("  Caricamento dataset...")
+    dataset, total_samples = load_dataset(args.dataset)
+
+    # ── Rileva dimensioni ──
+    # Accedi al primo campione per ottenere le dimensioni
+    sample_state, sample_action = dataset[0]
+    state_dim = sample_state.shape[0]
+    action_dim = sample_action.shape[0]
+    print(f"  Dimensioni: state={state_dim}, action={action_dim}")
+
+    # ── Assicurati che la directory di output esista ──
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+
+    # ── Modello ──
     model = PolicyNetwork(state_dim=state_dim, action_dim=action_dim)
-    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Parametri totali: {total_params:,}")
+
+    # ── Trainer ──
     trainer = BehaviorCloningTrainer(
         model=model,
         dataset=dataset,
@@ -189,9 +356,12 @@ def main():
         lr=args.lr,
         device=device
     )
-    
+
     trainer.train(max_epochs=args.epochs, checkpoint_path=args.output)
-    print("Addestramento Behavior Cloning completato.")
+
+    print("\n  ✅ Addestramento Behavioral Cloning completato.")
+    print(f"  Pesi salvati in: {args.output}\n")
+
 
 if __name__ == "__main__":
     main()
