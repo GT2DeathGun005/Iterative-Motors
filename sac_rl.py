@@ -32,7 +32,7 @@ from torch.distributions import Normal
 from collections import deque
 from datetime import datetime
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../gym_torcs')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'gym_torcs')))
 
 try:
     from gym_torcs import TorcsEnv

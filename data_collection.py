@@ -24,7 +24,7 @@ from datetime import datetime
 from typing import Optional
 
 # Aggiungo gym_torcs al path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../gym_torcs')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'gym_torcs')))
 
 try:
     from gym_torcs import TorcsEnv
