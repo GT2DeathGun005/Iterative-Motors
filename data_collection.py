@@ -28,8 +28,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'gym_
 
 try:
     from gym_torcs import TorcsEnv
-except ImportError:
-    print("ERRORE FATALE: gym_torcs non trovato. Assicurati che il modulo sia nella directory corretta.")
+except ImportError as e:
+    print(f"ERRORE FATALE: Impossibile importare gym_torcs o una sua dipendenza.")
+    print(f"Dettagli errore: {e}")
     sys.exit(1)
 
 # ──────────────────────────────────────────────────────────────────────
