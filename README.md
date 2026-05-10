@@ -115,59 +115,106 @@ Il training usa:
 - **Early stopping** (patience=15 epoche) per prevenire overfitting
 - **GPU** automaticamente se disponibile (testato su RTX 4060 8GB)
 
-### Fase 3: SAC Fine-Tuning con RLPD (RL)
+### Fase 3: SAC Fine-Tuning con CPI (RL)
 
-Il training RL usa **RLPD** (Reinforcement Learning with Prior Data) per fine-tuning dei pesi BC senza catastrophic forgetting.
+Il training RL usa un approccio **Conservative Policy Improvement (CPI)** per fine-tuning dei pesi BC senza catastrophic forgetting.
 
 ```bash
-python sac_rl.py \
+# Training headless (raccomandato)
+nohup xvfb-run -a -s "-screen 0 800x600x24" python sac_rl.py \
   --episodes 1000 \
+  --max_steps 5000 \
   --bc_weights train_set/checkpoints/bc_policy.pth \
   --demo_dir train_set/laps \
   --target_time 71.038 \
-  --batch_size 256
+  --critic_warmup_steps 10000 \
+  --actor_freeze_episodes 50 \
+  > /tmp/sac_stdout.log 2>&1 &
 ```
 
-**Perché RLPD?** Il SAC vanilla distrugge i pesi BC in pochi update, perché:
-1. Il replay buffer parte vuoto e si riempie solo di dati di crash
-2. Il critic non ha riferimenti di "buona guida"
-3. Gli update dell'actor sono troppo aggressivi
+#### Il Problema del Catastrophic Forgetting
 
-**Soluzioni implementate**:
+Durante lo sviluppo, l'approccio SAC vanilla con BC regularization ha mostrato un **pattern di fallimento sistematico**:
 
-| Tecnica | Descrizione |
-|---------|-------------|
-| **Pre-fill buffer** | Le 71k transizioni umane vengono caricate nel replay buffer prima del training |
-| **BC Regularization** | Un termine `λ_bc · MSE(actor, BC)` nella loss dell'actor impedisce di allontanarsi troppo dalla policy BC |
-| **λ_bc decay** | Il coefficiente BC si riduce automaticamente quando il best lap time si avvicina al miglior tempo umano (71.038s) |
-| **Actor LR separato** | Actor: `1e-5` (lento), Critic: `3e-4` (veloce) — preserva i pesi BC durante l'apprendimento |
+1. **Critic non addestrato → gradienti distruttivi**: il Critic inizializzato casualmente fornisce gradienti senza significato all'Actor, corrompendo i pesi BC in pochi update.
+2. **Entropia SAC → esplosione del rumore**: il termine `α · log π` nella loss SAC spinge il `log_std` dell'Actor verso l'alto, aumentando l'esplorazione fino a distruggere la policy.
+3. **Dominanza del SAC loss**: anche con `bc_lambda=1.0`, la componente SAC (`α·log_pi - Q`) dominava i gradienti rispetto alla BC regularization.
+
+#### Soluzione: Training a Due Fasi con CPI
+
+L'architettura di training è stata ristrutturata in **fasi sequenziali** per garantire che ogni componente sia pronto prima di influenzare gli altri:
+
+```mermaid
+graph LR
+    A["🧠 Offline Critic\nPre-training\n(10K step su demo)"] --> B["❄️ Fase FREEZE\n(50 episodi)\nActor congelato\nCritic impara online"]
+    B --> C["🔥 Fase TRAIN\n(ep 51+)\nCPI: BC + 0.01·Q"]
+    style A fill:#4a90d9,color:#fff
+    style B fill:#7cb342,color:#fff
+    style C fill:#e53935,color:#fff
+```
+
+| Fase | Episodi | Actor | Critic | Scopo |
+|------|---------|-------|--------|-------|
+| **Offline Warmup** | — (10K step) | Congelato | Si addestra su demo | Il Critic impara una Q-function base dai dati umani |
+| **FREEZE** | 1–50 | Congelato (pura BC, deterministico) | Si addestra online | Il Critic osserva la BC guidare in ambiente reale |
+| **TRAIN** | 51+ | Advantage-Weighted CPI | Si addestra online | L'Actor migliora selettivamente guidato dal Critic |
+
+#### Advantage-Weighted Conservative Policy Improvement (CPI)
+
+Nella fase TRAIN, la loss dell'Actor è:
+
+```
+# Advantage: quanto l'azione dell'Actor è migliore di quella nel buffer
+advantage = Q(actor_action) - Q(buffer_action)
+positive_adv = clamp(advantage, min=0)       # solo miglioramenti
+
+policy_loss = MSE(actor, bc_model)  +  0.01 · (-positive_adv / Q_scale)
+              ┗━━━━━ BC loss ━━━━━┛    ┗━━━━ Q improvement filtrato ━━━━┛
+              Obiettivo primario:       Attivo SOLO quando l'Actor
+              "resta uguale alla BC"    fa meglio del buffer.
+                                       Normalizzato per la scala del Q.
+```
+
+**Differenze chiave rispetto al SAC standard**:
+- ❌ Nessun termine di entropia → zero pressione esplorativa casuale
+- ❌ Nessun aggiornamento di `log_std` → rumore fisso a `std ≈ 0.007`
+- ✅ BC loss è l'obiettivo primario, non un regularizer
+- ✅ Q-value è un **consulente selettivo**: può solo migliorare, non degradare
+- ✅ Advantage filtering previene il drift a lungo termine
+- ✅ Normalizzazione Q-scale previene instabilità per cambio di scala del Critic
+
+#### Isolamento dei Gradienti
+
+Durante tutte le fasi di pre-training e freeze, i parametri dell'Actor sono categoricamente esclusi dai gradienti:
+
+- **`log_std_linear`**: permanentemente escluso dall'optimizer (non viene mai aggiornato)
+- **Fase FREEZE / Offline**: `requires_grad = False` su tutti i parametri Actor durante `update_critic_only()`
 
 **Opzioni principali**:
 | Flag | Default | Descrizione |
 |------|---------|-------------|
+| `--episodes` | `1000` | Numero totale di episodi |
+| `--max_steps` | `5000` | Step massimi per episodio (~100s a 50Hz) |
 | `--target_time` | `75.0` | Tempo target iniziale |
 | `--bc_weights` | `train_set/checkpoints/bc_policy.pth` | Pesi BC per warm start |
 | `--demo_dir` | `train_set/laps` | Directory demo per pre-fill buffer |
 | `--actor_lr` | `1e-5` | LR actor (basso per preservare BC) |
 | `--critic_lr` | `3e-4` | LR critic |
-| `--bc_lambda` | `1.0` | Coefficiente regolarizzazione BC |
+| `--critic_warmup_steps` | `10000` | Step di pre-training offline del Critic |
+| `--actor_freeze_episodes` | `50` | Episodi con Actor congelato (solo Critic si aggiorna) |
+| `--bc_lambda` | `1.0` | Coefficiente BC (usato nel decay schedulato) |
+| `--bc_decay_episodes` | `500` | Episodi per il decay lineare di `bc_lambda` |
 | `--warmup_steps` | `5000` | Campioni nel buffer prima degli update |
-| `--relaunch_every` | `50` | Rilancia TORCS ogni N episodi (previene memory leak) |
+| `--relaunch_every` | `20` | Rilancia TORCS ogni N episodi |
+| `--checkpoint_every` | `50` | Salva checkpoint ogni N episodi |
 | `--resume` | `""` | Path a un checkpoint per riprendere il training |
 
 **Riprendere una sessione interrotta**:
 ```bash
-# Riprende dal checkpoint più recente (sopravvive alla chiusura del terminale)
 nohup xvfb-run -a -s "-screen 0 800x600x24" python sac_rl.py \
   --episodes 1000 \
   --resume train_set/checkpoints/sac_checkpoint_latest.pth \
   --target_time 71.038 \
-  > /dev/null 2>&1 &
-
-# Oppure da un checkpoint specifico
-nohup xvfb-run -a -s "-screen 0 800x600x24" python sac_rl.py \
-  --episodes 1000 \
-  --resume train_set/checkpoints/sac_checkpoint_ep0150.pth \
   > /dev/null 2>&1 &
 ```
 
@@ -240,24 +287,43 @@ env -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE \
 
 ## 🎯 Design della Reward Function (SAC)
 
-La reward è stata progettata specificamente per il **giro secco** e per incentivare l'agente a limare i decimi:
+La reward è stata progettata per il **giro secco** e bilanciata per incentivare fortemente velocità e progresso,
+riducendo le penalità conservative che nelle prime iterazioni causavano stallo dell'agente.
 
 ### Reward per Step
 
 ```
-R_step = 0.1 · Δ_distRaced          (progresso sulla pista)
-       + 0.005 · max(0, speedX)     (bonus velocità)
-       - 2.0 · trackPos²            (penalità centro-pista, soft)
-       - 5.0 · |angle|              (penalità disallineamento)
+Se speedX ≥ 0 (marcia avanti):
+  R_step = 1.0 · Δ_distRaced           (progresso sulla pista)
+         + 0.05 · speedX               (bonus velocità frontale)
+         - 1.0 · trackPos²             (penalità centro-pista, soft)
+         - 1.5 · |angle|               (penalità disallineamento)
+         - 0.1                          (time penalty: costo per step)
+
+Se speedX < 0 (retromarcia):
+  R_step = 0                            (nessun progress/speed bonus)
+         - 0.1 · |speedX|              (penalità proporzionale alla velocità)
+         - 1.0 · trackPos²
+         - 1.5 · |angle|
+         - 0.1                          (time penalty)
 ```
+
+> **Time penalty**: la penalità costante di `-0.1` per step rende lo stallo **intrinsecamente costoso**
+> senza necessità di euristiche di terminazione anticipata. A 100 km/h i bonus di velocità
+> e progresso dominano ampiamente (+5.5/step netto), mentre a 0 km/h la time penalty
+> accumula -0.1/step indefinitamente.
 
 ### Terminazione Episodio
 
 | Condizione | Penalità | Motivazione |
 |-----------|----------|-------------|
-| `\|trackPos\| > 1.0` (fuori pista) | -500 | L'agente deve restare in pista |
-| `cos(angle) < 0` (spin/retromarcia) | -500 | L'auto si è girata |
-| Velocità < 5 km/h per >100 step | -200 | Stallo (bloccato contro un muro) |
+| `\|trackPos\| > 1.0` (fuori pista) | -100 | Terminazione fisica: l'auto è uscita |
+| `cos(angle) < 0` (spin/retromarcia) | -100 | L'auto si è girata completamente |
+| `max_steps` raggiunto (5000 = 100s) | — | Safety cap, nessuna penalità aggiuntiva |
+
+> **Nota**: le terminazioni artificiali per stallo (speedX < soglia) e anti-looping
+> (finestra mobile su distRaced) sono state **rimosse** dopo aver verificato che causavano
+> troncamenti dell'orizzonte incompatibili con i tempi fisici di accelerazione da fermo a 50Hz.
 
 ### Bonus/Penalità Completamento Giro (basato su tempi umani)
 
@@ -272,7 +338,7 @@ Soglie calibrate sui **session_logs** del pilota umano:
 | `77 – 82s` | -50 | Media penalità: poco più lento del worst umano |
 | `> 82s` | -100 | Alta penalità: molto più lento del worst umano |
 
-Il `best_time` interno viene aggiornato automaticamente ogni volta che l'agente batte il proprio record. Questo crea un **curriculum implicito**: all'inizio l'agente è premiato per completare il giro, poi gradualmente la pressione si sposta verso la velocità pura.
+Il `best_time` interno viene aggiornato automaticamente ogni volta che l'agente batte il proprio record.
 
 ---
 
@@ -291,23 +357,39 @@ La rete usa `Tanh` in output (range `[-1, 1]`). La normalizzazione delle azioni 
 
 ---
 
-## 🔧 Bug Risolti rispetto alla versione precedente
+## 🔧 Problemi Risolti durante lo Sviluppo
+
+### Pipeline di Data Collection e BC
 
 1. **Gear mapping**: Il gear nel vettore azioni viene ora correttamente normalizzato in `[-1, 1]` per il Tanh. La versione precedente usava `(gear/3)-1` che produceva `-1.33` per la retromarcia, valore irraggiungibile dal Tanh.
 
 2. **Warm-up trigger**: I grilletti L2/R2 hanno protezione warm-up con flag di inizializzazione per prevenire spike spuri alla prima lettura su Linux/Pygame.
 
-3. **Deadzone sterzo**: Aggiunta deadzone configurabile sullo sterzo per filtrare il micro-drift dello stick analogico e rendere la guida più stabile.
+3. **Deadzone sterzo**: Aggiunta deadzone configurabile sullo sterzo per filtrare il micro-drift dello stick analogico.
 
-4. **Flattening sicuro**: `flatten_state()` usa `.get()` con default per ogni chiave del dizionario, evitando crash su sensori mancanti.
+4. **Flattening sicuro**: `flatten_state()` usa `.get()` con default per ogni chiave del dizionario.
 
-5. **Framerate dinamico**: Sostituito `time.sleep(0.02)` fisso con calcolo basato su `time.perf_counter()` per mantenere 50Hz stabili indipendentemente dal tempo di elaborazione del loop.
+5. **Framerate dinamico**: Sostituito `time.sleep(0.02)` fisso con calcolo basato su `time.perf_counter()` per mantenere 50Hz stabili.
 
-6. **Device CUDA coerente**: L'assegnazione CPU/CUDA è ora propagata uniformemente in tutta la pipeline (DataLoader con `pin_memory`, modello su device, tensori con `non_blocking`).
+6. **Device CUDA coerente**: L'assegnazione CPU/CUDA è ora propagata uniformemente in tutta la pipeline.
 
 7. **Sanity check dati**: Il dataset HDF5 viene validato all'apertura per NaN, Inf e gruppi mancanti.
 
-8. **Flag `-nolaptime`**: Rimosso dal lancio TORCS in `gym_torcs.py`. La lap time è ora correttamente esposta nell'osservazione per il rilevamento del completamento giro.
+8. **Flag `-nolaptime`**: Rimosso dal lancio TORCS in `gym_torcs.py`. La lap time è ora correttamente esposta.
+
+### Training RL — Evoluzione dell'Architettura
+
+Il passaggio da BC a RL ha richiesto molteplici iterazioni per risolvere il catastrophic forgetting. Ogni problema scoperto ha portato a una soluzione architetturale specifica:
+
+| # | Problema | Diagnosi | Soluzione |
+|---|----------|----------|----------|
+| 1 | **Actor distrutto in ~10 episodi** | Il Critic non addestrato forniva gradienti casuali che sovrascrivevano i pesi BC | **Offline Critic Pre-training**: 10K step di training solo-Critic sulle demo umane prima del loop episodi |
+| 2 | **Reward negativa crescente** | Le penalità terminali (`-500`) dominavano il segnale di reward, confondendo il Critic | **Riduzione penalità terminali** a `-100` e **bilanciamento reward**: `progress ×10`, `speed ×10`, `center /2`, `angle /3` |
+| 3 | **Episodi troncati a 551 step** | L'anti-stallo (speedX < soglia per N step) triggerava nelle curve lente del Corkscrew | **Rimozione di tutte le euristiche di terminazione** e sostituzione con una **time penalty** costante (`-0.1/step`) |
+| 4 | **Esplorazione esplosiva alla transizione freeze→train** | Il termine di entropia SAC (`α·log_pi`) spingeva `log_std` verso l'alto durante gli update Actor | **`log_std_linear` escluso dall'optimizer**: il rumore resta fisso a `std ≈ 0.007` (quasi-deterministico) |
+| 5 | **Degradazione lenta anche senza entropia** | Il SAC loss (`-Q_value`) spostava la media dell'Actor lontano dalla BC anche con `bc_lambda=1.0` | **Conservative Policy Improvement**: BC loss come obiettivo primario + Q-value con peso 0.01 come correzione minimale |
+| 6 | **Gradiente leak durante offline/freeze** | I parametri dell'Actor ricevevano gradienti residui anche durante le fasi di solo-Critic | **`requires_grad = False`** esplicito su tutti i parametri Actor in `update_critic_only()` |
+| 7 | **Drift cumulativo a lungo termine** (ep 91→150) | Il CPI con `-Q.mean()` cieco accumulava piccoli errori di gradiente ad ogni update, erodendo la BC policy | **Advantage-Weighted CPI**: il Q-improvement si attiva solo dove `Q(actor) > Q(buffer)` (advantage positivo) e viene normalizzato per la scala del Q |
 
 ---
 
@@ -325,19 +407,19 @@ AIcar/
 │   ├── gym_torcs.py           # Ambiente Gym-like (TorcsEnv): reset, step, reward
 │   ├── snakeoil3_gym.py       # Client UDP: connessione, parsing telemetria, invio comandi
 │   └── autostart.sh           # Script xdotool che simula i tasti per avviare la Quick Race
-└── train_set/                 # ⚠️ In .gitignore — dati e checkpoint
-    ├── laps/                  # Giri validi registrati (HDF5)
-    │   ├── lap_001.h5
-    │   ├── lap_002.h5
-    │   └── ...
-    ├── checkpoints/           # Pesi dei modelli
-    │   ├── bc_policy.pth      # Pesi Behavioral Cloning
-    │   ├── sac_actor_ep*.pth  # Checkpoint SAC periodici
-    │   ├── sac_actor_best.pth # Miglior modello SAC
-    │   └── sac_actor_final.pth# Modello SAC finale
-    └── session_logs/          # Log delle sessioni
-        ├── session_*.log      # Log raccolta dati
-        └── sac_training_*.log # Log training RL
+├── train_set/                 # ⚠️ In .gitignore — dati e checkpoint
+│   ├── laps/                  # Giri validi registrati (HDF5)
+│   │   ├── lap_001.h5
+│   │   ├── lap_002.h5
+│   │   └── ...
+│   ├── checkpoints/           # Pesi dei modelli
+│   │   ├── bc_policy.pth      # Pesi Behavioral Cloning (immutabile)
+│   │   ├── sac_checkpoint_ep*.pth  # Checkpoint SAC periodici (ogni 50 ep)
+│   │   ├── sac_actor_best.pth # Miglior modello SAC (auto-aggiornato)
+│   │   └── sac_actor_final.pth# Modello SAC a fine training
+│   └── session_logs/          # Log delle sessioni
+│       ├── session_*.log      # Log raccolta dati
+│       └── sac_training_*.log # Log training RL (1 riga/episodio)
 ```
 
 ---
