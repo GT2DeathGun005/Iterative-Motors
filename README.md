@@ -152,7 +152,26 @@ python sac_rl.py \
 | `--critic_lr` | `3e-4` | LR critic |
 | `--bc_lambda` | `1.0` | Coefficiente regolarizzazione BC |
 | `--warmup_steps` | `5000` | Campioni nel buffer prima degli update |
-| `--relaunch_every` | `20` | Rilancia TORCS ogni N episodi |
+| `--relaunch_every` | `50` | Rilancia TORCS ogni N episodi (previene memory leak) |
+| `--resume` | `""` | Path a un checkpoint per riprendere il training |
+
+**Riprendere una sessione interrotta**:
+```bash
+# Riprende dal checkpoint più recente (sopravvive alla chiusura del terminale)
+nohup xvfb-run -a -s "-screen 0 800x600x24" python sac_rl.py \
+  --episodes 1000 \
+  --resume train_set/checkpoints/sac_checkpoint_latest.pth \
+  --target_time 71.038 \
+  > /dev/null 2>&1 &
+
+# Oppure da un checkpoint specifico
+nohup xvfb-run -a -s "-screen 0 800x600x24" python sac_rl.py \
+  --episodes 1000 \
+  --resume train_set/checkpoints/sac_checkpoint_ep0150.pth \
+  > /dev/null 2>&1 &
+```
+
+I checkpoint contengono: actor, critic, critic_target, optimizer states, best_lap_time, episode, total_updates e λ_bc. Il resume ripristina tutto lo stato del training.
 
 ### Fase 4: Test dell'agente
 

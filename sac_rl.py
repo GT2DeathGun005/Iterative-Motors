@@ -240,7 +240,7 @@ class SACAgent:
         # Alpha fisso (NO auto-tuning con BC warm start)
         # L'auto-tuning standard forza alpha in alto perché la policy BC
         # è quasi deterministica, il che distrugge i pesi BC.
-        self.alpha = 0.01  # Basso: poca esplorazione, preserva BC
+        self.alpha = 0.05  # Moderato: un po' di esplorazione, preserva BC
 
         # BC model congelato come riferimento (caricato dopo)
         self.bc_model = None
@@ -502,12 +502,14 @@ def main():
                         help="Learning rate dell'actor (basso per preservare BC)")
     parser.add_argument("--critic_lr", type=float, default=3e-4,
                         help="Learning rate del critic")
-    parser.add_argument("--bc_lambda", type=float, default=1.0,
-                        help="Coefficiente regolarizzazione BC (0=disabilitato)")
+    parser.add_argument("--bc_lambda", type=float, default=0.3,
+                        help="Coefficiente regolarizzazione BC (0=disabilitato, 0.3=default)")
     parser.add_argument("--relaunch_every", type=int, default=20,
                         help="Rilancia TORCS ogni N episodi")
     parser.add_argument("--checkpoint_every", type=int, default=50,
                         help="Salva checkpoint ogni N episodi")
+    parser.add_argument("--resume", type=str, default="",
+                        help="Path a un checkpoint completo per riprendere il training")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -524,6 +526,8 @@ def main():
     print(f"  Episodi: {args.episodes} | Buffer: {args.buffer_size}")
     print(f"  Actor LR: {args.actor_lr} | Critic LR: {args.critic_lr}")
     print(f"  BC λ: {args.bc_lambda} | Tempo target: {args.target_time:.1f}s")
+    if args.resume:
+        print(f"  Resume da: {args.resume}")
     print(f"{'=' * 64}\n")
 
     # ── Agent (con LR separati e BC lambda) ──
@@ -532,8 +536,28 @@ def main():
                      critic_lr=args.critic_lr,
                      bc_lambda=args.bc_lambda)
 
-    # ── Warm Start ──
-    agent.actor.load_bc_weights(args.bc_weights, device)
+    # ── Resume o Warm Start ──
+    start_episode = 1
+    best_lap_time = args.target_time
+    total_updates = 0
+
+    if args.resume and os.path.exists(args.resume):
+        print(f"  Ripristino checkpoint: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        agent.actor.load_state_dict(ckpt['actor'])
+        agent.critic.load_state_dict(ckpt['critic'])
+        agent.critic_target.load_state_dict(ckpt['critic_target'])
+        agent.actor_optimizer.load_state_dict(ckpt['actor_optimizer'])
+        agent.critic_optimizer.load_state_dict(ckpt['critic_optimizer'])
+        start_episode = ckpt.get('episode', 0) + 1
+        best_lap_time = ckpt.get('best_lap_time', args.target_time)
+        total_updates = ckpt.get('total_updates', 0)
+        agent.bc_lambda = ckpt.get('bc_lambda', args.bc_lambda)
+        print(f"  ✅ Checkpoint ripristinato: ep={start_episode-1}, "
+              f"best={best_lap_time:.3f}s, updates={total_updates}, λ_bc={agent.bc_lambda:.3f}")
+    else:
+        # Warm Start da BC
+        agent.actor.load_bc_weights(args.bc_weights, device)
 
     # ── BC Reference Model (congelato, per regularization) ──
     if args.bc_lambda > 0:
@@ -546,21 +570,45 @@ def main():
     print(f"\n  Caricamento demo umane nel replay buffer...")
     prefill_buffer_from_demos(memory, args.demo_dir)
 
-    # ── Best time tracking (reward dinamica) ──
-    best_lap_time = args.target_time
-    total_updates = 0
-
     # ── Training log ──
     log_dir = os.path.join(os.path.dirname(args.save_dir), "session_logs")
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f"sac_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    if args.resume and os.path.exists(args.resume):
+        # Riprendi il log della sessione originale (salvato nel checkpoint)
+        log_path = ckpt.get('log_path', '')
+        if not log_path or not os.path.exists(log_path):
+            # Fallback: trova il log il cui ultimo episodio corrisponde al checkpoint
+            existing_logs = glob.glob(os.path.join(log_dir, "sac_training_*.log"))
+            target_ep = start_episode - 1  # ultimo episodio completato prima del resume
+            matched_log = None
+            for lf in existing_logs:
+                try:
+                    with open(lf, 'r') as flog:
+                        lines = [l.strip() for l in flog if l.startswith('ep=')]
+                    if lines:
+                        last_ep = int(lines[-1].split(',')[0].split('=')[1])
+                        if last_ep == target_ep:
+                            matched_log = lf
+                            break
+                except Exception:
+                    continue
+            if matched_log:
+                log_path = matched_log
+                print(f"  📄 Resume: appendo al log originale (ep={target_ep}): {os.path.basename(log_path)}")
+            else:
+                log_path = os.path.join(log_dir, f"sac_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+                print(f"  📄 Nessun log corrispondente trovato, creo: {os.path.basename(log_path)}")
+        else:
+            print(f"  📄 Resume: appendo al log originale: {os.path.basename(log_path)}")
+    else:
+        log_path = os.path.join(log_dir, f"sac_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
     # ── Ambiente ──
     print("  Inizializzazione TORCS...")
     env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=False)
 
     try:
-        for ep in range(1, args.episodes + 1):
+        for ep in range(start_episode, args.episodes + 1):
             # ── Reset ──
             need_relaunch = (ep == 1) or (ep % args.relaunch_every == 0)
             if ep == 1:
@@ -680,20 +728,45 @@ def main():
                     f"best={best_lap_time:.3f},updates={total_updates}\n"
                 )
 
-            # ── Checkpoint ──
+            # ── Checkpoint (salvataggio completo per resume) ──
             if ep % args.checkpoint_every == 0:
-                path = os.path.join(args.save_dir, f"sac_actor_ep{ep:04d}.pth")
-                torch.save(agent.actor.state_dict(), path)
-                print(f"    💾 Checkpoint: {path}")
+                ckpt_path = os.path.join(args.save_dir, f"sac_checkpoint_ep{ep:04d}.pth")
+                torch.save({
+                    'episode': ep,
+                    'actor': agent.actor.state_dict(),
+                    'critic': agent.critic.state_dict(),
+                    'critic_target': agent.critic_target.state_dict(),
+                    'actor_optimizer': agent.actor_optimizer.state_dict(),
+                    'critic_optimizer': agent.critic_optimizer.state_dict(),
+                    'best_lap_time': best_lap_time,
+                    'total_updates': total_updates,
+                    'bc_lambda': agent.bc_lambda,
+                    'log_path': log_path,
+                }, ckpt_path)
+                print(f"    💾 Checkpoint completo: {ckpt_path}")
 
     except KeyboardInterrupt:
         print(f"\n\n  🛑 Training interrotto dall'utente all'episodio {ep}.")
 
     finally:
-        # ── Salvataggio finale ──
-        final_path = os.path.join(args.save_dir, "sac_actor_final.pth")
-        torch.save(agent.actor.state_dict(), final_path)
-        print(f"\n  Pesi finali salvati: {final_path}")
+        # ── Salvataggio finale (checkpoint completo) ──
+        final_ckpt = os.path.join(args.save_dir, "sac_checkpoint_latest.pth")
+        final_actor = os.path.join(args.save_dir, "sac_actor_final.pth")
+        torch.save({
+            'episode': ep,
+            'actor': agent.actor.state_dict(),
+            'critic': agent.critic.state_dict(),
+            'critic_target': agent.critic_target.state_dict(),
+            'actor_optimizer': agent.actor_optimizer.state_dict(),
+            'critic_optimizer': agent.critic_optimizer.state_dict(),
+            'best_lap_time': best_lap_time,
+            'total_updates': total_updates,
+            'bc_lambda': agent.bc_lambda,
+            'log_path': log_path,
+        }, final_ckpt)
+        torch.save(agent.actor.state_dict(), final_actor)
+        print(f"\n  Checkpoint finale: {final_ckpt}")
+        print(f"  Actor finale: {final_actor}")
         print(f"  Best lap time raggiunto: {best_lap_time:.3f}s")
         print(f"  Log training: {log_path}")
 
