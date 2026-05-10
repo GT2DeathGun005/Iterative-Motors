@@ -641,6 +641,11 @@ def main():
                             agent.bc_lambda = new_lambda
                             print(f"    📉 BC λ aggiornato: {new_lambda:.3f} (progress: {progress:.1%})")
 
+                        # Salva i pesi migliori SUBITO
+                        best_path = os.path.join(args.save_dir, "sac_actor_best.pth")
+                        torch.save(agent.actor.state_dict(), best_path)
+                        print(f"    💾 Best model salvato: {best_path}")
+
                 done = custom_done or env_done or lap_completed
                 mask = 0.0 if done else 1.0
                 memory.push(state, action, reward, next_state, mask)
@@ -690,9 +695,7 @@ def main():
     finally:
         # ── Salvataggio finale ──
         final_path = os.path.join(args.save_dir, "sac_actor_final.pth")
-        best_path = os.path.join(args.save_dir, "sac_actor_best.pth")
         torch.save(agent.actor.state_dict(), final_path)
-        torch.save(agent.actor.state_dict(), best_path)
         print(f"\n  Pesi finali salvati: {final_path}")
         print(f"  Best lap time raggiunto: {best_lap_time:.3f}s")
         print(f"  Log training: {log_path}")
