@@ -247,7 +247,7 @@ def main():
         description="Data Collection TORCS — Giro Secco con controller PS5"
     )
     parser.add_argument(
-        "--output_dir", type=str, default=".",
+        "--output_dir", type=str, default="train_set",
         help="Directory di output per i file HDF5 e il log (default: directory corrente)"
     )
     parser.add_argument(
@@ -277,8 +277,11 @@ def main():
     # getopt su sys.argv e non conosce --output_dir / --steering_deadzone.
     sys.argv = [sys.argv[0]]
 
+    # ── Cartella dati giri ──
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
+    laps_dir = os.path.join(output_dir, "laps")
+    os.makedirs(laps_dir, exist_ok=True)
 
     # ── Session log ──
     log_dir = os.path.join(output_dir, "session_logs")
@@ -291,7 +294,7 @@ def main():
 
     # ── Conta i giri già esistenti nella directory per numerazione continua ──
     existing_laps = sorted([
-        f for f in os.listdir(output_dir)
+        f for f in os.listdir(laps_dir)
         if f.startswith("lap_") and f.endswith(".h5")
     ])
     lap_counter = len(existing_laps)
@@ -409,7 +412,7 @@ def main():
                 # ── Salvataggio HDF5 (batch unico) ──
                 lap_counter += 1
                 filename = f"lap_{lap_counter:03d}.h5"
-                filepath = os.path.join(output_dir, filename)
+                filepath = os.path.join(laps_dir, filename)
 
                 states_np = np.stack(lap_states)
                 actions_np = np.stack(lap_actions)

@@ -265,7 +265,7 @@ class BehaviorCloningTrainer:
         return total_loss / len(self.val_loader)
 
     def train(self, max_epochs: int = 200, patience: int = 15,
-              checkpoint_path: str = "train_set/bc_policy.pth"):
+              checkpoint_path: str = "train_set/checkpoints/bc_policy.pth"):
         print(f"\n  Inizio training Behavioral Cloning su {self.device}...")
         print(f"  Max epochs: {max_epochs} | Patience: {patience}\n")
 
@@ -307,14 +307,14 @@ def main():
         description="Behavioral Cloning per agente TORCS (Giro Secco)"
     )
     parser.add_argument(
-        "--dataset", type=str, default="train_set",
+        "--dataset", type=str, default="train_set/laps",
         help="Path al dataset HDF5 (file singolo o directory di lap_*.h5)"
     )
     parser.add_argument("--epochs", type=int, default=200, help="Max epoche")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument(
-        "--output", type=str, default="train_set/bc_policy.pth",
+        "--output", type=str, default="train_set/checkpoints/bc_policy.pth",
         help="Path di output per i pesi del modello"
     )
     args = parser.parse_args()
@@ -326,7 +326,7 @@ def main():
     print(f"  Device: {device}")
     if device == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print(f"{'=' * 64}\n")
 
     # ── Caricamento dataset ──

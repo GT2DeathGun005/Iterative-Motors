@@ -1,14 +1,18 @@
 """
-Soft Actor-Critic (SAC) — Fine-Tuning RL per Giro Secco TORCS
+Soft Actor-Critic (SAC) con RLPD — Fine-Tuning RL per Giro Secco TORCS
 
 Addestra un agente SAC pre-inizializzato con i pesi del Behavioral Cloning
 per battere i tempi umani su singolo giro con partenza da fermo.
 
 Features:
+  - RLPD: replay buffer pre-riempito con 71k transizioni umane
   - Warm Start: carica backbone + mean_linear dal BC checkpoint
-  - Reward dinamica: l'agente cerca di battere il proprio best lap time
-  - Terminazione: uscita pista, spin (cos(angle)<0), stallo prolungato
-  - Checkpoint periodici in train_set/
+  - BC Regularization: previene catastrophic forgetting dei pesi BC
+  - λ_bc decay: il vincolo BC si rilassa quando l'agente migliora
+  - Actor LR separato (1e-5): aggiornamenti lenti per preservare BC
+  - Reward dinamica: basata sui tempi umani reali
+  - Terminazione: uscita pista, spin, stallo prolungato
+  - Checkpoint periodici in train_set/checkpoints/
   - GPU-optimized (CUDA)
 
 Action de-normalization (Tanh [-1,1] → env ranges):
@@ -20,10 +24,12 @@ Action de-normalization (Tanh [-1,1] → env ranges):
 
 import os
 import sys
+import glob
 import argparse
 import random
 import time
 import numpy as np
+import h5py
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -215,24 +221,41 @@ class Critic(nn.Module):
 class SACAgent:
     def __init__(self, state_dim: int, action_dim: int,
                  device: str = "cpu", gamma: float = 0.99,
-                 tau: float = 0.005, lr: float = 3e-4):
+                 tau: float = 0.005, critic_lr: float = 3e-4,
+                 actor_lr: float = 1e-5, bc_lambda: float = 1.0):
         self.device = torch.device(device)
         self.gamma = gamma
         self.tau = tau
+        self.bc_lambda = bc_lambda  # Coefficiente regolarizzazione BC
 
         self.actor = Actor(state_dim, action_dim).to(self.device)
         self.critic = Critic(state_dim, action_dim).to(self.device)
         self.critic_target = Critic(state_dim, action_dim).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr)
+        # LR separato: actor lento (preserva BC), critic veloce
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
 
-        # Auto-tuning alpha (entropia)
-        self.target_entropy = -float(action_dim)
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-        self.alpha_optim = optim.Adam([self.log_alpha], lr=lr)
-        self.alpha = self.log_alpha.exp().item()
+        # Alpha fisso (NO auto-tuning con BC warm start)
+        # L'auto-tuning standard forza alpha in alto perché la policy BC
+        # è quasi deterministica, il che distrugge i pesi BC.
+        self.alpha = 0.01  # Basso: poca esplorazione, preserva BC
+
+        # BC model congelato come riferimento (caricato dopo)
+        self.bc_model = None
+
+    def load_bc_reference(self, bc_path: str):
+        """Carica una copia congelata del BC model per la regularization."""
+        from behavioral_cloning import PolicyNetwork
+        self.bc_model = PolicyNetwork().to(self.device)
+        self.bc_model.load_state_dict(
+            torch.load(bc_path, map_location=self.device, weights_only=True)
+        )
+        self.bc_model.eval()
+        for p in self.bc_model.parameters():
+            p.requires_grad = False
+        print(f"  ✅ BC reference model caricato e congelato per regularization.")
 
     def select_action(self, state, evaluate=False):
         state_t = torch.FloatTensor(state).to(self.device).unsqueeze(0)
@@ -265,28 +288,32 @@ class SACAgent:
         qf_loss.backward()
         self.critic_optimizer.step()
 
-        # Actor update
+        # Actor update (con BC regularization)
         pi, log_pi, _ = self.actor.sample(state_b)
         q1_pi, q2_pi = self.critic(state_b, pi)
         min_q_pi = torch.min(q1_pi, q2_pi)
-        policy_loss = ((self.alpha * log_pi) - min_q_pi).mean()
+        sac_loss = ((self.alpha * log_pi) - min_q_pi).mean()
+
+        # BC regularization: penalizza la distanza dalla policy BC
+        bc_loss = torch.tensor(0.0, device=self.device)
+        if self.bc_model is not None and self.bc_lambda > 0:
+            with torch.no_grad():
+                bc_actions = self.bc_model(state_b)  # output tanh [-1,1]
+            # Confronta con l'output deterministico dell'actor (tanh(mean))
+            _, _, actor_det = self.actor.sample(state_b)
+            bc_loss = F.mse_loss(actor_det, bc_actions)
+
+        policy_loss = sac_loss + self.bc_lambda * bc_loss
 
         self.actor_optimizer.zero_grad()
         policy_loss.backward()
         self.actor_optimizer.step()
 
-        # Alpha update
-        alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
-        self.alpha_optim.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optim.step()
-        self.alpha = self.log_alpha.exp().item()
-
         # Soft update target
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
             tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
 
-        return qf_loss.item(), policy_loss.item(), alpha_loss.item()
+        return qf_loss.item(), policy_loss.item(), 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -328,6 +355,44 @@ def denormalize_action(action: np.ndarray) -> np.ndarray:
     gear = int(round((action[3] + 1.0) * 3.0))                   # gear
     env_action[3] = float(max(0, min(6, gear)))
     return env_action
+
+
+def normalize_action(env_action: np.ndarray) -> np.ndarray:
+    """Converte azione env TORCS → formato SAC Tanh [-1,1] (inversa di denormalize)."""
+    return np.array([
+        env_action[0],                          # steer: già [-1,1]
+        env_action[1] * 2.0 - 1.0,              # accel: [0,1] → [-1,1]
+        env_action[2] * 2.0 - 1.0,              # brake: [0,1] → [-1,1]
+        env_action[3] / 3.0 - 1.0,              # gear: [0,6] → [-1,1]
+    ], dtype=np.float32)
+
+
+def prefill_buffer_from_demos(memory: ReplayBuffer, demo_dir: str):
+    """Carica le transizioni dalle demo umane nel replay buffer.
+
+    Ogni coppia (state_t, action_t) → (state_t+1) diventa una transizione.
+    Le azioni vengono normalizzate in formato SAC (tanh [-1,1]).
+    La reward è un valore neutro-positivo (0.5) per indicare che le demo
+    sono "buone" senza distorcere la scala della reward online.
+    """
+    h5_files = sorted(glob.glob(os.path.join(demo_dir, "lap_*.h5")))
+    if not h5_files:
+        print(f"  ⚠️  Nessun file demo trovato in {demo_dir}")
+        return 0
+
+    total = 0
+    for h5_path in h5_files:
+        with h5py.File(h5_path, 'r') as h5f:
+            states = h5f['states'][:]
+            actions = h5f['actions'][:]
+
+        for i in range(len(states) - 1):
+            norm_action = normalize_action(actions[i])
+            memory.push(states[i], norm_action, 0.5, states[i + 1], 1.0)
+            total += 1
+
+    print(f"  ✅ Buffer pre-riempito con {total:,} transizioni da {len(h5_files)} giri demo")
+    return total
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -417,20 +482,28 @@ def compute_lap_bonus(lap_time: float, best_time: float) -> float:
 # ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="SAC RL Training — TORCS Giro Secco")
+    parser = argparse.ArgumentParser(description="SAC RL Training — TORCS Giro Secco (RLPD)")
     parser.add_argument("--episodes", type=int, default=1000, help="Episodi di training")
     parser.add_argument("--max_steps", type=int, default=10000, help="Max step per episodio")
-    parser.add_argument("--bc_weights", type=str, default="train_set/bc_policy.pth",
+    parser.add_argument("--bc_weights", type=str, default="train_set/checkpoints/bc_policy.pth",
                         help="Path ai pesi BC per warm start")
-    parser.add_argument("--save_dir", type=str, default="train_set",
+    parser.add_argument("--demo_dir", type=str, default="train_set/laps",
+                        help="Directory con i file HDF5 delle demo umane")
+    parser.add_argument("--save_dir", type=str, default="train_set/checkpoints",
                         help="Directory per checkpoint")
     parser.add_argument("--target_time", type=float, default=75.0,
                         help="Tempo target umano in secondi (default: 75s)")
     parser.add_argument("--buffer_size", type=int, default=200000,
                         help="Capacità replay buffer")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
-    parser.add_argument("--warmup_steps", type=int, default=1000,
-                        help="Step di esplorazione random prima del training")
+    parser.add_argument("--warmup_steps", type=int, default=5000,
+                        help="Campioni nel buffer prima di iniziare gli update (default: 5000)")
+    parser.add_argument("--actor_lr", type=float, default=1e-5,
+                        help="Learning rate dell'actor (basso per preservare BC)")
+    parser.add_argument("--critic_lr", type=float, default=3e-4,
+                        help="Learning rate del critic")
+    parser.add_argument("--bc_lambda", type=float, default=1.0,
+                        help="Coefficiente regolarizzazione BC (0=disabilitato)")
     parser.add_argument("--relaunch_every", type=int, default=20,
                         help="Rilancia TORCS ogni N episodi")
     parser.add_argument("--checkpoint_every", type=int, default=50,
@@ -444,29 +517,43 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
 
     print(f"\n{'=' * 64}")
-    print(f"  🏎️  SAC REINFORCEMENT LEARNING — Giro Secco TORCS")
+    print(f"  🏎️  SAC REINFORCEMENT LEARNING (RLPD) — Giro Secco TORCS")
     print(f"  Device: {device}")
     if device == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
     print(f"  Episodi: {args.episodes} | Buffer: {args.buffer_size}")
-    print(f"  Tempo target iniziale: {args.target_time:.1f}s")
+    print(f"  Actor LR: {args.actor_lr} | Critic LR: {args.critic_lr}")
+    print(f"  BC λ: {args.bc_lambda} | Tempo target: {args.target_time:.1f}s")
     print(f"{'=' * 64}\n")
 
-    # ── Agent ──
-    agent = SACAgent(state_dim, action_dim, device)
+    # ── Agent (con LR separati e BC lambda) ──
+    agent = SACAgent(state_dim, action_dim, device,
+                     actor_lr=args.actor_lr,
+                     critic_lr=args.critic_lr,
+                     bc_lambda=args.bc_lambda)
 
     # ── Warm Start ──
     agent.actor.load_bc_weights(args.bc_weights, device)
 
+    # ── BC Reference Model (congelato, per regularization) ──
+    if args.bc_lambda > 0:
+        agent.load_bc_reference(args.bc_weights)
+
     # ── Replay Buffer ──
     memory = ReplayBuffer(capacity=args.buffer_size)
+
+    # ── Pre-fill buffer con demo umane (RLPD) ──
+    print(f"\n  Caricamento demo umane nel replay buffer...")
+    prefill_buffer_from_demos(memory, args.demo_dir)
 
     # ── Best time tracking (reward dinamica) ──
     best_lap_time = args.target_time
     total_updates = 0
 
     # ── Training log ──
-    log_path = os.path.join(args.save_dir, f"sac_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    log_dir = os.path.join(os.path.dirname(args.save_dir), "session_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"sac_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
     # ── Ambiente ──
     print("  Inizializzazione TORCS...")
@@ -499,11 +586,11 @@ def main():
 
             for step in range(1, args.max_steps + 1):
                 # ── Selezione azione ──
-                if len(memory) < args.warmup_steps:
-                    # Esplorazione random durante il warmup
-                    action = np.random.uniform(-1, 1, size=action_dim).astype(np.float32)
-                else:
-                    action = agent.select_action(state)
+                # Con BC warm start, l'Actor produce già azioni ragionevoli.
+                # L'esplorazione è garantita dalla distribuzione stocastica del SAC
+                # (log_std). Il warmup serve solo a riempire il buffer prima
+                # di iniziare gli update, NON per esplorare con azioni random.
+                action = agent.select_action(state)
 
                 # ── De-normalizza e step ──
                 env_action = denormalize_action(action)
@@ -520,11 +607,11 @@ def main():
                 raw_speed = float(raw.get('speedX', 0.0))
                 if isinstance(raw_speed, list):
                     raw_speed = raw_speed[0]
-                if step > 200 and abs(raw_speed) < 5.0:
+                if step > 200 and abs(raw_speed) < 20.0:
                     stall_counter += 1
-                    if stall_counter > 100:
+                    if stall_counter > 50:
                         custom_done = True
-                        reward = -200.0
+                        reward = -500.0  # Stessa penalità dell'uscita pista
                 else:
                     stall_counter = 0
 
@@ -543,6 +630,17 @@ def main():
                         best_lap_time = ep_lap_time
                         print(f"  🏆 NUOVO BEST LAP: {ep_lap_time:.3f}s (precedente: {old_best:.3f}s)")
 
+                        # ── Decay λ_bc basato sulla performance ──
+                        # Quando l'agente si avvicina al HUMAN_BEST_TIME,
+                        # riduciamo il vincolo BC per permettere di superarlo.
+                        # λ = 1.0 quando best == worst, λ → 0.1 quando best ≈ human_best
+                        if HUMAN_WORST_TIME > HUMAN_BEST_TIME:
+                            progress = (HUMAN_WORST_TIME - best_lap_time) / (HUMAN_WORST_TIME - HUMAN_BEST_TIME)
+                            progress = max(0.0, min(1.0, progress))  # clamp [0, 1]
+                            new_lambda = max(0.1, args.bc_lambda * (1.0 - 0.9 * progress))
+                            agent.bc_lambda = new_lambda
+                            print(f"    📉 BC λ aggiornato: {new_lambda:.3f} (progress: {progress:.1%})")
+
                 done = custom_done or env_done or lap_completed
                 mask = 0.0 if done else 1.0
                 memory.push(state, action, reward, next_state, mask)
@@ -551,7 +649,10 @@ def main():
                 episode_reward += reward
 
                 # ── Update ──
-                if len(memory) > args.batch_size:
+                # Ritarda gli update finché il buffer non ha abbastanza
+                # transizioni dalla guida BC. Questo previene la distruzione
+                # dei pesi BC con pochi campioni di bassa qualità.
+                if len(memory) > max(args.warmup_steps, args.batch_size):
                     agent.update_parameters(memory, args.batch_size)
                     total_updates += 1
 
@@ -566,7 +667,8 @@ def main():
                 f"  Ep {ep:4d}/{args.episodes} | {status} | "
                 f"Reward: {episode_reward:8.1f} | Steps: {step:5d} | "
                 f"LapTime: {lap_str} | Best: {best_lap_time:.3f}s | "
-                f"Updates: {total_updates} | Alpha: {agent.alpha:.4f}"
+                f"Updates: {total_updates} | α: {agent.alpha:.4f} | "
+                f"λ_bc: {agent.bc_lambda:.3f}"
             )
 
             with open(log_path, 'a') as f:

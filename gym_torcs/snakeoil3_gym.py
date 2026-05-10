@@ -187,14 +187,12 @@ class Client():
                        ['host=','port=','id=','steps=',
                         'episodes=','track=','stage=',
                         'debug','help','version'])
-        except getopt.error as why:
-            print('getopt error: %s\n%s' % (why, usage))
-            sys.exit(-1)
+        except getopt.error:
+            # Quando usato come libreria (es. da sac_rl.py), sys.argv contiene
+            # argomenti dello script chiamante: ignora silenziosamente.
+            return
         try:
             for opt in opts:
-                if opt[0] == '-h' or opt[0] == '--help':
-                    print(usage)
-                    sys.exit(0)
                 if opt[0] == '-d' or opt[0] == '--debug':
                     self.debug= True
                 if opt[0] == '-H' or opt[0] == '--host':
@@ -211,15 +209,9 @@ class Client():
                     self.maxEpisodes= int(opt[1])
                 if opt[0] == '-m' or opt[0] == '--steps':
                     self.maxSteps= int(opt[1])
-                if opt[0] == '-v' or opt[0] == '--version':
-                    print('%s %s' % (sys.argv[0], version))
-                    sys.exit(0)
         except ValueError as why:
             print('Bad parameter \'%s\' for option %s: %s\n%s' % (
                                        opt[1], opt[0], why, usage))
-            sys.exit(-1)
-        if len(args) > 0:
-            print('Superflous input? %s\n%s' % (', '.join(args), usage))
             sys.exit(-1)
 
     def get_servers_input(self):

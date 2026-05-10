@@ -97,8 +97,8 @@ python data_collection.py --output_dir train_set --steering_deadzone 0.05
 - ✅ Il giro è stato completato con un lap time valido (`lastLapTime > 0`)
 
 **Output**:
-- `lap_001.h5`, `lap_002.h5`, ... — Un file HDF5 per giro valido (states + actions + metadata)
-- `session_YYYYMMDD_HHMMSS.log` — Log testuale con lap time e nome file di ogni giro
+- `train_set/laps/lap_001.h5`, ... — Un file HDF5 per giro valido (states + actions + metadata)
+- `train_set/session_logs/session_*.log` — Log testuale con lap time e nome file di ogni giro
 
 **Interruzione**: `Ctrl+C` termina la sessione. Il giro corrente incompleto **non** viene salvato.
 
@@ -107,7 +107,7 @@ python data_collection.py --output_dir train_set --steering_deadzone 0.05
 Addestra la PolicyNetwork sui giri raccolti. Accetta sia un singolo file `.h5` sia una **directory** di `lap_*.h5`.
 
 ```bash
-python behavioral_cloning.py --dataset train_set --epochs 200 --batch_size 256 --output train_set/bc_policy.pth
+python behavioral_cloning.py --dataset train_set/laps --epochs 200 --batch_size 256 --output train_set/checkpoints/bc_policy.pth
 ```
 
 Il training usa:
@@ -115,27 +115,54 @@ Il training usa:
 - **Early stopping** (patience=15 epoche) per prevenire overfitting
 - **GPU** automaticamente se disponibile (testato su RTX 4060 8GB)
 
-### Fase 3: SAC Fine-Tuning (RL)
+### Fase 3: SAC Fine-Tuning con RLPD (RL)
 
-Lancia il training RL con warm start dai pesi BC. L'agente guida autonomamente cercando di **battere il proprio best lap time** ad ogni episodio.
+Il training RL usa **RLPD** (Reinforcement Learning with Prior Data) per fine-tuning dei pesi BC senza catastrophic forgetting.
 
 ```bash
 python sac_rl.py \
   --episodes 1000 \
-  --bc_weights train_set/bc_policy.pth \
-  --save_dir train_set \
-  --target_time 75.0 \
+  --bc_weights train_set/checkpoints/bc_policy.pth \
+  --demo_dir train_set/laps \
+  --target_time 71.038 \
   --batch_size 256
 ```
+
+**Perché RLPD?** Il SAC vanilla distrugge i pesi BC in pochi update, perché:
+1. Il replay buffer parte vuoto e si riempie solo di dati di crash
+2. Il critic non ha riferimenti di "buona guida"
+3. Gli update dell'actor sono troppo aggressivi
+
+**Soluzioni implementate**:
+
+| Tecnica | Descrizione |
+|---------|-------------|
+| **Pre-fill buffer** | Le 71k transizioni umane vengono caricate nel replay buffer prima del training |
+| **BC Regularization** | Un termine `λ_bc · MSE(actor, BC)` nella loss dell'actor impedisce di allontanarsi troppo dalla policy BC |
+| **λ_bc decay** | Il coefficiente BC si riduce automaticamente quando il best lap time si avvicina al miglior tempo umano (71.038s) |
+| **Actor LR separato** | Actor: `1e-5` (lento), Critic: `3e-4` (veloce) — preserva i pesi BC durante l'apprendimento |
 
 **Opzioni principali**:
 | Flag | Default | Descrizione |
 |------|---------|-------------|
-| `--target_time` | `75.0` | Tempo target iniziale (il tuo miglior tempo umano) |
-| `--bc_weights` | `train_set/bc_policy.pth` | Path ai pesi BC per warm start |
-| `--warmup_steps` | `1000` | Step di esplorazione random prima del training |
-| `--relaunch_every` | `20` | Rilancia TORCS ogni N episodi (previene memory leak) |
-| `--checkpoint_every` | `50` | Checkpoint periodici |
+| `--target_time` | `75.0` | Tempo target iniziale |
+| `--bc_weights` | `train_set/checkpoints/bc_policy.pth` | Pesi BC per warm start |
+| `--demo_dir` | `train_set/laps` | Directory demo per pre-fill buffer |
+| `--actor_lr` | `1e-5` | LR actor (basso per preservare BC) |
+| `--critic_lr` | `3e-4` | LR critic |
+| `--bc_lambda` | `1.0` | Coefficiente regolarizzazione BC |
+| `--warmup_steps` | `5000` | Campioni nel buffer prima degli update |
+| `--relaunch_every` | `20` | Rilancia TORCS ogni N episodi |
+
+### Fase 4: Test dell'agente
+
+```bash
+# Testa il modello BC (solo behavioral cloning)
+python test_agent.py --weights train_set/checkpoints/bc_policy.pth --model bc --laps 3
+
+# Testa il modello SAC (dopo fine-tuning RL)
+python test_agent.py --weights train_set/checkpoints/sac_actor_best.pth --model sac --laps 5
+```
 
 ---
 
@@ -219,6 +246,7 @@ AIcar/
 ├── data_collection.py         # Fase 1: Raccolta dati umani
 ├── behavioral_cloning.py      # Fase 2: Imitation Learning (BC)
 ├── sac_rl.py                  # Fase 3: SAC Reinforcement Learning
+├── test_agent.py              # Test: valutazione agente addestrato
 ├── README.md
 ├── .gitignore
 ├── gym_torcs/                 # Wrapper Python per comunicare con TORCS via UDP
@@ -226,14 +254,18 @@ AIcar/
 │   ├── snakeoil3_gym.py       # Client UDP: connessione, parsing telemetria, invio comandi
 │   └── autostart.sh           # Script xdotool che simula i tasti per avviare la Quick Race
 └── train_set/                 # ⚠️ In .gitignore — dati e checkpoint
-    ├── lap_001.h5             # Giri validi (generati)
-    ├── lap_002.h5
-    ├── session_*.log          # Log delle sessioni di raccolta
-    ├── bc_policy.pth          # Pesi BC (generato)
-    ├── sac_actor_ep*.pth      # Checkpoint SAC periodici
-    ├── sac_actor_best.pth     # Miglior modello SAC
-    ├── sac_actor_final.pth    # Modello SAC finale
-    └── sac_training_*.log     # Log del training RL
+    ├── laps/                  # Giri validi registrati (HDF5)
+    │   ├── lap_001.h5
+    │   ├── lap_002.h5
+    │   └── ...
+    ├── checkpoints/           # Pesi dei modelli
+    │   ├── bc_policy.pth      # Pesi Behavioral Cloning
+    │   ├── sac_actor_ep*.pth  # Checkpoint SAC periodici
+    │   ├── sac_actor_best.pth # Miglior modello SAC
+    │   └── sac_actor_final.pth# Modello SAC finale
+    └── session_logs/          # Log delle sessioni
+        ├── session_*.log      # Log raccolta dati
+        └── sac_training_*.log # Log training RL
 ```
 
 ---
@@ -263,6 +295,7 @@ I file nella directory `gym_torcs/` sono una versione modificata del wrapper ope
 | **Flag `-nolaptime` rimosso** dal blocco di rilancio | Stesso motivo del punto in `gym_torcs.py`: il rilancio automatico riavviava TORCS senza esporre la lap time. |
 | **Path assoluti per `autostart.sh`** | Stesso fix dei path assoluti applicato in `gym_torcs.py`. |
 | **Fix SyntaxWarning** (escape sequences in stringhe ASCII art) | Python ≥ 3.12 segnala `'\.'` come sequenza di escape non valida. Corretti con doppio backslash. |
+| **`parse_the_command_line()` ignora argomenti sconosciuti** | L'originale usava `getopt` su `sys.argv` e crashava con `sys.exit(-1)` se trovava flag come `--bc_weights`. Ora ignora silenziosamente gli argomenti non riconosciuti quando usato come libreria. |
 
 ### `autostart.sh` — Automazione menu TORCS
 
