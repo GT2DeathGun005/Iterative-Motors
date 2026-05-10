@@ -653,11 +653,8 @@ def main():
                 state = next_state
                 episode_reward += reward
 
-                # ── Update ──
-                # Ritarda gli update finché il buffer non ha abbastanza
-                # transizioni dalla guida BC. Questo previene la distruzione
-                # dei pesi BC con pochi campioni di bassa qualità.
-                if len(memory) > max(args.warmup_steps, args.batch_size):
+                # ── Update (ogni 4 step per velocità e stabilità) ──
+                if len(memory) > max(args.warmup_steps, args.batch_size) and step % 4 == 0:
                     agent.update_parameters(memory, args.batch_size)
                     total_updates += 1
 

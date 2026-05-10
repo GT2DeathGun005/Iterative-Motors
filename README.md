@@ -164,6 +164,59 @@ python test_agent.py --weights train_set/checkpoints/bc_policy.pth --model bc --
 python test_agent.py --weights train_set/checkpoints/sac_actor_best.pth --model sac --laps 5
 ```
 
+### ⚡ Training Headless (Velocizzato)
+
+TORCS richiede un server X per il rendering OpenGL. Per velocizzare il training RL si usa **Xvfb** (X Virtual Framebuffer), che fornisce un display virtuale senza overhead grafico a schermo. Il training risulta ~5-8x più veloce.
+
+**Prerequisito** (Fedora):
+```bash
+sudo dnf install -y xorg-x11-server-Xvfb
+```
+
+**Avvio in background**:
+```bash
+# Lancia il training headless con nohup (sopravvive alla chiusura del terminale)
+nohup xvfb-run -a -s "-screen 0 800x600x24" python sac_rl.py \
+  --episodes 1000 \
+  --bc_weights train_set/checkpoints/bc_policy.pth \
+  --target_time 71.038 \
+  --batch_size 256 \
+  --relaunch_every 50 \
+  > train_set/session_logs/sac_stdout.log 2>&1 &
+
+echo "PID: $!"
+```
+
+**Monitoraggio**:
+```bash
+# Segui il log in tempo reale
+tail -f train_set/session_logs/sac_training_*.log
+
+# Oppure il log completo con stdout/stderr
+tail -f train_set/session_logs/sac_stdout.log
+
+# Controlla se il processo è ancora attivo
+ps aux | grep sac_rl
+```
+
+**Connessione allo schermo virtuale** (opzionale, per vedere TORCS):
+```bash
+# Installa un VNC server per Xvfb
+sudo dnf install -y x11vnc
+
+# Trova il display Xvfb attivo
+ls /tmp/.X*-lock   # Mostra i display attivi (es. /tmp/.X99-lock → :99)
+
+# Collega VNC al display virtuale (env -u richiesto su sistemi Wayland)
+env -u WAYLAND_DISPLAY -u XDG_SESSION_TYPE \
+  x11vnc -display :99 -nopw -listen localhost -rfbport 5900 -bg
+
+# Connettiti con un VNC viewer (es. da un altro terminale)
+# vncviewer localhost:5900
+```
+
+> **Nota**: il training headless salva checkpoint in `train_set/checkpoints/` esattamente come il training normale. I file `sac_actor_best.pth` e `sac_actor_final.pth` vengono aggiornati automaticamente.
+
 ---
 
 ## 🎯 Design della Reward Function (SAC)
