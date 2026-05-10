@@ -240,7 +240,7 @@ class SACAgent:
         # Alpha fisso (NO auto-tuning con BC warm start)
         # L'auto-tuning standard forza alpha in alto perché la policy BC
         # è quasi deterministica, il che distrugge i pesi BC.
-        self.alpha = 0.05  # Moderato: un po' di esplorazione, preserva BC
+        self.alpha = 0.02  # Basso: esplorazione conservativa per preservare BC
 
         # BC model congelato come riferimento (caricato dopo)
         self.bc_model = None
@@ -307,6 +307,7 @@ class SACAgent:
 
         self.actor_optimizer.zero_grad()
         policy_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         self.actor_optimizer.step()
 
         # Soft update target
@@ -436,15 +437,15 @@ def compute_step_reward(obs: dict, prev_dist: float, raw_obs: dict) -> tuple:
     # ── Terminazione ──
     done = False
 
-    # Uscita di pista — ALTISSIMA PENALITÀ
+    # Uscita di pista
     if abs(track_pos) > 1.0:
         done = True
-        reward = -500.0
+        reward = -100.0
 
     # Spin: l'auto si è girata
     if np.cos(angle) < 0:
         done = True
-        reward = -500.0
+        reward = -100.0
 
     return reward, done, dist_raced
 
@@ -502,8 +503,10 @@ def main():
                         help="Learning rate dell'actor (basso per preservare BC)")
     parser.add_argument("--critic_lr", type=float, default=3e-4,
                         help="Learning rate del critic")
-    parser.add_argument("--bc_lambda", type=float, default=0.3,
-                        help="Coefficiente regolarizzazione BC (0=disabilitato, 0.3=default)")
+    parser.add_argument("--bc_lambda", type=float, default=1.0,
+                        help="Coefficiente regolarizzazione BC (0=disabilitato, 1.0=default)")
+    parser.add_argument("--bc_decay_episodes", type=int, default=500,
+                        help="Episodi su cui decadere bc_lambda linearmente fino a 0.1")
     parser.add_argument("--relaunch_every", type=int, default=20,
                         help="Rilancia TORCS ogni N episodi")
     parser.add_argument("--checkpoint_every", type=int, default=50,
@@ -525,7 +528,7 @@ def main():
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
     print(f"  Episodi: {args.episodes} | Buffer: {args.buffer_size}")
     print(f"  Actor LR: {args.actor_lr} | Critic LR: {args.critic_lr}")
-    print(f"  BC λ: {args.bc_lambda} | Tempo target: {args.target_time:.1f}s")
+    print(f"  BC λ: {args.bc_lambda} → 0.1 over {args.bc_decay_episodes} ep | Tempo target: {args.target_time:.1f}s")
     if args.resume:
         print(f"  Resume da: {args.resume}")
     print(f"{'=' * 64}\n")
@@ -609,6 +612,12 @@ def main():
 
     try:
         for ep in range(start_episode, args.episodes + 1):
+            # ── Scheduled BC λ decay (lineare su bc_decay_episodes) ──
+            ep_elapsed = ep - start_episode
+            if args.bc_decay_episodes > 0 and ep_elapsed < args.bc_decay_episodes:
+                scheduled_lambda = args.bc_lambda * (1.0 - 0.9 * ep_elapsed / args.bc_decay_episodes)
+                agent.bc_lambda = max(0.1, scheduled_lambda)
+
             # ── Reset ──
             need_relaunch = (ep == 1) or (ep % args.relaunch_every == 0)
             if ep == 1:
@@ -651,15 +660,15 @@ def main():
                     next_obs, prev_dist, raw
                 )
 
-                # ── Stallo detection (dopo i primi 200 step) ──
+                # ── Stallo detection (dopo i primi 300 step) ──
                 raw_speed = float(raw.get('speedX', 0.0))
                 if isinstance(raw_speed, list):
                     raw_speed = raw_speed[0]
-                if step > 200 and abs(raw_speed) < 20.0:
+                if step > 300 and abs(raw_speed) < 10.0:
                     stall_counter += 1
-                    if stall_counter > 50:
+                    if stall_counter > 100:
                         custom_done = True
-                        reward = -500.0  # Stessa penalità dell'uscita pista
+                        reward = -50.0  # Penalità moderata per stallo
                 else:
                     stall_counter = 0
 
