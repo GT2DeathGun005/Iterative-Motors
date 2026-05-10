@@ -160,14 +160,20 @@ R_step = 0.1 · Δ_distRaced          (progresso sulla pista)
 | `cos(angle) < 0` (spin/retromarcia) | -500 | L'auto si è girata |
 | Velocità < 5 km/h per >100 step | -200 | Stallo (bloccato contro un muro) |
 
-### Bonus Completamento Giro (Dinamico)
+### Bonus/Penalità Completamento Giro (basato su tempi umani)
 
-```
-bonus = 500                                      (base per aver completato)
-      + max(0, best_time - lap_time) × 200       (extra per nuovo record)
-```
+Soglie calibrate sui **session_logs** del pilota umano:
+- **Best umano**: `71.038s` (lap_017)
+- **Worst umano**: `77.146s` (lap_001)
 
-Il `best_time` viene aggiornato automaticamente ogni volta che l'agente batte il proprio record. Questo crea un **curriculum implicito**: all'inizio l'agente è premiato per completare il giro, poi gradualmente la pressione si sposta verso la velocità pura.
+| Tempo Giro | Reward | Logica |
+|-----------|--------|--------|
+| `< 71.038s` | **+1000 + 200/s** | 🏆 Premio cospicuo: ha battuto il best umano |
+| `71 – 77s` | +500 | Giro nella fascia umana, buono |
+| `77 – 82s` | -50 | Media penalità: poco più lento del worst umano |
+| `> 82s` | -100 | Alta penalità: molto più lento del worst umano |
+
+Il `best_time` interno viene aggiornato automaticamente ogni volta che l'agente batte il proprio record. Questo crea un **curriculum implicito**: all'inizio l'agente è premiato per completare il giro, poi gradualmente la pressione si sposta verso la velocità pura.
 
 ---
 

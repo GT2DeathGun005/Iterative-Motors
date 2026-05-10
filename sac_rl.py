@@ -334,6 +334,11 @@ def denormalize_action(action: np.ndarray) -> np.ndarray:
 #  Reward Function — Giro Secco
 # ──────────────────────────────────────────────────────────────────────
 
+# ── Tempi umani dai session_logs (riferimenti per la reward) ──
+HUMAN_BEST_TIME = 71.038    # Miglior giro umano (lap_017.h5)
+HUMAN_WORST_TIME = 77.146   # Peggior giro umano (lap_001.h5)
+
+
 def compute_step_reward(obs: dict, prev_dist: float, raw_obs: dict) -> tuple:
     """Reward per singolo step. Ritorna (reward, done, dist_raced).
 
@@ -342,7 +347,7 @@ def compute_step_reward(obs: dict, prev_dist: float, raw_obs: dict) -> tuple:
       + speed:    bonus velocità longitudinale
       - center:   penalità quadratica per distanza dal centro
       - angle:    penalità per disallineamento
-      - offtrack: terminazione + penalità pesante
+      - offtrack: terminazione + altissima penalità
       - spin:     terminazione se l'auto si gira (cos(angle) < 0)
     """
     speed_x = float(np.array(obs.get('speedX', 0.0)).flat[0])
@@ -366,7 +371,7 @@ def compute_step_reward(obs: dict, prev_dist: float, raw_obs: dict) -> tuple:
     # ── Terminazione ──
     done = False
 
-    # Uscita di pista
+    # Uscita di pista — ALTISSIMA PENALITÀ
     if abs(track_pos) > 1.0:
         done = True
         reward = -500.0
@@ -380,12 +385,31 @@ def compute_step_reward(obs: dict, prev_dist: float, raw_obs: dict) -> tuple:
 
 
 def compute_lap_bonus(lap_time: float, best_time: float) -> float:
-    """Bonus per completamento giro. Extra se batte il best time."""
-    base = 500.0
-    if lap_time < best_time:
-        improvement = best_time - lap_time
-        return base + improvement * 200.0  # 200 punti per ogni secondo risparmiato
-    return base
+    """Bonus/penalità per completamento giro basati sui tempi umani.
+
+    Soglie (dai session_logs):
+      Best umano:  71.038s (lap_017)
+      Worst umano: 77.146s (lap_001)
+
+    Reward:
+      - Batte il best umano (< 71.038s):     +1000 base + 200/s di miglioramento
+      - Tra best e worst umano:               +500 base
+      - Poco più lento del worst (77-82s):    -50  (media penalità)
+      - Molto più lento del worst (> 82s):    -100 (alta penalità)
+    """
+    if lap_time < HUMAN_BEST_TIME:
+        # Premio cospicuo: ha battuto il miglior giro umano!
+        improvement = HUMAN_BEST_TIME - lap_time
+        return 1000.0 + improvement * 200.0
+    elif lap_time <= HUMAN_WORST_TIME:
+        # Giro nella fascia umana: buono, bonus base
+        return 500.0
+    elif lap_time <= 82.0:
+        # Poco più lento del peggior giro umano: media penalità
+        return -50.0
+    else:
+        # Molto più lento del peggior giro umano: alta penalità
+        return -100.0
 
 
 # ──────────────────────────────────────────────────────────────────────
