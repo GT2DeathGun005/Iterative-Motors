@@ -274,7 +274,7 @@ class SACAgent:
             action, _, _ = self.actor.sample(state_t)
         return action.detach().cpu().numpy()[0]
 
-    def update_parameters(self, memory: ReplayBuffer, batch_size: int):
+    def update_parameters(self, memory: ReplayBuffer, batch_size: int, episode: int = 0, freeze_episodes: int = 50):
         state_b, action_b, reward_b, next_state_b, mask_b = memory.sample(batch_size)
 
         state_b = torch.FloatTensor(state_b).to(self.device)
@@ -332,8 +332,15 @@ class SACAgent:
         q_scale = max(q_baseline.abs().mean().item(), 1.0)
         q_improvement = -(positive_adv / q_scale).mean()
 
-        # CPI loss: BC domina, Q solo dove il Critic è sicuro che migliora
-        cpi_weight = 0.01
+        # CPI loss: BC domina, Q corregge con peso crescente
+        # Schedule: il Critic guadagna influenza man mano che diventa più affidabile
+        train_ep = max(0, episode - freeze_episodes)  # episodi dall'inizio del TRAIN
+        if train_ep < 50:
+            cpi_weight = 0.01   # Stabilizzazione: CPI ultra-conservativo
+        elif train_ep < 150:
+            cpi_weight = 0.05   # Crescita: il Critic inizia a influenzare
+        else:
+            cpi_weight = 0.1    # Pieno: il Critic guida il miglioramento
         policy_loss = bc_loss + cpi_weight * q_improvement
 
         self.actor_optimizer.zero_grad()
@@ -811,7 +818,7 @@ def main():
                         agent.update_critic_only(memory, args.batch_size)
                     else:
                         # Fase TRAIN: update completo (Actor + Critic)
-                        agent.update_parameters(memory, args.batch_size)
+                        agent.update_parameters(memory, args.batch_size, episode=ep, freeze_episodes=args.actor_freeze_episodes)
                     total_updates += 1
 
                 if done:
