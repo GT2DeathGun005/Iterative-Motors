@@ -233,7 +233,7 @@ policy_loss = λ_bc · MSE(actor, bc_model)  +  w_cpi · (-Q(actor) · adv_mask 
               ┗━━━━━━━━ BC loss ━━━━━━━━━┛    ┗━━━━━━ Q improvement filtrato ━━━━━━━┛
               Obiettivo primario:               Attivo SOLO dove l'Actor
               "resta uguale alla BC"            è dimostrabilmente migliore del buffer.
-              Pesato da λ_bc (0.5 default,      Maschera hard: gradienti ZERO dove
+              Pesato da λ_bc (1.0 default,      Maschera hard: gradienti ZERO dove
               decade solo con lap completati)    advantage ≤ 0 → nessun drift.
 ```
 
@@ -251,7 +251,7 @@ policy_loss = λ_bc · MSE(actor, bc_model)  +  w_cpi · (-Q(actor) · adv_mask 
 - ✅ Q-value è un **consulente selettivo**: maschera binaria hard impedisce drift
 - ✅ Singolo forward pass Actor per BC e Q (nessun gradiente conflittuale)
 - ✅ Normalizzazione Q-scale previene instabilità per cambio di scala del Critic
-- ✅ `λ_bc` decade con lap completati (reward-based); valore iniziale configurabile (default 0.5)
+- ✅ `λ_bc` decade solo con lap completati (nessun decay incondizionato)
 - ✅ **Launch Override**: partenza da fermo con `accel=1, brake=0, gear=1` finché `speedX < 10 km/h` (la BC non ha dati sufficienti per la partenza)
 - ✅ **Demo reward calcolata**: le transizioni demo usano la stessa reward function del training online (non flat `0.5`)
 
@@ -274,7 +274,7 @@ Durante tutte le fasi di pre-training e freeze, i parametri dell'Actor sono cate
 | `--critic_lr` | `3e-4` | LR critic |
 | `--critic_warmup_steps` | `10000` | Step di pre-training offline del Critic |
 | `--actor_freeze_episodes` | `50` | Episodi con Actor congelato (solo Critic si aggiorna) |
-| `--bc_lambda` | `0.5` | Coefficiente BC nella loss (decade con lap completati; su resume usa il valore CLI, non il checkpoint) |
+| `--bc_lambda` | `1.0` | Coefficiente BC nella loss (decade solo con lap completati; su resume usa il valore CLI, non il checkpoint) |
 | `--bc_decay_episodes` | `500` | *(non usato attivamente — decay solo performance-based)* |
 | `--warmup_steps` | `5000` | Campioni nel buffer prima degli update |
 | `--relaunch_every` | `20` | Rilancia TORCS ogni N episodi |
@@ -469,6 +469,7 @@ Il passaggio da BC a RL ha richiesto molteplici iterazioni per risolvere il cata
 | 10 | **Stallo universale: ogni episodio terminato a 100 step** | Lo stall detection confrontava `speedX < 5.0` ma `speedX` dal wrapper `gym_torcs` è normalizzato per `default_speed=50`. Il valore `5.0` normalizzato equivale a 250 km/h → condizione sempre vera → terminazione immediata | **Soglia corretta**: `speedX < 0.1` (5 km/h ÷ 50). Stesso bug nel launch override: soglia cambiata da `10.0` a `0.2` (10 km/h ÷ 50) |
 | 11 | **BC non accelera da fermo + overfitting senza validation** | (a) La BC policy predice `accel=0` a velocità zero perché il dataset contiene pochissimi campioni di partenza da fermo. (b) Tentativo di rimuovere la validation split 80/20 per usare il 100% dei dati: il modello overffitta (train loss 0.021 vs val loss 0.032), degradando la performance reale (reward media +20 vs +296) | **(a) Launch Override**: nei primi step, se `speedX < 10 km/h`, forza `accel=1, brake=0, gear=1` mantenendo lo sterzo dalla policy. **(b) Split ripristinata**: la validation split è una regolarizzazione implicita necessaria; con ~71k campioni mescolati da 20 giri, la probabilità di perdere tutti i campioni di una curva è trascurabile |
 | 12 | **Critic pre-training loss diverge: 0.06 → 3.66 in 10K step** | Con `log_std=-5.0` congelato, l'Actor è quasi-deterministico (`std≈0.007`). Il `log_prob` di un campione da questa distribuzione è **~+90**. Il target Bellman `r + γ(Q - α·log_π)` include `α·log_π = 0.02×90 = 1.8/step` — penalità che domina la reward (~0.7) e spinge i Q-values a **-80** invece del corretto **+68**. La loss cresce perché il Critic insegue target in espansione negativa | **(a) Entropia rimossa** dal target Bellman offline: il termine `-α·log_π` è un incentivo all'esplorazione per il loop online, privo di significato nel pre-training su dataset fisso. **(b) Azioni deterministiche**: `tanh(mean)` invece di sample stocastico. **(c) Gradient clipping** (`max_norm=1.0`) sul Critic. **(d) Tau ridotto** a `0.001` durante pre-training (da `0.005`) + sincronizzazione hard del target network alla fine. Risultato: loss stabile a ~0.005, Q-values positivi e crescenti verso il valore teorico |
+| 13 | **Plateau a metà pista con λ_bc=1.0 (0 giri in 800 ep)** | Con `λ_bc=1.0` e `cpi_weight=0.1`, il rapporto BC:CPI è **10:1** — l'Actor non ha abbastanza libertà per deviare dalla BC policy. Ma ridurre `λ_bc` (0.3 e 0.5) o aumentare `cpi_weight` (0.3) causa **instabilità**: il Critic, addestrato solo su esperienze di crash (prima metà pista), fornisce gradienti distruttivi quando gli viene data più influenza. Anche un decay temporale di `λ_bc` causa collasso immediato su resume. | **Nessuna soluzione efficace trovata**: il problema è circolare — il Critic non può imparare la seconda metà della pista perché l'agente non ci arriva mai, e l'agente non ci arriva perché il Critic non sa guidarlo lì. Si mantiene `λ_bc=1.0` come configurazione stabile. Possibili strade future: (a) curriculum learning con tratti di pista progressivi, (b) demo sintetiche della seconda metà, (c) reward shaping più aggressivo nelle curve |
 
 ---
 
