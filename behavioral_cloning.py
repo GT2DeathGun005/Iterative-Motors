@@ -183,13 +183,21 @@ def normalize_actions(actions: torch.Tensor) -> torch.Tensor:
 # ──────────────────────────────────────────────────────────────────────
 
 class BehaviorCloningTrainer:
-    """Addestra la PolicyNetwork con MSE loss su azioni normalizzate.
+    """Addestra la PolicyNetwork con Steering-Weighted MSE loss.
 
     Features:
+      - Loss pesata: lo sterzo in curva (|steer| > 0.1) pesa 5x di più
+        per contrastare lo sbilanciamento dei dati (64.5% rettilinei)
       - Validation split con seed fisso per riproducibilità
       - Early stopping basato sulla val loss
       - Salvataggio automatico del miglior checkpoint
     """
+
+    # Peso extra per lo sterzo in curva. Senza questo, la MSE media converge
+    # verso steer≈0 perché il 64.5% dei campioni è in rettilineo, causando
+    # sotto-sterzo catastrofico che porta fuori pista alla prima curva.
+    STEER_CURVE_WEIGHT = 5.0
+    STEER_CURVE_THRESHOLD = 0.1  # |steer_normalized| sopra questa soglia
 
     def __init__(self, model: nn.Module, dataset: Dataset,
                  batch_size: int = 128, val_split: float = 0.2,
@@ -198,7 +206,6 @@ class BehaviorCloningTrainer:
         self.model = model.to(self.device)
         print(f"  Modello spostato su: {self.device}")
 
-        self.criterion = nn.MSELoss()
         self.optimizer = optim.Adam(
             self.model.parameters(), lr=lr, weight_decay=1e-5
         )
@@ -227,6 +234,28 @@ class BehaviorCloningTrainer:
 
         print(f"  Split: {train_size} train / {val_size} val")
 
+    def _weighted_mse(self, predictions, targets_norm):
+        """MSE con peso extra sullo sterzo in curva.
+
+        Per i campioni dove |steer_target| > threshold, il peso dello sterzo
+        è STEER_CURVE_WEIGHT (5x). Per tutti gli altri campioni e dimensioni
+        il peso è 1.0 (MSE standard).
+        """
+        # Errore quadratico per-dimensione [batch, 4]
+        sq_error = (predictions - targets_norm) ** 2
+
+        # Peso per-campione sullo sterzo (dim 0)
+        steer_target = targets_norm[:, 0].abs()
+        is_curve = (steer_target > self.STEER_CURVE_THRESHOLD).float()
+        # Peso: 1.0 in rettilineo, STEER_CURVE_WEIGHT in curva
+        steer_weight = 1.0 + (self.STEER_CURVE_WEIGHT - 1.0) * is_curve
+
+        # Applica il peso SOLO allo sterzo
+        weighted_sq = sq_error.clone()
+        weighted_sq[:, 0] = sq_error[:, 0] * steer_weight
+
+        return weighted_sq.mean()
+
     def train_epoch(self) -> float:
         self.model.train()
         total_loss = 0.0
@@ -240,7 +269,7 @@ class BehaviorCloningTrainer:
 
             self.optimizer.zero_grad()
             predictions = self.model(states)
-            loss = self.criterion(predictions, targets_norm)
+            loss = self._weighted_mse(predictions, targets_norm)
             loss.backward()
             self.optimizer.step()
 
@@ -259,7 +288,7 @@ class BehaviorCloningTrainer:
 
                 targets_norm = normalize_actions(targets)
                 predictions = self.model(states)
-                loss = self.criterion(predictions, targets_norm)
+                loss = self._weighted_mse(predictions, targets_norm)
                 total_loss += loss.item()
 
         return total_loss / len(self.val_loader)

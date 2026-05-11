@@ -102,6 +102,40 @@ python data_collection.py --output_dir train_set --steering_deadzone 0.05
 
 **Interruzione**: `Ctrl+C` termina la sessione. Il giro corrente incompleto **non** viene salvato.
 
+#### Dataset Raccolto
+
+Il dataset completo contiene **20 giri validi** per un totale di **71.562 campioni** (~1430s di guida a 50Hz).
+
+| Metrica | Valore |
+|---------|--------|
+| Giri validi | 20 |
+| Campioni totali | 71.562 |
+| Durata media giro | ~71.6s (3578 step a 50Hz) |
+| Best lap | 71.038s (lap_017) |
+| Worst lap | 77.146s (lap_001) |
+
+**Spazio delle azioni** (4 dimensioni):
+| Azione | Range | Media | Distribuzione |
+|--------|-------|-------|---------------|
+| Steering | [-1, 1] | 0.082 | Dx: 12.8% \| Dritto: 64.5% \| Sx: 22.7% |
+| Accel | [0, 1] | 0.693 | Gas pieno nel 55%+ dei campioni |
+| Brake | [0, 1] | 0.067 | Usato nel 7.3% dei campioni (forza media: 0.92) |
+| Gear | [1, 6] | 3.37 | 1ª:4.5% \| 2ª:14.4% \| 3ª:35.0% \| 4ª:32.3% \| 5ª:12.9% \| 6ª:0.9% |
+
+> **Nota sulla frizione (clutch)**: il protocollo SCR di TORCS **non supporta la frizione** come azione separata. Il cambio marcia è istantaneo e gestito direttamente dal simulatore. Le 4 azioni (steer, accel, brake, gear) sono l'unico spazio di controllo disponibile.
+
+**Bilanciamento sterzo**:
+| Tipo | Campioni | % |
+|------|----------|---|
+| Rettilineo (\|s\| < 0.05) | 46.169 | 64.5% |
+| Curva lieve (0.05–0.2) | 3.229 | 4.5% |
+| Curva media (0.2–0.5) | 5.055 | 7.1% |
+| Curva forte (>0.5) | 17.109 | 23.9% |
+
+> **Nota**: lo sbilanciamento rettilineo/curva (64.5% vs 35.5%) richiede una **loss pesata** nel BC training per evitare sotto-sterzo (vedi Fase 2).
+
+**Qualità dati**: zero NaN, zero Inf, tutte le azioni nei range attesi. Nessun giro contiene retromarcia significativa.
+
 ### Fase 2: Behavioral Cloning
 
 Addestra la PolicyNetwork sui giri raccolti. Accetta sia un singolo file `.h5` sia una **directory** di `lap_*.h5`.
@@ -111,6 +145,7 @@ python behavioral_cloning.py --dataset train_set/laps --epochs 200 --batch_size 
 ```
 
 Il training usa:
+- **Steering-Weighted MSE Loss**: i campioni in curva (`|steer| > 0.1`) pesano **5x** di più nello sterzo per contrastare lo sbilanciamento dei dati (64.5% rettilinei). Senza questo peso, il modello converge verso `steer≈0` e sotto-sterza catastroficamente alla prima curva.
 - **Validation split 80/20** con seed fisso per riproducibilità
 - **Early stopping** (patience=15 epoche) per prevenire overfitting
 - **GPU** automaticamente se disponibile (testato su RTX 4060 8GB)
@@ -401,6 +436,7 @@ Il passaggio da BC a RL ha richiesto molteplici iterazioni per risolvere il cata
 | 6 | **Gradiente leak durante offline/freeze** | I parametri dell'Actor ricevevano gradienti residui anche durante le fasi di solo-Critic | **`requires_grad = False`** esplicito su tutti i parametri Actor in `update_critic_only()` |
 | 7 | **Drift cumulativo a lungo termine** (ep 91→150) | Il CPI con `-Q.mean()` cieco accumulava piccoli errori di gradiente ad ogni update, erodendo la BC policy | **Advantage-Weighted CPI**: il Q-improvement si attiva solo dove `Q(actor) > Q(buffer)` (advantage positivo) e viene normalizzato per la scala del Q |
 | 8 | **Degradazione reward -47% in 172 ep** | 6 bug interconnessi: (a) `bc_lambda` non applicato nella loss, (b) `clamp(advantage)` non bloccava i gradienti negativi, (c) decay lineare incondizionato di `bc_lambda`, (d) nessuna terminazione per stallo, (e) demo mask errata ai confini, (f) CPI schedule sbagliato con resume | **Riscrittura CPI**: maschera binaria hard con `detach()`, singolo forward pass, `bc_lambda` applicato, decay solo performance-based, stall detection (100 step < 5km/h), fix demo mask e CPI counter |
+| 9 | **BC sotto-sterza: fuori pista allo step 382 (100%)** | La MSE loss uniforme bilancia l'errore su tutti i campioni. Con il 64.5% dei dati in rettilineo (`steer≈0`), la rete converge verso "sterza sempre dritto". Nelle curve strette (demo `steer=0.91`) il modello predice `steer=0.10` — errore dell'89% | **Steering-Weighted MSE**: peso 5x sullo sterzo quando `\|steer_target\| > 0.1`. Lo sterzo in curva passa da 0.10 a 0.49 (miglioramento ~4x). Il MAE in curva cala del 42% (0.14 → 0.08) |
 
 ---
 
