@@ -705,7 +705,11 @@ def main():
         start_episode = ckpt.get('episode', 0) + 1
         best_lap_time = ckpt.get('best_lap_time', args.target_time)
         total_updates = ckpt.get('total_updates', 0)
-        agent.bc_lambda = ckpt.get('bc_lambda', args.bc_lambda)
+        # Usa bc_lambda da CLI (non dal checkpoint) per permettere tuning su resume
+        ckpt_lambda = ckpt.get('bc_lambda', args.bc_lambda)
+        if abs(args.bc_lambda - ckpt_lambda) > 1e-6:
+            print(f"  ⚠️  bc_lambda override: checkpoint={ckpt_lambda:.3f} → CLI={args.bc_lambda:.3f}")
+        agent.bc_lambda = args.bc_lambda
         print(f"  ✅ Checkpoint ripristinato: ep={start_episode-1}, "
               f"best={best_lap_time:.3f}s, updates={total_updates}, λ_bc={agent.bc_lambda:.3f}")
     else:
@@ -793,11 +797,15 @@ def main():
         freeze_boundary = 1 + args.actor_freeze_episodes
         train_ep_counter = max(0, start_episode - freeze_boundary)
 
+        # Contatore locale per il decay di bc_lambda: parte da 0 ad ogni sessione
+        # (incluso resume), così il decay è sempre graduale dal valore corrente.
+        bc_decay_counter = 0
+        bc_lambda_start = agent.bc_lambda  # Valore iniziale di questa sessione
+
         for ep in range(start_episode, args.episodes + 1):
-            # FIX #3: bc_lambda NON decade più linearmente.
-            # Decade solo in base alla performance (quando l'agente completa giri,
-            # vedi logica a fine episodio). Questo previene l'erosione della
-            # protezione BC senza miglioramenti dimostrati.
+            # bc_lambda: fissato al valore da CLI. Decade solo con lap completati
+            # (vedi logica performance-based a fine episodio).
+            # Il decay temporale è stato rimosso perché causa instabilità su resume.
 
             # ── Reset ──
             need_relaunch = (ep == 1) or (ep % args.relaunch_every == 0)
@@ -826,6 +834,7 @@ def main():
             is_freeze = (ep < freeze_boundary)
             if not is_freeze:
                 train_ep_counter += 1  # Incrementa contatore fase TRAIN
+                bc_decay_counter += 1  # Incrementa contatore decay bc_lambda
 
             for step in range(1, args.max_steps + 1):
                 # ── Selezione azione ──

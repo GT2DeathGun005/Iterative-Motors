@@ -46,6 +46,7 @@ SAC_EPISODES=1000
 SAC_MAX_STEPS=5000
 SAC_TARGET_TIME=71.038
 SAC_CRITIC_WARMUP=10000
+SAC_BC_LAMBDA=0.5
 SAC_FREEZE_EPISODES=50
 SAC_BATCH_SIZE=256
 SAC_RELAUNCH_EVERY=20
@@ -217,6 +218,7 @@ if $RUN_SAC; then
         --target_time $SAC_TARGET_TIME \
         --critic_warmup_steps $SAC_CRITIC_WARMUP \
         --actor_freeze_episodes $SAC_FREEZE_EPISODES \
+        --bc_lambda $SAC_BC_LAMBDA \
         --batch_size $SAC_BATCH_SIZE \
         --relaunch_every $SAC_RELAUNCH_EVERY \
         --checkpoint_every $SAC_CHECKPOINT_EVERY"

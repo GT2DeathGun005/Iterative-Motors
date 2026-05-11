@@ -233,7 +233,7 @@ policy_loss = λ_bc · MSE(actor, bc_model)  +  w_cpi · (-Q(actor) · adv_mask 
               ┗━━━━━━━━ BC loss ━━━━━━━━━┛    ┗━━━━━━ Q improvement filtrato ━━━━━━━┛
               Obiettivo primario:               Attivo SOLO dove l'Actor
               "resta uguale alla BC"            è dimostrabilmente migliore del buffer.
-              Pesato da λ_bc (1.0 default,      Maschera hard: gradienti ZERO dove
+              Pesato da λ_bc (0.5 default,      Maschera hard: gradienti ZERO dove
               decade solo con lap completati)    advantage ≤ 0 → nessun drift.
 ```
 
@@ -251,7 +251,7 @@ policy_loss = λ_bc · MSE(actor, bc_model)  +  w_cpi · (-Q(actor) · adv_mask 
 - ✅ Q-value è un **consulente selettivo**: maschera binaria hard impedisce drift
 - ✅ Singolo forward pass Actor per BC e Q (nessun gradiente conflittuale)
 - ✅ Normalizzazione Q-scale previene instabilità per cambio di scala del Critic
-- ✅ `λ_bc` decade solo con lap completati (nessun decay incondizionato)
+- ✅ `λ_bc` decade con lap completati (reward-based); valore iniziale configurabile (default 0.5)
 - ✅ **Launch Override**: partenza da fermo con `accel=1, brake=0, gear=1` finché `speedX < 10 km/h` (la BC non ha dati sufficienti per la partenza)
 - ✅ **Demo reward calcolata**: le transizioni demo usano la stessa reward function del training online (non flat `0.5`)
 
@@ -274,8 +274,8 @@ Durante tutte le fasi di pre-training e freeze, i parametri dell'Actor sono cate
 | `--critic_lr` | `3e-4` | LR critic |
 | `--critic_warmup_steps` | `10000` | Step di pre-training offline del Critic |
 | `--actor_freeze_episodes` | `50` | Episodi con Actor congelato (solo Critic si aggiorna) |
-| `--bc_lambda` | `1.0` | Coefficiente BC nella loss (decade solo con lap completati) |
-| `--bc_decay_episodes` | `500` | *(legacy, non usato attivamente — decay ora solo performance-based)* |
+| `--bc_lambda` | `0.5` | Coefficiente BC nella loss (decade con lap completati; su resume usa il valore CLI, non il checkpoint) |
+| `--bc_decay_episodes` | `500` | *(non usato attivamente — decay solo performance-based)* |
 | `--warmup_steps` | `5000` | Campioni nel buffer prima degli update |
 | `--relaunch_every` | `20` | Rilancia TORCS ogni N episodi |
 | `--checkpoint_every` | `50` | Salva checkpoint ogni N episodi |
