@@ -727,7 +727,9 @@ def main():
     # Addestra solo il Critic sulle demo prima di iniziare il loop degli episodi.
     # Questo permette al Critic di apprendere una Q-function ragionevole
     # PRIMA che possa influenzare l'Actor, prevenendo catastrophic forgetting.
-    if args.critic_warmup_steps > 0 and len(memory) > args.batch_size:
+    # SKIP se stiamo facendo resume: il checkpoint contiene già un Critic addestrato.
+    is_resuming = args.resume and os.path.exists(args.resume)
+    if args.critic_warmup_steps > 0 and len(memory) > args.batch_size and not is_resuming:
         print(f"\n  🧠 Critic pre-training offline: {args.critic_warmup_steps} step...")
         # Tau più basso durante il pre-training per stabilizzare i target Bellman.
         # Con tau=0.005 e 10000 step, il target network converge completamente
@@ -744,6 +746,8 @@ def main():
         # Sincronizza il target network al critic addestrato per partire allineati
         agent.critic_target.load_state_dict(agent.critic.state_dict())
         print(f"  ✅ Critic pre-training completato (target sync).\n")
+    elif is_resuming:
+        print(f"\n  ⏭️  Critic pre-training SKIPPATO (resume da checkpoint, Critic già addestrato).\n")
 
     # ── Training log ──
     log_dir = os.path.join(os.path.dirname(args.save_dir), "session_logs")
