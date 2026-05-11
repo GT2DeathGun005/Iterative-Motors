@@ -662,6 +662,8 @@ def main():
                         help="Salva checkpoint ogni N episodi")
     parser.add_argument("--resume", type=str, default="",
                         help="Path a un checkpoint completo per riprendere il training")
+    parser.add_argument("--exploration_sigma", type=float, default=0.1,
+                        help="Deviazione standard del rumore Gaussiano aggiunto alle azioni in fase TRAIN (0=disabilitato)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -678,7 +680,7 @@ def main():
     print(f"  Episodi: {args.episodes} | Buffer: {args.buffer_size}")
     print(f"  Actor LR: {args.actor_lr} | Critic LR: {args.critic_lr}")
     print(f"  BC λ: {args.bc_lambda} → 0.1 over {args.bc_decay_episodes} ep | Tempo target: {args.target_time:.1f}s")
-    print(f"  Actor freeze: {args.actor_freeze_episodes} ep | Critic warmup: {args.critic_warmup_steps} step")
+    print(f"  Exploration σ: {args.exploration_sigma} | Actor freeze: {args.actor_freeze_episodes} ep | Critic warmup: {args.critic_warmup_steps} step")
     if args.resume:
         print(f"  Resume da: {args.resume}")
     print(f"{'=' * 64}\n")
@@ -844,6 +846,18 @@ def main():
                     action = agent.select_action(state, evaluate=True)
                 else:
                     action = agent.select_action(state)
+                    # ── Exploration Noise ──
+                    # Il log_std è congelato a -5.0 (std≈0.007), quasi deterministico.
+                    # Senza rumore esterno, l'agente percorre la stessa traiettoria
+                    # ad ogni episodio e non può scoprire come superare le curve
+                    # dove la BC policy crasha. Il rumore Gaussiano aggiunge
+                    # diversità alle esperienze raccolte senza corrompere i pesi.
+                    # Applicato solo a steer/accel/brake (non gear).
+                    if args.exploration_sigma > 0:
+                        noise = np.random.normal(0, args.exploration_sigma, size=3)
+                        action[0] = np.clip(action[0] + noise[0], -1.0, 1.0)  # steer
+                        action[1] = np.clip(action[1] + noise[1], -1.0, 1.0)  # accel
+                        action[2] = np.clip(action[2] + noise[2], -1.0, 1.0)  # brake
 
                 # ── Launch Override ──
                 # La BC policy non ha abbastanza campioni di partenza da fermo
