@@ -274,7 +274,14 @@ class SACAgent:
             action, _, _ = self.actor.sample(state_t)
         return action.detach().cpu().numpy()[0]
 
-    def update_parameters(self, memory: ReplayBuffer, batch_size: int, episode: int = 0, freeze_episodes: int = 50):
+    def update_parameters(self, memory: ReplayBuffer, batch_size: int,
+                          train_episode: int = 0):
+        """Update Actor e Critic con Advantage-Weighted CPI.
+
+        Args:
+            train_episode: numero di episodi dall'inizio della fase TRAIN
+                           (esclude la fase FREEZE). Usato per lo schedule CPI.
+        """
         state_b, action_b, reward_b, next_state_b, mask_b = memory.sample(batch_size)
 
         state_b = torch.FloatTensor(state_b).to(self.device)
@@ -283,7 +290,7 @@ class SACAgent:
         reward_b = torch.FloatTensor(reward_b).to(self.device).unsqueeze(1)
         mask_b = torch.FloatTensor(mask_b).to(self.device).unsqueeze(1)
 
-        # Critic update
+        # ── Critic update ──
         with torch.no_grad():
             next_action, next_log_pi, _ = self.actor.sample(next_state_b)
             q1_next, q2_next = self.critic_target(next_state_b, next_action)
@@ -298,50 +305,45 @@ class SACAgent:
         self.critic_optimizer.step()
 
         # ── Actor update: Advantage-Weighted CPI ──
-        # La BC loss è l'obiettivo PRIMARIO.
-        # Il Q-value corregge l'Actor SOLO quando il Critic ha un vantaggio
-        # positivo (l'azione dell'Actor è migliore di quella nel buffer).
-        # Questo impedisce al Critic di degradare l'Actor quando è incerto.
+        # Un SINGOLO forward pass dell'Actor produce sia l'azione per BC
+        # sia l'azione per Q-improvement, evitando gradienti conflittuali.
+
+        pi, _, pi_det = self.actor.sample(state_b)
 
         # 1. BC loss: distanza dall'azione BC (obiettivo principale)
         bc_loss = torch.tensor(0.0, device=self.device)
         if self.bc_model is not None:
             with torch.no_grad():
                 bc_actions = self.bc_model(state_b)
-            _, _, actor_det = self.actor.sample(state_b)
-            bc_loss = F.mse_loss(actor_det, bc_actions)
+            bc_loss = F.mse_loss(pi_det, bc_actions)
 
-        # 2. Advantage-filtered Q-improvement
-        pi, _, _ = self.actor.sample(state_b)
+        # 2. Advantage-filtered Q-improvement con maschera binaria hard
         q1_pi, q2_pi = self.critic(state_b, pi)
         min_q_pi = torch.min(q1_pi, q2_pi)
 
-        # Q delle azioni nel buffer (baseline)
+        # Q delle azioni nel buffer (baseline) — DETACHED
         with torch.no_grad():
             q1_buf, q2_buf = self.critic(state_b, action_b)
             q_baseline = torch.min(q1_buf, q2_buf)
+            # Maschera binaria: 1.0 dove l'Actor è migliore del buffer, 0.0 altrove.
+            # Il detach() impedisce ai gradienti di fluire attraverso la maschera.
+            adv_mask = (min_q_pi.detach() > q_baseline).float()
 
-        # Advantage: quanto l'azione dell'Actor è migliore di quella nel buffer
-        advantage = min_q_pi - q_baseline
-
-        # Filtro: applica Q-improvement SOLO dove il vantaggio è positivo
-        # Dove advantage < 0, il Critic dice "l'azione buffer era meglio" → ignora
-        positive_adv = torch.clamp(advantage, min=0.0)
-
-        # Normalizza per la scala del Q per evitare drift
+        # Applica Q-improvement SOLO dove advantage > 0 (maschera hard)
+        # Dove adv_mask=0, il gradiente è zero → il Critic non può degradare l'Actor
         q_scale = max(q_baseline.abs().mean().item(), 1.0)
-        q_improvement = -(positive_adv / q_scale).mean()
+        q_improvement = -((min_q_pi * adv_mask) / q_scale).mean()
 
-        # CPI loss: BC domina, Q corregge con peso crescente
-        # Schedule: il Critic guadagna influenza man mano che diventa più affidabile
-        train_ep = max(0, episode - freeze_episodes)  # episodi dall'inizio del TRAIN
-        if train_ep < 50:
+        # CPI schedule: il Critic guadagna influenza gradualmente
+        if train_episode < 50:
             cpi_weight = 0.01   # Stabilizzazione: CPI ultra-conservativo
-        elif train_ep < 150:
+        elif train_episode < 150:
             cpi_weight = 0.05   # Crescita: il Critic inizia a influenzare
         else:
             cpi_weight = 0.1    # Pieno: il Critic guida il miglioramento
-        policy_loss = bc_loss + cpi_weight * q_improvement
+
+        # FIX #1: bc_lambda ora moltiplica effettivamente la BC loss
+        policy_loss = self.bc_lambda * bc_loss + cpi_weight * q_improvement
 
         self.actor_optimizer.zero_grad()
         policy_loss.backward()
@@ -465,9 +467,14 @@ def prefill_buffer_from_demos(memory: ReplayBuffer, demo_dir: str):
             states = h5f['states'][:]
             actions = h5f['actions'][:]
 
-        for i in range(len(states) - 1):
+        n_transitions = len(states) - 1
+        for i in range(n_transitions):
             norm_action = normalize_action(actions[i])
-            memory.push(states[i], norm_action, 0.5, states[i + 1], 1.0)
+            # FIX #5: ultima transizione di ogni giro demo → mask=0.0 (terminale)
+            # perché è il confine tra la fine di un giro e l'inizio del successivo
+            is_last = (i == n_transitions - 1)
+            mask = 0.0 if is_last else 1.0
+            memory.push(states[i], norm_action, 0.5, states[i + 1], mask)
             total += 1
 
     print(f"  ✅ Buffer pre-riempito con {total:,} transizioni da {len(h5_files)} giri demo")
@@ -572,7 +579,8 @@ def compute_lap_bonus(lap_time: float, best_time: float) -> float:
 def main():
     parser = argparse.ArgumentParser(description="SAC RL Training — TORCS Giro Secco (RLPD)")
     parser.add_argument("--episodes", type=int, default=1000, help="Episodi di training")
-    parser.add_argument("--max_steps", type=int, default=10000, help="Max step per episodio")
+    parser.add_argument("--max_steps", type=int, default=5000,
+                        help="Max step per episodio (~250s a 20Hz, ~3.5x tempo umano best)")
     parser.add_argument("--bc_weights", type=str, default="train_set/checkpoints/bc_policy.pth",
                         help="Path ai pesi BC per warm start")
     parser.add_argument("--demo_dir", type=str, default="train_set/laps",
@@ -716,12 +724,17 @@ def main():
     env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=False)
 
     try:
+        # Contatore episodi nella fase TRAIN (post-freeze), per CPI schedule
+        # La freeze boundary è assoluta: ep < (1 + actor_freeze_episodes)
+        # Per resume da ep=150 con freeze=50 → counter = max(0, 150 - 51) = 99
+        freeze_boundary = 1 + args.actor_freeze_episodes
+        train_ep_counter = max(0, start_episode - freeze_boundary)
+
         for ep in range(start_episode, args.episodes + 1):
-            # ── Scheduled BC λ decay (lineare su bc_decay_episodes) ──
-            ep_elapsed = ep - start_episode
-            if args.bc_decay_episodes > 0 and ep_elapsed < args.bc_decay_episodes:
-                scheduled_lambda = args.bc_lambda * (1.0 - 0.9 * ep_elapsed / args.bc_decay_episodes)
-                agent.bc_lambda = max(0.1, scheduled_lambda)
+            # FIX #3: bc_lambda NON decade più linearmente.
+            # Decade solo in base alla performance (quando l'agente completa giri,
+            # vedi logica a fine episodio). Questo previene l'erosione della
+            # protezione BC senza miglioramenti dimostrati.
 
             # ── Reset ──
             need_relaunch = (ep == 1) or (ep % args.relaunch_every == 0)
@@ -742,12 +755,14 @@ def main():
             if isinstance(prev_last_lap, list):
                 prev_last_lap = prev_last_lap[0]
 
-            stall_counter = 0
+            stall_counter = 0  # Conta step consecutivi a bassa velocità
             lap_completed = False
             ep_lap_time = 0.0
 
             # Determina la fase di training per questo episodio
-            is_freeze = (ep < start_episode + args.actor_freeze_episodes)
+            is_freeze = (ep < freeze_boundary)
+            if not is_freeze:
+                train_ep_counter += 1  # Incrementa contatore fase TRAIN
 
             for step in range(1, args.max_steps + 1):
                 # ── Selezione azione ──
@@ -769,9 +784,15 @@ def main():
                     next_obs, prev_dist, raw
                 )
 
-                # (Nessuna terminazione artificiale per stallo/looping.
-                # La time_penalty nella reward rende lo stallo intrinsecamente costoso.
-                # L'episodio termina solo per offtrack, spin, lap completato, o max_steps.)
+                # FIX #4: terminazione per stallo (velocità < 5 km/h per 100+ step)
+                speed_x_raw = float(np.array(next_obs.get('speedX', 0.0)).flat[0])
+                if abs(speed_x_raw) < 5.0:
+                    stall_counter += 1
+                else:
+                    stall_counter = 0
+                if stall_counter >= 100 and not custom_done:
+                    custom_done = True
+                    reward = -50.0  # Penalità moderata per stallo
 
                 # ── Lap completion ──
                 current_last_lap = float(raw.get('lastLapTime', 0.0))
@@ -818,7 +839,9 @@ def main():
                         agent.update_critic_only(memory, args.batch_size)
                     else:
                         # Fase TRAIN: update completo (Actor + Critic)
-                        agent.update_parameters(memory, args.batch_size, episode=ep, freeze_episodes=args.actor_freeze_episodes)
+                        # FIX #6: train_ep_counter è relativo alla fase TRAIN
+                        agent.update_parameters(memory, args.batch_size,
+                                                train_episode=train_ep_counter)
                     total_updates += 1
 
                 if done:

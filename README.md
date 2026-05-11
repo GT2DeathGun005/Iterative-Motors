@@ -164,24 +164,32 @@ graph LR
 Nella fase TRAIN, la loss dell'Actor è:
 
 ```
-# Advantage: quanto l'azione dell'Actor è migliore di quella nel buffer
-advantage = Q(actor_action) - Q(buffer_action)
-positive_adv = clamp(advantage, min=0)       # solo miglioramenti
+# Maschera binaria hard: 1.0 dove Q(actor) > Q(buffer), 0.0 altrove
+adv_mask = float(Q(actor_action).detach() > Q(buffer_action))   # no gradient
 
-policy_loss = MSE(actor, bc_model)  +  0.01 · (-positive_adv / Q_scale)
-              ┗━━━━━ BC loss ━━━━━┛    ┗━━━━ Q improvement filtrato ━━━━┛
-              Obiettivo primario:       Attivo SOLO quando l'Actor
-              "resta uguale alla BC"    fa meglio del buffer.
-                                       Normalizzato per la scala del Q.
+policy_loss = λ_bc · MSE(actor, bc_model)  +  w_cpi · (-Q(actor) · adv_mask / Q_scale)
+              ┗━━━━━━━━ BC loss ━━━━━━━━━┛    ┗━━━━━━ Q improvement filtrato ━━━━━━━┛
+              Obiettivo primario:               Attivo SOLO dove l'Actor
+              "resta uguale alla BC"            è dimostrabilmente migliore del buffer.
+              Pesato da λ_bc (1.0 default,      Maschera hard: gradienti ZERO dove
+              decade solo con lap completati)    advantage ≤ 0 → nessun drift.
 ```
+
+**Schedule CPI** (basato su episodi nella fase TRAIN, non assoluti):
+| Episodi TRAIN | `w_cpi` | Fase |
+|---------------|---------|------|
+| 0–49 | 0.01 | Stabilizzazione ultra-conservativa |
+| 50–149 | 0.05 | Crescita: il Critic inizia a influenzare |
+| 150+ | 0.1 | Pieno: il Critic guida il miglioramento |
 
 **Differenze chiave rispetto al SAC standard**:
 - ❌ Nessun termine di entropia → zero pressione esplorativa casuale
 - ❌ Nessun aggiornamento di `log_std` → rumore fisso a `std ≈ 0.007`
-- ✅ BC loss è l'obiettivo primario, non un regularizer
-- ✅ Q-value è un **consulente selettivo**: può solo migliorare, non degradare
-- ✅ Advantage filtering previene il drift a lungo termine
+- ✅ BC loss è l'obiettivo primario, pesato da `λ_bc`
+- ✅ Q-value è un **consulente selettivo**: maschera binaria hard impedisce drift
+- ✅ Singolo forward pass Actor per BC e Q (nessun gradiente conflittuale)
 - ✅ Normalizzazione Q-scale previene instabilità per cambio di scala del Critic
+- ✅ `λ_bc` decade solo con lap completati (nessun decay incondizionato)
 
 #### Isolamento dei Gradienti
 
@@ -202,8 +210,8 @@ Durante tutte le fasi di pre-training e freeze, i parametri dell'Actor sono cate
 | `--critic_lr` | `3e-4` | LR critic |
 | `--critic_warmup_steps` | `10000` | Step di pre-training offline del Critic |
 | `--actor_freeze_episodes` | `50` | Episodi con Actor congelato (solo Critic si aggiorna) |
-| `--bc_lambda` | `1.0` | Coefficiente BC (usato nel decay schedulato) |
-| `--bc_decay_episodes` | `500` | Episodi per il decay lineare di `bc_lambda` |
+| `--bc_lambda` | `1.0` | Coefficiente BC nella loss (decade solo con lap completati) |
+| `--bc_decay_episodes` | `500` | *(legacy, non usato attivamente — decay ora solo performance-based)* |
 | `--warmup_steps` | `5000` | Campioni nel buffer prima degli update |
 | `--relaunch_every` | `20` | Rilancia TORCS ogni N episodi |
 | `--checkpoint_every` | `50` | Salva checkpoint ogni N episodi |
@@ -319,11 +327,13 @@ Se speedX < 0 (retromarcia):
 |-----------|----------|-------------|
 | `\|trackPos\| > 1.0` (fuori pista) | -100 | Terminazione fisica: l'auto è uscita |
 | `cos(angle) < 0` (spin/retromarcia) | -100 | L'auto si è girata completamente |
-| `max_steps` raggiunto (5000 = 100s) | — | Safety cap, nessuna penalità aggiuntiva |
+| `\|speedX\| < 5 km/h` per 100+ step | -50 | Stallo: la macchina è ferma o quasi |
+| `max_steps` raggiunto (5000 ≈ 250s) | — | Safety cap, ~3.5x tempo umano best |
 
-> **Nota**: le terminazioni artificiali per stallo (speedX < soglia) e anti-looping
-> (finestra mobile su distRaced) sono state **rimosse** dopo aver verificato che causavano
-> troncamenti dell'orizzonte incompatibili con i tempi fisici di accelerazione da fermo a 50Hz.
+> **Nota**: la terminazione per stallo (velocità < 5 km/h per 100 step consecutivi) è stata
+> aggiunta dopo aver verificato che la sola time penalty (-0.1/step) non era sufficiente
+> a prevenire episodi in cui la macchina girava a bassissima velocità senza mai terminare,
+> inquinando il replay buffer con transizioni di bassa qualità.
 
 ### Bonus/Penalità Completamento Giro (basato su tempi umani)
 
@@ -390,6 +400,7 @@ Il passaggio da BC a RL ha richiesto molteplici iterazioni per risolvere il cata
 | 5 | **Degradazione lenta anche senza entropia** | Il SAC loss (`-Q_value`) spostava la media dell'Actor lontano dalla BC anche con `bc_lambda=1.0` | **Conservative Policy Improvement**: BC loss come obiettivo primario + Q-value con peso 0.01 come correzione minimale |
 | 6 | **Gradiente leak durante offline/freeze** | I parametri dell'Actor ricevevano gradienti residui anche durante le fasi di solo-Critic | **`requires_grad = False`** esplicito su tutti i parametri Actor in `update_critic_only()` |
 | 7 | **Drift cumulativo a lungo termine** (ep 91→150) | Il CPI con `-Q.mean()` cieco accumulava piccoli errori di gradiente ad ogni update, erodendo la BC policy | **Advantage-Weighted CPI**: il Q-improvement si attiva solo dove `Q(actor) > Q(buffer)` (advantage positivo) e viene normalizzato per la scala del Q |
+| 8 | **Degradazione reward -47% in 172 ep** | 6 bug interconnessi: (a) `bc_lambda` non applicato nella loss, (b) `clamp(advantage)` non bloccava i gradienti negativi, (c) decay lineare incondizionato di `bc_lambda`, (d) nessuna terminazione per stallo, (e) demo mask errata ai confini, (f) CPI schedule sbagliato con resume | **Riscrittura CPI**: maschera binaria hard con `detach()`, singolo forward pass, `bc_lambda` applicato, decay solo performance-based, stall detection (100 step < 5km/h), fix demo mask e CPI counter |
 
 ---
 
