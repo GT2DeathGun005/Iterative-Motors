@@ -360,6 +360,13 @@ class SACAgent:
         """Aggiorna SOLO il Critic (e il target) — usato per il pre-training offline.
 
         I gradienti dell'Actor sono categoricamente disabilitati durante questa fase.
+
+        IMPORTANTE: il termine entropia (-alpha * log_pi) è RIMOSSO dal target
+        Bellman. Con log_std=-5.0 l'Actor è quasi-deterministico, il che produce
+        log_pi≈90. Moltiplicato per alpha=0.02 dà un penalty di ~1.8/step che
+        domina la reward (~0.7) e spinge i Q-values a -80 invece del vero ~+68.
+        L'entropia è un incentivo all'esplorazione per il loop online,
+        non ha senso durante il pre-training offline su dataset fisso.
         """
         state_b, action_b, reward_b, next_state_b, mask_b = memory.sample(batch_size)
 
@@ -374,9 +381,11 @@ class SACAgent:
             p.requires_grad = False
 
         with torch.no_grad():
-            next_action, next_log_pi, _ = self.actor.sample(next_state_b)
+            # Usa la media deterministica dell'Actor (no rumore di sampling)
+            _, _, next_action = self.actor.sample(next_state_b)
             q1_next, q2_next = self.critic_target(next_state_b, next_action)
-            min_q_next = torch.min(q1_next, q2_next) - self.alpha * next_log_pi
+            # NO entropia: il termine -alpha*log_pi è omesso intenzionalmente
+            min_q_next = torch.min(q1_next, q2_next)
             next_q = reward_b + mask_b * self.gamma * min_q_next
 
         q1, q2 = self.critic(state_b, action_b)
@@ -384,6 +393,7 @@ class SACAgent:
 
         self.critic_optimizer.zero_grad()
         qf_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.critic_optimizer.step()
 
         # Soft update target
@@ -719,12 +729,21 @@ def main():
     # PRIMA che possa influenzare l'Actor, prevenendo catastrophic forgetting.
     if args.critic_warmup_steps > 0 and len(memory) > args.batch_size:
         print(f"\n  🧠 Critic pre-training offline: {args.critic_warmup_steps} step...")
+        # Tau più basso durante il pre-training per stabilizzare i target Bellman.
+        # Con tau=0.005 e 10000 step, il target network converge completamente
+        # al main network (1-(1-0.005)^10000 ≈ 1.0), eliminando la stabilizzazione.
+        # tau=0.001 mantiene il target network come ancora stabile.
+        original_tau = agent.tau
+        agent.tau = 0.001
         for cw_step in range(1, args.critic_warmup_steps + 1):
             cw_loss = agent.update_critic_only(memory, args.batch_size)
             if cw_step % 1000 == 0 or cw_step == 1:
                 pct = 100 * cw_step / args.critic_warmup_steps
                 print(f"    [{pct:5.1f}%] step {cw_step:6d}/{args.critic_warmup_steps} | critic_loss: {cw_loss:.4f}")
-        print(f"  ✅ Critic pre-training completato.\n")
+        agent.tau = original_tau
+        # Sincronizza il target network al critic addestrato per partire allineati
+        agent.critic_target.load_state_dict(agent.critic.state_dict())
+        print(f"  ✅ Critic pre-training completato (target sync).\n")
 
     # ── Training log ──
     log_dir = os.path.join(os.path.dirname(args.save_dir), "session_logs")
