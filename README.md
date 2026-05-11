@@ -146,13 +146,40 @@ python behavioral_cloning.py --dataset train_set/laps --epochs 200 --batch_size 
 
 Il training usa:
 - **Steering-Weighted MSE Loss**: i campioni in curva (`|steer| > 0.1`) pesano **5x** di più nello sterzo per contrastare lo sbilanciamento dei dati (64.5% rettilinei). Senza questo peso, il modello converge verso `steer≈0` e sotto-sterza catastroficamente alla prima curva.
-- **Validation split 80/20** con seed fisso per riproducibilità
+- **Validation split 80/20** con seed fisso per riproducibilità. La split funge da regolarizzazione implicita: senza di essa (training su 100% dei dati) il modello overfitta, degradando la performance in ambiente reale (reward media: +20 vs +296 con early stopping).
 - **Early stopping** (patience=15 epoche) per prevenire overfitting
 - **GPU** automaticamente se disponibile (testato su RTX 4060 8GB)
 
 ### Fase 3: SAC Fine-Tuning con CPI (RL)
 
 Il training RL usa un approccio **Conservative Policy Improvement (CPI)** per fine-tuning dei pesi BC senza catastrophic forgetting.
+
+#### 🚀 Quick Start (script automatizzati)
+
+```bash
+# Auto-detect: riprende da checkpoint se esiste, altrimenti avvia da zero
+./train_all.sh
+
+# Forza ripartenza completa (ri-addestra BC → SAC da zero)
+./train_all.sh --fresh
+
+# Solo Behavioral Cloning
+./train_all.sh --bc-only
+
+# Riprendi da un checkpoint specifico
+./train_all.sh --resume train_set/checkpoints/sac_checkpoint_ep0050.pth
+
+# Monitoraggio live
+./monitor.sh
+
+# Solo status (senza follow)
+./monitor.sh --status
+
+# Ferma tutto
+./stop_training.sh
+```
+
+#### Comandi manuali
 
 ```bash
 # Training headless (raccomandato)
@@ -190,7 +217,7 @@ graph LR
 
 | Fase | Episodi | Actor | Critic | Scopo |
 |------|---------|-------|--------|-------|
-| **Offline Warmup** | — (10K step) | Congelato | Si addestra su demo | Il Critic impara una Q-function base dai dati umani |
+| **Offline Warmup** | — (10K step) | Congelato | Si addestra su demo | Il Critic impara una Q-function base dai dati umani (reward calcolata, non flat) |
 | **FREEZE** | 1–50 | Congelato (pura BC, deterministico) | Si addestra online | Il Critic osserva la BC guidare in ambiente reale |
 | **TRAIN** | 51+ | Advantage-Weighted CPI | Si addestra online | L'Actor migliora selettivamente guidato dal Critic |
 
@@ -225,6 +252,8 @@ policy_loss = λ_bc · MSE(actor, bc_model)  +  w_cpi · (-Q(actor) · adv_mask 
 - ✅ Singolo forward pass Actor per BC e Q (nessun gradiente conflittuale)
 - ✅ Normalizzazione Q-scale previene instabilità per cambio di scala del Critic
 - ✅ `λ_bc` decade solo con lap completati (nessun decay incondizionato)
+- ✅ **Launch Override**: partenza da fermo con `accel=1, brake=0, gear=1` finché `speedX < 10 km/h` (la BC non ha dati sufficienti per la partenza)
+- ✅ **Demo reward calcolata**: le transizioni demo usano la stessa reward function del training online (non flat `0.5`)
 
 #### Isolamento dei Gradienti
 
@@ -437,6 +466,8 @@ Il passaggio da BC a RL ha richiesto molteplici iterazioni per risolvere il cata
 | 7 | **Drift cumulativo a lungo termine** (ep 91→150) | Il CPI con `-Q.mean()` cieco accumulava piccoli errori di gradiente ad ogni update, erodendo la BC policy | **Advantage-Weighted CPI**: il Q-improvement si attiva solo dove `Q(actor) > Q(buffer)` (advantage positivo) e viene normalizzato per la scala del Q |
 | 8 | **Degradazione reward -47% in 172 ep** | 6 bug interconnessi: (a) `bc_lambda` non applicato nella loss, (b) `clamp(advantage)` non bloccava i gradienti negativi, (c) decay lineare incondizionato di `bc_lambda`, (d) nessuna terminazione per stallo, (e) demo mask errata ai confini, (f) CPI schedule sbagliato con resume | **Riscrittura CPI**: maschera binaria hard con `detach()`, singolo forward pass, `bc_lambda` applicato, decay solo performance-based, stall detection (100 step < 5km/h), fix demo mask e CPI counter |
 | 9 | **BC sotto-sterza: fuori pista allo step 382 (100%)** | La MSE loss uniforme bilancia l'errore su tutti i campioni. Con il 64.5% dei dati in rettilineo (`steer≈0`), la rete converge verso "sterza sempre dritto". Nelle curve strette (demo `steer=0.91`) il modello predice `steer=0.10` — errore dell'89% | **Steering-Weighted MSE**: peso 5x sullo sterzo quando `\|steer_target\| > 0.1`. Lo sterzo in curva passa da 0.10 a 0.49 (miglioramento ~4x). Il MAE in curva cala del 42% (0.14 → 0.08) |
+| 10 | **Stallo universale: ogni episodio terminato a 100 step** | Lo stall detection confrontava `speedX < 5.0` ma `speedX` dal wrapper `gym_torcs` è normalizzato per `default_speed=50`. Il valore `5.0` normalizzato equivale a 250 km/h → condizione sempre vera → terminazione immediata | **Soglia corretta**: `speedX < 0.1` (5 km/h ÷ 50). Stesso bug nel launch override: soglia cambiata da `10.0` a `0.2` (10 km/h ÷ 50) |
+| 11 | **BC non accelera da fermo + overfitting senza validation** | (a) La BC policy predice `accel=0` a velocità zero perché il dataset contiene pochissimi campioni di partenza da fermo. (b) Tentativo di rimuovere la validation split 80/20 per usare il 100% dei dati: il modello overffitta (train loss 0.021 vs val loss 0.032), degradando la performance reale (reward media +20 vs +296) | **(a) Launch Override**: nei primi step, se `speedX < 10 km/h`, forza `accel=1, brake=0, gear=1` mantenendo lo sterzo dalla policy. **(b) Split ripristinata**: la validation split è una regolarizzazione implicita necessaria; con ~71k campioni mescolati da 20 giri, la probabilità di perdere tutti i campioni di una curva è trascurabile |
 
 ---
 
@@ -448,6 +479,9 @@ AIcar/
 ├── behavioral_cloning.py      # Fase 2: Imitation Learning (BC)
 ├── sac_rl.py                  # Fase 3: SAC Reinforcement Learning
 ├── test_agent.py              # Test: valutazione agente addestrato
+├── train_all.sh               # 🚀 Script automazione: BC → SAC (--bc-only, --sac-only, --resume)
+├── stop_training.sh           # 🛑 Ferma tutti i processi di training
+├── monitor.sh                 # 📊 Monitoraggio live (status + follow log)
 ├── README.md
 ├── .gitignore
 ├── gym_torcs/                 # Wrapper Python per comunicare con TORCS via UDP

@@ -5,7 +5,7 @@ Addestra un agente SAC pre-inizializzato con i pesi del Behavioral Cloning
 per battere i tempi umani su singolo giro con partenza da fermo.
 
 Features:
-  - RLPD: replay buffer pre-riempito con 71k transizioni umane
+  - RLPD: replay buffer pre-riempito con 71k transizioni umane (reward calcolata)
   - Warm Start: carica backbone + mean_linear dal BC checkpoint
   - BC Regularization: previene catastrophic forgetting dei pesi BC
   - λ_bc decay: il vincolo BC si rilassa quando l'agente migliora
@@ -448,13 +448,48 @@ def normalize_action(env_action: np.ndarray) -> np.ndarray:
     ], dtype=np.float32)
 
 
+def compute_demo_reward(state: np.ndarray, next_state: np.ndarray) -> float:
+    """Calcola la reward per una transizione demo usando il vettore stato.
+
+    Usa le stesse componenti di compute_step_reward() ma ricavate
+    dal vettore flattened (non dal dict obs):
+      state[0]  = angle
+      state[20] = trackPos
+      state[21] = speedX (÷50, normalizzato dal wrapper)
+
+    Il progresso è approssimato da speedX * dt (dt ≈ 0.02s a 50Hz).
+    """
+    speed_x = next_state[21]      # Normalizzato (÷50)
+    track_pos = next_state[20]
+    angle = next_state[0]
+
+    # Progresso approssimato: distanza ≈ velocità × tempo
+    # speedX è in unità normalizzate (÷50), dt=0.02s, speed reale = speedX*50 km/h
+    # Converti in m/s: speed_real = speedX * 50 / 3.6
+    # delta_dist ≈ speed_real * 0.02 ≈ speedX * 50 / 3.6 * 0.02 ≈ speedX * 0.278
+    if speed_x >= 0:
+        progress = speed_x * 0.278
+        speed_bonus = speed_x * 0.05
+        reverse_penalty = 0.0
+    else:
+        progress = 0.0
+        speed_bonus = 0.0
+        reverse_penalty = -abs(speed_x) * 0.1
+
+    center_penalty = -1.0 * (track_pos ** 2)
+    angle_penalty = -1.5 * abs(angle)
+    time_penalty = -0.1
+
+    return progress + speed_bonus + center_penalty + angle_penalty + reverse_penalty + time_penalty
+
+
 def prefill_buffer_from_demos(memory: ReplayBuffer, demo_dir: str):
     """Carica le transizioni dalle demo umane nel replay buffer.
 
     Ogni coppia (state_t, action_t) → (state_t+1) diventa una transizione.
     Le azioni vengono normalizzate in formato SAC (tanh [-1,1]).
-    La reward è un valore neutro-positivo (0.5) per indicare che le demo
-    sono "buone" senza distorcere la scala della reward online.
+    La reward viene calcolata dalle componenti del vettore stato usando
+    la stessa formula della reward online (speed, center, angle, time penalty).
     """
     h5_files = sorted(glob.glob(os.path.join(demo_dir, "lap_*.h5")))
     if not h5_files:
@@ -462,6 +497,7 @@ def prefill_buffer_from_demos(memory: ReplayBuffer, demo_dir: str):
         return 0
 
     total = 0
+    rewards_sum = 0.0
     for h5_path in h5_files:
         with h5py.File(h5_path, 'r') as h5f:
             states = h5f['states'][:]
@@ -470,14 +506,18 @@ def prefill_buffer_from_demos(memory: ReplayBuffer, demo_dir: str):
         n_transitions = len(states) - 1
         for i in range(n_transitions):
             norm_action = normalize_action(actions[i])
+            reward = compute_demo_reward(states[i], states[i + 1])
             # FIX #5: ultima transizione di ogni giro demo → mask=0.0 (terminale)
             # perché è il confine tra la fine di un giro e l'inizio del successivo
             is_last = (i == n_transitions - 1)
             mask = 0.0 if is_last else 1.0
-            memory.push(states[i], norm_action, 0.5, states[i + 1], mask)
+            memory.push(states[i], norm_action, reward, states[i + 1], mask)
+            rewards_sum += reward
             total += 1
 
+    avg_reward = rewards_sum / total if total > 0 else 0.0
     print(f"  ✅ Buffer pre-riempito con {total:,} transizioni da {len(h5_files)} giri demo")
+    print(f"     Reward media demo: {avg_reward:.3f}")
     return total
 
 
@@ -773,6 +813,20 @@ def main():
                 else:
                     action = agent.select_action(state)
 
+                # ── Launch Override ──
+                # La BC policy non ha abbastanza campioni di partenza da fermo
+                # e predice accel=0 a velocità zero. Override: full throttle,
+                # no brake, gear=1, con lo sterzo dalla policy.
+                speed_x_current = state[21]  # speedX normalizzato (÷50)
+                if speed_x_current < 0.2 and step <= 200:  # 0.2 = 10 km/h / 50
+                    # Mantieni lo sterzo della policy, forza accelerazione
+                    action = np.array([
+                        action[0],     # steer: dalla policy
+                        1.0,           # accel: full throttle (già in range tanh)
+                        -1.0,          # brake: no brake (in range tanh)
+                        -0.667,        # gear: 1 (normalizzato: (1/3)-1 = -0.667)
+                    ], dtype=np.float32)
+
                 # ── De-normalizza e step ──
                 env_action = denormalize_action(action)
                 next_obs, _, env_done, _ = env.step(env_action)
@@ -785,8 +839,9 @@ def main():
                 )
 
                 # FIX #4: terminazione per stallo (velocità < 5 km/h per 100+ step)
+                # speedX è normalizzato dal wrapper (÷50), 5 km/h = 0.1
                 speed_x_raw = float(np.array(next_obs.get('speedX', 0.0)).flat[0])
-                if abs(speed_x_raw) < 5.0:
+                if abs(speed_x_raw) < 0.1:  # 0.1 = 5 km/h / 50
                     stall_counter += 1
                 else:
                     stall_counter = 0

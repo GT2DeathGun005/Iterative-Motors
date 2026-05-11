@@ -188,9 +188,18 @@ class BehaviorCloningTrainer:
     Features:
       - Loss pesata: lo sterzo in curva (|steer| > 0.1) pesa 5x di più
         per contrastare lo sbilanciamento dei dati (64.5% rettilinei)
-      - Validation split con seed fisso per riproducibilità
+      - Validation split 80/20 con seed fisso per riproducibilità
       - Early stopping basato sulla val loss
       - Salvataggio automatico del miglior checkpoint
+
+    Nota sulla validation split:
+      La split 80/20 funge da regolarizzazione implicita: il modello si
+      ferma quando inizia a memorizzare il rumore nei dati anziché i pattern
+      di guida. Senza di essa (training su 100%) il modello raggiunge
+      train loss molto basse (0.021) ma overffitta, degradando la performance
+      in ambiente reale (reward media: +20 vs +296 con early stopping).
+      Con ~71k campioni mescolati da 20 giri, la probabilità di perdere tutti
+      i campioni di una curva specifica è trascurabile.
     """
 
     # Peso extra per lo sterzo in curva. Senza questo, la MSE media converge
