@@ -638,9 +638,9 @@ def prefill_buffer_from_demos(memory: ReplayBuffer, demo_dir: str):
     La reward viene calcolata dalle componenti del vettore stato usando
     la stessa formula della reward online (speed, center, angle, time penalty).
     """
-    h5_files = sorted(glob.glob(os.path.join(demo_dir, "lap_*.h5")))
+    h5_files = sorted(glob.glob(os.path.join(demo_dir, "**/lap_*.h5"), recursive=True))
     if not h5_files:
-        print(f"  ⚠️  Nessun file demo trovato in {demo_dir}")
+        print(f"  ⚠️  Nessun file demo trovato in {demo_dir} o nelle sue sottocartelle")
         return 0
 
     total = 0
@@ -650,14 +650,19 @@ def prefill_buffer_from_demos(memory: ReplayBuffer, demo_dir: str):
             states = h5f['states'][:]
             actions = h5f['actions'][:]
 
+        is_curve_snippet = "lap_curve_" in os.path.basename(h5_path)
+
         n_transitions = len(states) - 1
         for i in range(n_transitions):
             norm_action = normalize_action(actions[i])
             reward = compute_demo_reward(states[i], states[i + 1])
+            
             # FIX #5: ultima transizione di ogni giro demo → mask=0.0 (terminale)
-            # perché è il confine tra la fine di un giro e l'inizio del successivo
+            # ECCEZIONE: per gli snippet delle curve, l'episodio non finisce realmente lì,
+            # quindi il Critic deve fare bootstrap (mask=1.0) sul next_state.
             is_last = (i == n_transitions - 1)
-            mask = 0.0 if is_last else 1.0
+            mask = 0.0 if (is_last and not is_curve_snippet) else 1.0
+            
             memory.push(states[i], norm_action, reward, states[i + 1], mask)
             rewards_sum += reward
             total += 1

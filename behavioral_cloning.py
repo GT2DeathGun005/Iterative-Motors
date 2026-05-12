@@ -3,8 +3,9 @@ Behavioral Cloning (Imitation Learning) — TORCS Giro Secco
 
 Addestra una PolicyNetwork sulle dimostrazioni umane (HDF5) per il warm start del SAC.
 
-Caratteristiche:
+Features:
   - Supporto multi-file: accetta sia un singolo .h5 sia una directory di lap_*.h5
+  - Caricamento automatico dei mini-episodi in curva (i file lap_curve_*.h5)
   - Normalizzazione corretta delle azioni per Tanh output [-1, 1]
   - Sanity check preventivi (NaN, Inf, gruppi mancanti)
   - Device CPU/CUDA coerente in tutta la pipeline
@@ -96,19 +97,19 @@ def load_dataset(path: str) -> Dataset:
     Se `path` è un singolo file, lo carica direttamente.
     """
     if os.path.isdir(path):
-        h5_files = sorted(glob.glob(os.path.join(path, "lap_*.h5")))
+        h5_files = sorted(glob.glob(os.path.join(path, "**/lap_*.h5"), recursive=True))
         if not h5_files:
             raise FileNotFoundError(
-                f"Nessun file lap_*.h5 trovato in {path}"
+                f"Nessun file lap_*.h5 trovato in {path} o nelle sue sottocartelle"
             )
-        print(f"  Trovati {len(h5_files)} file HDF5 nella directory:")
+        print(f"  Trovati {len(h5_files)} file HDF5:")
         datasets = []
         total_samples = 0
         for f in h5_files:
             ds = TorcsHDF5Dataset(f)
             datasets.append(ds)
             total_samples += len(ds)
-            print(f"    ✓ {os.path.basename(f)}: {len(ds)} campioni")
+            print(f"    ✓ {os.path.relpath(f, path)}: {len(ds)} campioni")
         print(f"  Totale: {total_samples} campioni")
         return ConcatDataset(datasets), total_samples
     else:

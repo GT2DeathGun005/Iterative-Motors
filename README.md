@@ -53,6 +53,30 @@ Un agente SAC inizializzato casualmente in TORCS affronta un problema di **sampl
 2. **Trasferimento Pesi**: Il backbone della rete BC (estrattore di feature + regressore della media) viene copiato direttamente nell'Actor del SAC.
 3. **Fine-Tuning RL**: Il SAC parte dal livello dell'esperto umano e usa l'esplorazione stocastica guidata dall'entropia per scoprire traiettorie più veloci, **superando il tetto delle abilità umane** (limite intrinseco del solo Imitation Learning).
 
+### 🎯 Strategia dei Dati Separati: Ideali vs Diversificati
+
+La nostra pipeline implementa una **separazione strategica dei dati di addestramento** per massimizzare la stabilità del warm-start e la robustezza dell'apprendimento per rinforzo:
+
+```
+               [ DATI RACCOLTI ]
+               /               \
+              /                 \
+  [ Giri Completi Ideali ]    [ Curve con Linee Alternative ]
+  (Traiettoria e guida 100%   (Manovre errate + RECUPERO dell'auto)
+   pulite e perfette)                    |
+              |                          |
+              v                          v
+  [ Fase 2: Behavioral Cloning ]   [ Fase 3: SAC Replay Buffer ]
+  (Impara una guida di base        (Prefill completo: impara sia
+   lineare, solida e senza sbandate)  la linea ideale che il recupero)
+```
+
+- **Perché il Behavioral Cloning (Fase 2) vuole solo Dati Perfetti?**
+  L'addestramento supervisionato (BC) minimizza l'errore quadratico medio (MSE). Se includessimo traiettorie "sporche" o sbandate nel dataset di addestramento del BC, la rete calcolerebbe una media matematica di questi comportamenti divergenti (*multi-modal policy problem*), portando a un modello di base instabile che sbanda e va fuori pista da solo. Il BC deve quindi imparare **esclusivamente la linea ideale perfetta**.
+  
+- **Perché il Replay Buffer del SAC (Fase 3) vuole Sia Dati Perfetti che di Recupero?**
+  Durante il Reinforcement Learning, l'agente deve esplorare la pista. Se devia leggermente dalla traiettoria ideale, deve sapere come correggersi. Prefilando il Replay Buffer con gli snippet di curve diversificate (`lap_curve_diverse_*`), insegniamo al Critic del SAC che trovarsi fuori traiettoria ma effettuare una **manovra di recupero corretta** porta a una reward elevata, offrendo all'Actor un gradiente di miglioramento immediato senza costringerlo a sbattere a muro migliaia di volte prima di capire come salvarsi.
+
 ### Perché il Gear a 4 Dimensioni?
 
 Il cambio è mantenuto come azione esplicita (non automatico) perché:
@@ -75,32 +99,57 @@ Il cambio è mantenuto come azione esplicita (non automatico) perché:
 pip install torch numpy h5py pygame
 ```
 
-### Fase 1: Data Collection
+### Fase 1: Data Collection (Sistema di Raccolta Curve & Traiettorie Diversificate)
 
-Lo script registra **un giro alla volta** con partenza da fermo. Funziona in loop infinito: guidi un giro → il sistema lo valida → salva solo se valido → riavvia per il prossimo.
+Lo script registra **un giro alla volta** con partenza da fermo e supporta due distinte modalità di raccolta dei dati. Offre un **rilevatore geometrico di curva** brevettato che analizza la strada in tempo reale anziché basarsi sullo sterzo del pilota, prevenendo falsi positivi causati da micro-correzioni in rettilineo.
 
-**Mappatura controller:**
-| Input | Azione |
-|-------|--------|
-| Left Stick X | Sterzo continuo (deadzone configurabile) |
-| R2 (trigger) | Acceleratore graduale [0, 1] |
-| L2 (trigger) | Freno graduale [0, 1] |
-| Quadrato | Upshift (+1 marcia) |
-| X (Cross) | Downshift (-1 marcia) |
-
+#### 🎮 Parametri e Modalità di Raccolta
 ```bash
-python data_collection.py --output_dir train_set --steering_deadzone 0.05
+# Esempio 1: Raccolta Giri Ideali usando il controller PS5 (default)
+python data_collection.py --output_dir train_set --mode ideal --device controller
+
+# Esempio 2: Raccolta Traiettorie Diversificate usando la TASTIERA
+python data_collection.py --output_dir train_set --mode diverse --device keyboard
 ```
 
-**Validazione del giro**: un giro viene salvato se e solo se:
+- `--device controller` (default): Usa il controller PS5 DualSense.
+- `--device keyboard`: Usa la tastiera (WASD + Frecce). Apre una piccola finestra nera denominata `"Input Focus"`. **Mantieni il focus su tale finestra affinché Pygame possa registrare i tasti premuti.**
+- `--mode ideal` (default): Rappresenta la guida sulla linea ideale. All'arrivo del giro pulito, salva **sia il giro completo** in `laps/` che **gli snippet delle curve** in `laps/curves/`.
+- `--mode diverse`: Ideale per arricchire il dataset delle curve. Il pilota può guidare intenzionalmente linee diverse (es. traiettorie larghe o strette in curva), mantenendosi però **rigorosamente dentro la pista** (`abs(trackPos) <= 1.0`). All'arrivo, salva **solo** gli snippet delle curve in `laps/curves/` (evitando di inquinare i giri completi ideali usati nel Behavioral Cloning con traiettorie sub-ottimali).
+
+#### 🗺️ Algoritmo di Rilevamento Geometrico delle Curve
+Per evitare che le correzioni di traiettoria del pilota umano in rettilineo vengano scambiate per curve, il sistema analizza la geometria della pista tramite i 19 range finder del sensore `track`:
+1. **Visuale Frontale Ridotta**: Se la distanza misurata straight-ahead (`track[9]`) scende sotto i `130` metri, significa che la pista si sta chiudendo (la vettura si avvicina al muro esterno della curva).
+2. **Spostamento dell'Apice (Apex Shift)**: In rettilineo il sensore più lungo è sempre il 9 (centrale). In curva, la via di fuga si sposta a destra o sinistra, facendo sì che l'indice con valore massimo sia diverso da 9.
+3. **Asimmetria Profilo**: Se la somma delle distanze a sinistra `track[0:9]` differisce significativamente da quella a destra `track[10:19]`, la strada sta curvando.
+4. **Frenate/Tornanti Ciechi**: Se la visuale frontale scende sotto i `60` metri, la curva è rilevata istantaneamente.
+
+#### ⌨️ Mappatura Controlli di Guida
+
+| Dispositivo | Input | Azione |
+|-------------|-------|--------|
+| **Controller PS5** | Left Stick X | Sterzo continuo (deadzone configurabile) |
+| | R2 (trigger) | Acceleratore graduale [0, 1] |
+| | L2 (trigger) | Freno graduale [0, 1] |
+| | Quadrato | Upshift (+1 marcia) |
+| | X (Cross) | Downshift (-1 marcia) |
+| **Tastiera** | W | Acceleratore digitale (Gas) |
+| | S | Freno digitale (Brake, con priorità su W) |
+| | A / D | Sterzo con interpolazione e auto-allineamento graduale |
+| | Freccia SU | Upshift (+1 marcia) |
+| | Freccia GIÙ | Downshift (-1 marcia) |
+
+**Validazione del giro**: un giro viene validato e salvato se e solo se:
 - ✅ La macchina non è mai uscita di pista (`|trackPos| ≤ 1.0`)
 - ✅ Il giro è stato completato con un lap time valido (`lastLapTime > 0`)
 
-**Output**:
-- `train_set/laps/lap_001.h5`, ... — Un file HDF5 per giro valido (states + actions + metadata)
-- `train_set/session_logs/session_*.log` — Log testuale con lap time e nome file di ogni giro
+**Organizzazione Output**:
+- `train_set/laps/lap_001.h5`, ... — Giri completi ideali (states + actions + metadata)
+- `train_set/laps/curves/lap_curve_001_0001.h5`, ... — Curve ideali estratte automaticamente
+- `train_set/laps/curves/lap_curve_diverse_001_0001.h5`, ... — Curve diversificate per la robustezza
+- `train_set/session_logs/session_*.log` — Log della sessione di raccolta
 
-**Interruzione**: `Ctrl+C` termina la sessione. Il giro corrente incompleto **non** viene salvato.
+**Interruzione**: `Ctrl+C` termina la sessione. Il giro corrente incompleto o non completato **non** viene salvato.
 
 #### Dataset Raccolto
 
