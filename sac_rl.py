@@ -836,6 +836,7 @@ def main():
     # ── Resume o Warm Start ──
     start_episode = 1
     best_lap_time = args.target_time
+    best_completed_lap_time = float('inf')
     total_updates = 0
 
     if args.resume and os.path.exists(args.resume):
@@ -852,6 +853,11 @@ def main():
         agent.critic_optimizer.load_state_dict(ckpt['critic_optimizer'])
         start_episode = ckpt.get('episode', 0) + 1
         best_lap_time = ckpt.get('best_lap_time', args.target_time)
+        best_completed_lap_time = ckpt.get('best_completed_lap_time', float('inf'))
+        if best_completed_lap_time == float('inf') and 'best_lap_time' in ckpt:
+            ckpt_best = ckpt['best_lap_time']
+            if ckpt_best < args.target_time:
+                best_completed_lap_time = ckpt_best
         total_updates = ckpt.get('total_updates', 0)
         # Usa bc_lambda da CLI (non dal checkpoint) per permettere tuning su resume
         ckpt_lambda = ckpt.get('bc_lambda', args.bc_lambda)
@@ -859,7 +865,7 @@ def main():
             print(f"  ⚠️  bc_lambda override: checkpoint={ckpt_lambda:.3f} → CLI={args.bc_lambda:.3f}")
         agent.bc_lambda = args.bc_lambda
         print(f"  ✅ Checkpoint ripristinato: ep={start_episode-1}, "
-              f"best={best_lap_time:.3f}s, updates={total_updates}, λ_bc={agent.bc_lambda:.3f}")
+              f"best={best_lap_time:.3f}s, best_completed={best_completed_lap_time:.3f}s, updates={total_updates}, λ_bc={agent.bc_lambda:.3f}")
     else:
         # Warm Start da BC
         agent.actor.load_bc_weights(args.bc_weights, device)
@@ -1047,10 +1053,41 @@ def main():
                     bonus = compute_lap_bonus(ep_lap_time, best_lap_time)
                     reward += bonus
 
+                    # Salvataggio del checkpoint ad ogni episodio con tempo migliore (o primo giro valido)
+                    if ep_lap_time < best_completed_lap_time:
+                        old_completed_best = best_completed_lap_time
+                        best_completed_lap_time = ep_lap_time
+
+                        # Salva checkpoint completo
+                        best_ckpt_path = os.path.join(args.save_dir, "sac_checkpoint_best.pth")
+                        torch.save({
+                            'episode': ep,
+                            'actor': agent.actor.state_dict(),
+                            'critic': agent.critic.state_dict(),
+                            'critic_target': agent.critic_target.state_dict(),
+                            'actor_optimizer': agent.actor_optimizer.state_dict(),
+                            'critic_optimizer': agent.critic_optimizer.state_dict(),
+                            'best_lap_time': best_lap_time,
+                            'best_completed_lap_time': best_completed_lap_time,
+                            'total_updates': total_updates,
+                            'bc_lambda': agent.bc_lambda,
+                            'log_path': log_path,
+                            'scheduler': scheduler.state_dict(),
+                        }, best_ckpt_path)
+
+                        # Salva anche l'actor best (.pth) per test_agent.py
+                        best_actor_path = os.path.join(args.save_dir, "sac_actor_best.pth")
+                        torch.save(agent.actor.state_dict(), best_actor_path)
+
+                        if old_completed_best == float('inf'):
+                            print(f"  🏆 PRIMO GIRO COMPLETATO: {ep_lap_time:.3f}s | Checkpoint completo salvato: {best_ckpt_path}")
+                        else:
+                            print(f"  🏆 NUOVO RECORD LAPTIME: {ep_lap_time:.3f}s (precedente: {old_completed_best:.3f}s) | Checkpoint completo salvato: {best_ckpt_path}")
+
                     if ep_lap_time < best_lap_time:
                         old_best = best_lap_time
                         best_lap_time = ep_lap_time
-                        print(f"  🏆 NUOVO BEST LAP: {ep_lap_time:.3f}s (precedente: {old_best:.3f}s)")
+                        print(f"  🏆 NUOVO BEST LAP (target): {ep_lap_time:.3f}s (precedente: {old_best:.3f}s)")
 
                         # ── Decay λ_bc basato sulla performance (bonus) ──
                         # Override: quando l'agente batte il best, forza λ_bc
@@ -1062,11 +1099,6 @@ def main():
                             scheduler.bc_lambda = new_lambda
                             agent.bc_lambda = new_lambda
                             print(f"    📉 BC λ aggiornato (performance): {new_lambda:.3f} (progress: {progress:.1%})")
-
-                        # Salva i pesi migliori SUBITO
-                        best_path = os.path.join(args.save_dir, "sac_actor_best.pth")
-                        torch.save(agent.actor.state_dict(), best_path)
-                        print(f"    💾 Best model salvato: {best_path}")
 
                 done = custom_done or env_done or lap_completed
                 mask = 0.0 if done else 1.0
@@ -1141,6 +1173,7 @@ def main():
                     'actor_optimizer': agent.actor_optimizer.state_dict(),
                     'critic_optimizer': agent.critic_optimizer.state_dict(),
                     'best_lap_time': best_lap_time,
+                    'best_completed_lap_time': best_completed_lap_time,
                     'total_updates': total_updates,
                     'bc_lambda': agent.bc_lambda,
                     'log_path': log_path,
@@ -1163,6 +1196,7 @@ def main():
             'actor_optimizer': agent.actor_optimizer.state_dict(),
             'critic_optimizer': agent.critic_optimizer.state_dict(),
             'best_lap_time': best_lap_time,
+            'best_completed_lap_time': best_completed_lap_time,
             'total_updates': total_updates,
             'bc_lambda': agent.bc_lambda,
             'log_path': log_path,
@@ -1171,7 +1205,8 @@ def main():
         torch.save(agent.actor.state_dict(), final_actor)
         print(f"\n  Checkpoint finale: {final_ckpt}")
         print(f"  Actor finale: {final_actor}")
-        print(f"  Best lap time raggiunto: {best_lap_time:.3f}s")
+        print(f"  Best lap time (target) raggiunto: {best_lap_time:.3f}s")
+        print(f"  Best completed lap time raggiunto: {best_completed_lap_time:.3f}s")
         print(f"  Log training: {log_path}")
 
         env.end()
