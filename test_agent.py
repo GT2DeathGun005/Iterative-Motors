@@ -148,7 +148,14 @@ def main():
         print(f"  ❌ File pesi non trovato: {args.weights}")
         sys.exit(1)
 
-    model.load_state_dict(torch.load(args.weights, map_location=device, weights_only=True))
+    checkpoint = torch.load(args.weights, map_location=device, weights_only=True)
+    if isinstance(checkpoint, dict) and "actor" in checkpoint:
+        print("  ℹ️ Rilevato checkpoint di training completo. Caricamento dei pesi dell'Actor...")
+        state_dict = checkpoint["actor"]
+    else:
+        state_dict = checkpoint
+
+    model.load_state_dict(state_dict)
     model.eval()
     print(f"  ✅ Pesi caricati correttamente.\n")
 
