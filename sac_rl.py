@@ -62,18 +62,44 @@ def weights_init_(m):
 
 class ReplayBuffer:
     def __init__(self, capacity: int):
-        self.buffer = deque(maxlen=capacity)
+        self.base_buffer = deque(maxlen=capacity)
+        self.curve_buffer = deque(maxlen=capacity)
 
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+    def push(self, state, action, reward, next_state, done, is_curve=False):
+        if is_curve:
+            self.curve_buffer.append((state, action, reward, next_state, done))
+        else:
+            self.base_buffer.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size: int):
-        batch = random.sample(self.buffer, batch_size)
+        # Campionamento stratificato: 75% base, 25% curve
+        if len(self.curve_buffer) == 0:
+            batch = random.sample(self.base_buffer, batch_size)
+        elif len(self.base_buffer) == 0:
+            batch = random.sample(self.curve_buffer, batch_size)
+        else:
+            curve_batch_size = int(round(batch_size * 0.25))
+            curve_batch_size = max(0, min(curve_batch_size, len(self.curve_buffer)))
+            base_batch_size = batch_size - curve_batch_size
+            
+            base_batch_size = max(0, min(base_batch_size, len(self.base_buffer)))
+            if base_batch_size + curve_batch_size < batch_size:
+                needed = batch_size - (base_batch_size + curve_batch_size)
+                if len(self.base_buffer) > base_batch_size:
+                    base_batch_size += min(needed, len(self.base_buffer) - base_batch_size)
+                elif len(self.curve_buffer) > curve_batch_size:
+                    curve_batch_size += min(needed, len(self.curve_buffer) - curve_batch_size)
+
+            batch_base = random.sample(self.base_buffer, base_batch_size)
+            batch_curve = random.sample(self.curve_buffer, curve_batch_size)
+            batch = batch_base + batch_curve
+            random.shuffle(batch)
+            
         state, action, reward, next_state, done = map(np.stack, zip(*batch))
         return state, action, reward, next_state, done
 
     def __len__(self):
-        return len(self.buffer)
+        return len(self.base_buffer) + len(self.curve_buffer)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -480,7 +506,8 @@ class AdaptiveScheduler:
 
         # ── λ_bc: decade se reward stabile e agente sopravvive ──
         old_lbc = self.bc_lambda
-        if reward_trend >= -10.0 and survival > 0.15:
+        # Soglia abbassata da 0.15 a 0.08 per far decadere bc_lambda anche in stallo iniziale a ~400 step (survival ≈ 0.114)
+        if reward_trend >= -10.0 and survival > 0.08:
             self.bc_lambda = max(0.1, self.bc_lambda - 0.05)
         elif reward_trend < -50.0:
             self.bc_lambda = min(1.0, self.bc_lambda + 0.1)
@@ -663,12 +690,13 @@ def prefill_buffer_from_demos(memory: ReplayBuffer, demo_dir: str):
             is_last = (i == n_transitions - 1)
             mask = 0.0 if (is_last and not is_curve_snippet) else 1.0
             
-            memory.push(states[i], norm_action, reward, states[i + 1], mask)
+            memory.push(states[i], norm_action, reward, states[i + 1], mask, is_curve=is_curve_snippet)
             rewards_sum += reward
             total += 1
 
     avg_reward = rewards_sum / total if total > 0 else 0.0
     print(f"  ✅ Buffer pre-riempito con {total:,} transizioni da {len(h5_files)} giri demo")
+    print(f"     -> Base transitions: {len(memory.base_buffer):,} | Curve transitions: {len(memory.curve_buffer):,}")
     print(f"     Reward media demo: {avg_reward:.3f}")
     return total
 
@@ -790,8 +818,8 @@ def main():
                         help="Learning rate dell'actor (basso per preservare BC)")
     parser.add_argument("--critic_lr", type=float, default=3e-4,
                         help="Learning rate del critic")
-    parser.add_argument("--bc_lambda", type=float, default=1.0,
-                        help="Coefficiente regolarizzazione BC (0=disabilitato, 1.0=default)")
+    parser.add_argument("--bc_lambda", type=float, default=0.75,
+                        help="Coefficiente regolarizzazione BC (0=disabilitato, default: 0.75)")
     parser.add_argument("--critic_warmup_steps", type=int, default=10000,
                         help="Step di pre-training offline del Critic prima del loop episodi")
     parser.add_argument("--actor_freeze_episodes", type=int, default=5,

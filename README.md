@@ -76,6 +76,8 @@ La nostra pipeline implementa una **separazione strategica dei dati di addestram
   
 - **Perché il Replay Buffer del SAC (Fase 3) vuole Sia Dati Perfetti che di Recupero?**
   Durante il Reinforcement Learning, l'agente deve esplorare la pista. Se devia leggermente dalla traiettoria ideale, deve sapere come correggersi. Prefilando il Replay Buffer con gli snippet di curve diversificate (`lap_curve_diverse_*`), insegniamo al Critic del SAC che trovarsi fuori traiettoria ma effettuare una **manovra di recupero corretta** porta a una reward elevata, offrendo all'Actor un gradiente di miglioramento immediato senza costringerlo a sbattere a muro migliaia di volte prima di capire come salvarsi.
+  
+  > **Architettura Stratificata (Data Mixing):** Per evitare che un dataset sbilanci il Replay Buffer a sfavore dei tratti lineari (catastrophic forgetting), il campionamento dei mini-batch a livello di Dataloader è stratificato. Viene mantenuto il dataset originale come base al **75% delle transizioni** nel batch, iniettando le curve specifiche come expert injection al **25%**. Questo preserva le dinamiche rettilinee garantendo al contempo sufficienti gradienti per le manovre di svolta.
 
 ### Perché il Gear a 4 Dimensioni?
 
@@ -305,6 +307,7 @@ policy_loss = λ_bc · MSE(actor, bc_model)  +  w_cpi · (-Q(actor) · adv_mask 
 - ✅ Singolo forward pass Actor per BC e Q (nessun gradiente conflittuale)
 - ✅ Normalizzazione Q-scale previene instabilità per cambio di scala del Critic
 - ✅ `λ_bc` decade adattivamente in base alle metriche di training (reward trend, survival ratio)
+- ✅ **Replay Buffer Stratificato (Data Mixing)**: campionamento stratificato con mini-batch composti al 75% da traiettorie base (giri completi + online) e al 25% da curve snippet (expert injection) per ripristinare la densità delle transizioni lineari ed evitare catastrophic forgetting.
 - ✅ **Exploration Noise adattivo**: σ aumenta su stagnazione, diminuisce quando l'agente migliora
 - ✅ **Launch Override**: partenza da fermo con `accel=1, brake=0, gear=1` finché `speedX < 10 km/h` (la BC non ha dati sufficienti per la partenza)
 - ✅ **Demo reward calcolata**: le transizioni demo usano la stessa reward function del training online (non flat `0.5`)
@@ -326,7 +329,7 @@ Ogni **50 episodi**, lo scheduler analizza 4 metriche su una finestra mobile e a
 
 | Parametro | Condizione ↓ | Condizione ↑ | Range |
 |-----------|-------------|-------------|-------|
-| **λ_bc** | reward stabile + survival > 15% | reward crolla (trend < -50) | [0.1, 1.0] |
+| **λ_bc** | reward stabile + survival > 8% | reward crolla (trend < -50) | [0.1, 1.0] |
 | **σ** (noise) | stagnazione + crash precoci | reward in crescita | [0.05, 0.3] |
 | **cpi_weight** | Critic stabile + Actor migliora | Critic diverge | [0.01, 0.2] |
 | **α** (entropy) | Actor bloccato + crash precoci | Actor sta migliorando | [0.01, 0.1] |
@@ -357,7 +360,7 @@ Durante tutte le fasi di pre-training e freeze, i parametri dell'Actor sono cate
 | `--critic_lr` | `3e-4` | LR critic |
 | `--critic_warmup_steps` | `10000` | Step di pre-training offline del Critic |
 | `--actor_freeze_episodes` | `50` | Episodi con Actor congelato (solo Critic si aggiorna) |
-| `--bc_lambda` | `1.0` | Coefficiente BC iniziale (l'AdaptiveScheduler lo adatterà durante il training) |
+| `--bc_lambda` | `0.75` | Coefficiente BC iniziale (l'AdaptiveScheduler lo adatterà durante il training) |
 | `--bc_decay_episodes` | `500` | *(deprecato — decay ora gestito dall'AdaptiveScheduler)* |
 | `--warmup_steps` | `5000` | Campioni nel buffer prima degli update |
 | `--relaunch_every` | `20` | Rilancia TORCS ogni N episodi |
@@ -554,6 +557,7 @@ Il passaggio da BC a RL ha richiesto molteplici iterazioni per risolvere il cata
 | 11 | **BC non accelera da fermo + overfitting senza validation** | (a) La BC policy predice `accel=0` a velocità zero perché il dataset contiene pochissimi campioni di partenza da fermo. (b) Tentativo di rimuovere la validation split 80/20 per usare il 100% dei dati: il modello overffitta (train loss 0.021 vs val loss 0.032), degradando la performance reale (reward media +20 vs +296) | **(a) Launch Override & Speed-Weighted MSE**: nei primi step dell'episodio online, se `speedX < 10 km/h`, forza `accel=1, brake=0, gear=1` mantenendo lo sterzo della policy. Inoltre, durante l'addestramento della BC, applichiamo un **peso 10x (Speed-Weighted MSE)** su tutti i campioni a bassa velocità (`speedX < 0.8` o `< 40 km/h`) per forzare l'apprendimento corretto della marcia 1 e del gas. **(b) Split ripristinata**: la validation split è una regolarizzazione implicita necessaria; con ~71k campioni mescolati da 20 giri, la probabilità di perdere tutti i campioni di una curva è trascurabile |
 | 12 | **Critic pre-training loss diverge: 0.06 → 3.66 in 10K step** | Con `log_std=-5.0` congelato, l'Actor è quasi-deterministico (`std≈0.007`). Il `log_prob` di un campione da questa distribuzione è **~+90**. Il target Bellman `r + γ(Q - α·log_π)` include `α·log_π = 0.02×90 = 1.8/step` — penalità che domina la reward (~0.7) e spinge i Q-values a **-80** invece del corretto **+68**. La loss cresce perché il Critic insegue target in espansione negativa | **(a) Entropia rimossa** dal target Bellman offline: il termine `-α·log_π` è un incentivo all'esplorazione per il loop online, privo di significato nel pre-training su dataset fisso. **(b) Azioni deterministiche**: `tanh(mean)` invece di sample stocastico. **(c) Gradient clipping** (`max_norm=1.0`) sul Critic. **(d) Tau ridotto** a `0.001` durante pre-training (da `0.005`) + sincronizzazione hard del target network alla fine. Risultato: loss stabile a ~0.005, Q-values positivi e crescenti verso il valore teorico |
 | 13 | **Plateau a metà pista con λ_bc=1.0 (0 giri in 1967 ep)** | Con `λ_bc=1.0` e `cpi_weight=0.1`, il rapporto BC:CPI è **10:1** — l'Actor non ha abbastanza libertà per deviare dalla BC policy. Il decay di λ_bc era *performance-based* (solo su lap completati), ma l'agente non ha mai completato un giro → deadlock: λ_bc non poteva mai scendere. L'addestramento notturno (6 ore, ep 851→1967) ha confermato il problema: **0 giri completati, λ_bc=1.0 fisso per tutta la sessione**, reward stagnante (~160-210). | **AdaptiveScheduler**: sistema di parametri adattivi che reagisce alle metriche runtime. Ogni 50 episodi, lo scheduler analizza reward trend, survival ratio, Q-stability e advantage hit rate, e adatta 4 parametri: **(a) λ_bc** decade se reward stabile e agente sopravvive >15% del giro (da 1.0 a 0.1 in ~900 ep), rialza se reward crolla; **(b) σ_exploration** aumenta su stagnazione (fino a 0.3), diminuisce su miglioramento; **(c) cpi_weight** sale se Critic stabile + Actor migliora, scende se Critic diverge; **(d) α** sale se Actor bloccato. Lo scheduler si serializza nei checkpoint per continuità su resume |
+| 14 | **Stallo a ~400 step e sbilanciamento del Replay Buffer** | (a) Inserendo i curve snippet, il buffer si è sbilanciato eccessivamente verso il nuovo comportamento di curva a scapito della stabilità rettilinea (catastrophic forgetting). (b) Soglia di sopravvivenza per il decay di `bc_lambda` troppo severa (>15%, ~525 step): l'agente bloccato a ~400 step non innescava mai il decadimento, rimanendo in deadlock. | **(a) Replay Buffer Stratificato (Data Mixing)**: implementato campionamento stratificato con mini-batch composti al 75% da traiettorie base (giri completi + online) e al 25% da curve snippet (expert injection). **(b) Rilassamento BC**: abbassato il default di `bc_lambda` a `0.75` e ridotta la soglia di `survival` dello scheduler a `>8%` (~280 step) per sbloccare l'esplorazione autonoma. |
 
 ---
 
