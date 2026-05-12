@@ -244,12 +244,13 @@ class BehaviorCloningTrainer:
 
         print(f"  Split: {train_size} train / {val_size} val")
 
-    def _weighted_mse(self, predictions, targets_norm):
-        """MSE con peso extra sullo sterzo in curva.
+    def _weighted_mse(self, predictions, targets_norm, states):
+        """MSE con peso extra sullo sterzo in curva e sulla partenza da fermo.
 
         Per i campioni dove |steer_target| > threshold, il peso dello sterzo
         è STEER_CURVE_WEIGHT (5x). Per tutti gli altri campioni e dimensioni
-        il peso è 1.0 (MSE standard).
+        il peso è 1.0 (MSE standard). Per la partenza a bassa velocità, applichiamo
+        un peso extra di 10x per forzare l'apprendimento di marcia 1 e gas.
         """
         # Errore quadratico per-dimensione [batch, 4]
         sq_error = (predictions - targets_norm) ** 2
@@ -263,6 +264,16 @@ class BehaviorCloningTrainer:
         # Applica il peso SOLO allo sterzo
         weighted_sq = sq_error.clone()
         weighted_sq[:, 0] = sq_error[:, 0] * steer_weight
+
+        # Peso extra per bassa velocità (speedX è all'indice 21 dello stato)
+        # speedX < 0.8 corrisponde a < 40 km/h
+        speed_x = states[:, 21].abs()
+        is_low_speed = (speed_x < 0.8).float()
+        # Moltiplicatore 10x per i campioni a bassa velocità
+        speed_weight = 1.0 + 9.0 * is_low_speed
+
+        # Applica il moltiplicatore a tutto il campione (tutte e 4 le dimensioni)
+        weighted_sq = weighted_sq * speed_weight.unsqueeze(1)
 
         return weighted_sq.mean()
 
@@ -279,7 +290,7 @@ class BehaviorCloningTrainer:
 
             self.optimizer.zero_grad()
             predictions = self.model(states)
-            loss = self._weighted_mse(predictions, targets_norm)
+            loss = self._weighted_mse(predictions, targets_norm, states)
             loss.backward()
             self.optimizer.step()
 
@@ -298,7 +309,7 @@ class BehaviorCloningTrainer:
 
                 targets_norm = normalize_actions(targets)
                 predictions = self.model(states)
-                loss = self._weighted_mse(predictions, targets_norm)
+                loss = self._weighted_mse(predictions, targets_norm, states)
                 total_loss += loss.item()
 
         return total_loss / len(self.val_loader)

@@ -177,7 +177,7 @@ class Actor(nn.Module):
             # Log_std inizializzato molto basso: la policy BC deve essere
             # quasi-deterministica per guidare correttamente fin dal primo episodio.
             # L'esplorazione verrà aumentata gradualmente durante il training.
-            nn.init.constant_(self.log_std_linear.weight, -5.0)
+            nn.init.constant_(self.log_std_linear.weight, 0.0)
             nn.init.constant_(self.log_std_linear.bias, -5.0)
 
         print(f"  Warm Start completato: {loaded}/10 parametri caricati.")
@@ -794,7 +794,7 @@ def main():
                         help="Coefficiente regolarizzazione BC (0=disabilitato, 1.0=default)")
     parser.add_argument("--critic_warmup_steps", type=int, default=10000,
                         help="Step di pre-training offline del Critic prima del loop episodi")
-    parser.add_argument("--actor_freeze_episodes", type=int, default=50,
+    parser.add_argument("--actor_freeze_episodes", type=int, default=5,
                         help="Episodi in cui l'Actor è congelato (solo Critic si aggiorna)")
     parser.add_argument("--bc_decay_episodes", type=int, default=500,
                         help="Episodi su cui decadere bc_lambda linearmente fino a 0.1")
@@ -842,6 +842,10 @@ def main():
         print(f"  Ripristino checkpoint: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         agent.actor.load_state_dict(ckpt['actor'])
+        # Forza la correzione di log_std_linear anche su resume da checkpoint precedenti
+        with torch.no_grad():
+            torch.nn.init.constant_(agent.actor.log_std_linear.weight, 0.0)
+            torch.nn.init.constant_(agent.actor.log_std_linear.bias, -5.0)
         agent.critic.load_state_dict(ckpt['critic'])
         agent.critic_target.load_state_dict(ckpt['critic_target'])
         agent.actor_optimizer.load_state_dict(ckpt['actor_optimizer'])
@@ -1007,22 +1011,12 @@ def main():
                         action[1] = np.clip(action[1] + noise[1], -1.0, 1.0)  # accel
                         action[2] = np.clip(action[2] + noise[2], -1.0, 1.0)  # brake
 
-                # ── Launch Override ──
-                # La BC policy non ha abbastanza campioni di partenza da fermo
-                # e predice accel=0 a velocità zero. Override: full throttle,
-                # no brake, gear=1, con lo sterzo dalla policy.
-                speed_x_current = state[21]  # speedX normalizzato (÷50)
-                if speed_x_current < 0.2 and step <= 200:  # 0.2 = 10 km/h / 50
-                    # Mantieni lo sterzo della policy, forza accelerazione
-                    action = np.array([
-                        action[0],     # steer: dalla policy
-                        1.0,           # accel: full throttle (già in range tanh)
-                        -1.0,          # brake: no brake (in range tanh)
-                        -0.667,        # gear: 1 (normalizzato: (1/3)-1 = -0.667)
-                    ], dtype=np.float32)
+
 
                 # ── De-normalizza e step ──
                 env_action = denormalize_action(action)
+                if ep <= 2 and (step <= 10 or step % 50 == 0 or step >= 310):
+                    print(f"      [DEBUG Step {step:3d}] SpeedX: {state[21]*50:.1f} km/h | TrackPos: {state[20]:.3f} | Angle: {state[0]:.3f} | Action (env): Steer={env_action[0]:.3f}, Accel={env_action[1]:.3f}, Brake={env_action[2]:.3f}, Gear={env_action[3]}")
                 next_obs, _, env_done, _ = env.step(env_action)
                 next_state = flatten_state(next_obs)
 
