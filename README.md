@@ -209,10 +209,13 @@ L'architettura di training è stata ristrutturata in **fasi sequenziali** per ga
 ```mermaid
 graph LR
     A["🧠 Offline Critic\nPre-training\n(10K step su demo)"] --> B["❄️ Fase FREEZE\n(50 episodi)\nActor congelato\nCritic impara online"]
-    B --> C["🔥 Fase TRAIN\n(ep 51+)\nCPI: BC + 0.01·Q"]
+    B --> C["🔥 Fase TRAIN\n(ep 51+)\nCPI: BC + w_cpi·Q"]
+    C -.-> D["🔧 AdaptiveScheduler\n(ogni 50 ep)\nλ_bc, σ, cpi, α"]
+    D -.-> C
     style A fill:#4a90d9,color:#fff
     style B fill:#7cb342,color:#fff
     style C fill:#e53935,color:#fff
+    style D fill:#ff9800,color:#fff
 ```
 
 | Fase | Episodi | Actor | Critic | Scopo |
@@ -237,7 +240,7 @@ policy_loss = λ_bc · MSE(actor, bc_model)  +  w_cpi · (-Q(actor) · adv_mask 
               decade solo con lap completati)    advantage ≤ 0 → nessun drift.
 ```
 
-**Schedule CPI** (basato su episodi nella fase TRAIN, non assoluti):
+**Schedule CPI**: gestito dall'**AdaptiveScheduler** (vedi sezione dedicata sotto). Fallback statico se lo scheduler non è attivo:
 | Episodi TRAIN | `w_cpi` | Fase |
 |---------------|---------|------|
 | 0–49 | 0.01 | Stabilizzazione ultra-conservativa |
@@ -251,9 +254,39 @@ policy_loss = λ_bc · MSE(actor, bc_model)  +  w_cpi · (-Q(actor) · adv_mask 
 - ✅ Q-value è un **consulente selettivo**: maschera binaria hard impedisce drift
 - ✅ Singolo forward pass Actor per BC e Q (nessun gradiente conflittuale)
 - ✅ Normalizzazione Q-scale previene instabilità per cambio di scala del Critic
-- ✅ `λ_bc` decade solo con lap completati (nessun decay incondizionato)
+- ✅ `λ_bc` decade adattivamente in base alle metriche di training (reward trend, survival ratio)
+- ✅ **Exploration Noise adattivo**: σ aumenta su stagnazione, diminuisce quando l'agente migliora
 - ✅ **Launch Override**: partenza da fermo con `accel=1, brake=0, gear=1` finché `speedX < 10 km/h` (la BC non ha dati sufficienti per la partenza)
 - ✅ **Demo reward calcolata**: le transizioni demo usano la stessa reward function del training online (non flat `0.5`)
+
+#### AdaptiveScheduler — Parametri che Reagiscono al Training
+
+Il problema #13 (λ_bc bloccato a 1.0 perché il decay era condizionato al completamento giro — evento che non avveniva mai) ha portato all'introduzione di un sistema di **parametri adattivi guidati dalle metriche runtime**.
+
+Ogni **50 episodi**, lo scheduler analizza 4 metriche su una finestra mobile e adatta i parametri:
+
+| Metrica | Calcolo | Cosa Misura |
+|---------|---------|-------------|
+| **Reward Trend** | `mean(R[-50:]) - mean(R[-100:-50])` | L'agente sta migliorando o peggiorando? |
+| **Survival Ratio** | `mean(steps[-50:]) / 3500` | Quanto lontano arriva l'agente? (1.0 = giro completo) |
+| **Q-Stability** | `std(critic_loss) / mean(critic_loss)` | Il Critic è stabile o sta divergendo? |
+| **Advantage Hit Rate** | `mean(adv_mask)` | L'Actor trova azioni migliori del buffer? |
+
+**Logica di adattamento:**
+
+| Parametro | Condizione ↓ | Condizione ↑ | Range |
+|-----------|-------------|-------------|-------|
+| **λ_bc** | reward stabile + survival > 15% | reward crolla (trend < -50) | [0.1, 1.0] |
+| **σ** (noise) | stagnazione + crash precoci | reward in crescita | [0.05, 0.3] |
+| **cpi_weight** | Critic stabile + Actor migliora | Critic diverge | [0.01, 0.2] |
+| **α** (entropy) | Actor bloccato + crash precoci | Actor sta migliorando | [0.01, 0.1] |
+
+Lo scheduler viene **serializzato nei checkpoint**, garantendo continuità dell'adattamento su resume.
+
+**Log CSV esteso**: ogni riga del log `sac_training_*.log` include i valori correnti dei parametri adattivi:
+```
+ep=2000,reward=250.1,steps=700,lap=FAIL,...,bc_lambda=0.800,sigma=0.120,alpha=0.0250,cpi_weight=0.030
+```
 
 #### Isolamento dei Gradienti
 
@@ -274,12 +307,13 @@ Durante tutte le fasi di pre-training e freeze, i parametri dell'Actor sono cate
 | `--critic_lr` | `3e-4` | LR critic |
 | `--critic_warmup_steps` | `10000` | Step di pre-training offline del Critic |
 | `--actor_freeze_episodes` | `50` | Episodi con Actor congelato (solo Critic si aggiorna) |
-| `--bc_lambda` | `1.0` | Coefficiente BC nella loss (decade solo con lap completati; su resume usa il valore CLI, non il checkpoint) |
-| `--bc_decay_episodes` | `500` | *(non usato attivamente — decay solo performance-based)* |
+| `--bc_lambda` | `1.0` | Coefficiente BC iniziale (l'AdaptiveScheduler lo adatterà durante il training) |
+| `--bc_decay_episodes` | `500` | *(deprecato — decay ora gestito dall'AdaptiveScheduler)* |
 | `--warmup_steps` | `5000` | Campioni nel buffer prima degli update |
 | `--relaunch_every` | `20` | Rilancia TORCS ogni N episodi |
 | `--checkpoint_every` | `50` | Salva checkpoint ogni N episodi |
 | `--resume` | `""` | Path a un checkpoint per riprendere il training |
+| `--exploration_sigma` | `0.1` | σ iniziale del rumore Gaussiano (adattato dallo scheduler durante il training) |
 
 **Riprendere una sessione interrotta**:
 ```bash
@@ -290,7 +324,7 @@ nohup xvfb-run -a -s "-screen 0 800x600x24" python sac_rl.py \
   > /dev/null 2>&1 &
 ```
 
-I checkpoint contengono: actor, critic, critic_target, optimizer states, best_lap_time, episode, total_updates e λ_bc. Il resume ripristina tutto lo stato del training.
+I checkpoint contengono: actor, critic, critic_target, optimizer states, best_lap_time, episode, total_updates, λ_bc e **stato completo dell'AdaptiveScheduler** (λ_bc, σ, α, cpi_weight + storico metriche). Il resume ripristina tutto lo stato del training, inclusa la continuità dell'adattamento.
 
 ### Fase 4: Test dell'agente
 
@@ -469,7 +503,7 @@ Il passaggio da BC a RL ha richiesto molteplici iterazioni per risolvere il cata
 | 10 | **Stallo universale: ogni episodio terminato a 100 step** | Lo stall detection confrontava `speedX < 5.0` ma `speedX` dal wrapper `gym_torcs` è normalizzato per `default_speed=50`. Il valore `5.0` normalizzato equivale a 250 km/h → condizione sempre vera → terminazione immediata | **Soglia corretta**: `speedX < 0.1` (5 km/h ÷ 50). Stesso bug nel launch override: soglia cambiata da `10.0` a `0.2` (10 km/h ÷ 50) |
 | 11 | **BC non accelera da fermo + overfitting senza validation** | (a) La BC policy predice `accel=0` a velocità zero perché il dataset contiene pochissimi campioni di partenza da fermo. (b) Tentativo di rimuovere la validation split 80/20 per usare il 100% dei dati: il modello overffitta (train loss 0.021 vs val loss 0.032), degradando la performance reale (reward media +20 vs +296) | **(a) Launch Override**: nei primi step, se `speedX < 10 km/h`, forza `accel=1, brake=0, gear=1` mantenendo lo sterzo dalla policy. **(b) Split ripristinata**: la validation split è una regolarizzazione implicita necessaria; con ~71k campioni mescolati da 20 giri, la probabilità di perdere tutti i campioni di una curva è trascurabile |
 | 12 | **Critic pre-training loss diverge: 0.06 → 3.66 in 10K step** | Con `log_std=-5.0` congelato, l'Actor è quasi-deterministico (`std≈0.007`). Il `log_prob` di un campione da questa distribuzione è **~+90**. Il target Bellman `r + γ(Q - α·log_π)` include `α·log_π = 0.02×90 = 1.8/step` — penalità che domina la reward (~0.7) e spinge i Q-values a **-80** invece del corretto **+68**. La loss cresce perché il Critic insegue target in espansione negativa | **(a) Entropia rimossa** dal target Bellman offline: il termine `-α·log_π` è un incentivo all'esplorazione per il loop online, privo di significato nel pre-training su dataset fisso. **(b) Azioni deterministiche**: `tanh(mean)` invece di sample stocastico. **(c) Gradient clipping** (`max_norm=1.0`) sul Critic. **(d) Tau ridotto** a `0.001` durante pre-training (da `0.005`) + sincronizzazione hard del target network alla fine. Risultato: loss stabile a ~0.005, Q-values positivi e crescenti verso il valore teorico |
-| 13 | **Plateau a metà pista con λ_bc=1.0 (0 giri in 800 ep)** | Con `λ_bc=1.0` e `cpi_weight=0.1`, il rapporto BC:CPI è **10:1** — l'Actor non ha abbastanza libertà per deviare dalla BC policy. Ma ridurre `λ_bc` (0.3 e 0.5) o aumentare `cpi_weight` (0.3) causa **instabilità**: il Critic, addestrato solo su esperienze di crash (prima metà pista), fornisce gradienti distruttivi quando gli viene data più influenza. Anche un decay temporale di `λ_bc` causa collasso immediato su resume. | **Nessuna soluzione efficace trovata**: il problema è circolare — il Critic non può imparare la seconda metà della pista perché l'agente non ci arriva mai, e l'agente non ci arriva perché il Critic non sa guidarlo lì. Si mantiene `λ_bc=1.0` come configurazione stabile. Possibili strade future: (a) curriculum learning con tratti di pista progressivi, (b) demo sintetiche della seconda metà, (c) reward shaping più aggressivo nelle curve |
+| 13 | **Plateau a metà pista con λ_bc=1.0 (0 giri in 1967 ep)** | Con `λ_bc=1.0` e `cpi_weight=0.1`, il rapporto BC:CPI è **10:1** — l'Actor non ha abbastanza libertà per deviare dalla BC policy. Il decay di λ_bc era *performance-based* (solo su lap completati), ma l'agente non ha mai completato un giro → deadlock: λ_bc non poteva mai scendere. L'addestramento notturno (6 ore, ep 851→1967) ha confermato il problema: **0 giri completati, λ_bc=1.0 fisso per tutta la sessione**, reward stagnante (~160-210). | **AdaptiveScheduler**: sistema di parametri adattivi che reagisce alle metriche runtime. Ogni 50 episodi, lo scheduler analizza reward trend, survival ratio, Q-stability e advantage hit rate, e adatta 4 parametri: **(a) λ_bc** decade se reward stabile e agente sopravvive >15% del giro (da 1.0 a 0.1 in ~900 ep), rialza se reward crolla; **(b) σ_exploration** aumenta su stagnazione (fino a 0.3), diminuisce su miglioramento; **(c) cpi_weight** sale se Critic stabile + Actor migliora, scende se Critic diverge; **(d) α** sale se Actor bloccato. Lo scheduler si serializza nei checkpoint per continuità su resume |
 
 ---
 

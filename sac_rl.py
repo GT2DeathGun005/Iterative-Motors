@@ -8,11 +8,11 @@ Features:
   - RLPD: replay buffer pre-riempito con 71k transizioni umane (reward calcolata)
   - Warm Start: carica backbone + mean_linear dal BC checkpoint
   - BC Regularization: previene catastrophic forgetting dei pesi BC
-  - λ_bc decay: il vincolo BC si rilassa quando l'agente migliora
+  - AdaptiveScheduler: λ_bc, σ, cpi_weight, α adattati ogni 50 ep in base alle metriche
   - Actor LR separato (1e-5): aggiornamenti lenti per preservare BC
   - Reward dinamica: basata sui tempi umani reali
   - Terminazione: uscita pista, spin, stallo prolungato
-  - Checkpoint periodici in train_set/checkpoints/
+  - Checkpoint periodici in train_set/checkpoints/ (con stato scheduler)
   - GPU-optimized (CUDA)
 
 Action de-normalization (Tanh [-1,1] → env ranges):
@@ -275,7 +275,7 @@ class SACAgent:
         return action.detach().cpu().numpy()[0]
 
     def update_parameters(self, memory: ReplayBuffer, batch_size: int,
-                          train_episode: int = 0):
+                          train_episode: int = 0, cpi_weight: float = None):
         """Update Actor e Critic con Advantage-Weighted CPI.
 
         Args:
@@ -334,13 +334,14 @@ class SACAgent:
         q_scale = max(q_baseline.abs().mean().item(), 1.0)
         q_improvement = -((min_q_pi * adv_mask) / q_scale).mean()
 
-        # CPI schedule: il Critic guadagna influenza gradualmente
-        if train_episode < 50:
-            cpi_weight = 0.01   # Stabilizzazione: CPI ultra-conservativo
-        elif train_episode < 150:
-            cpi_weight = 0.05   # Crescita: il Critic inizia a influenzare
-        else:
-            cpi_weight = 0.1    # Pieno: il Critic guida il miglioramento
+        # CPI schedule: usa il valore dallo scheduler adattivo, o fallback statico
+        if cpi_weight is None:
+            if train_episode < 50:
+                cpi_weight = 0.01   # Stabilizzazione: CPI ultra-conservativo
+            elif train_episode < 150:
+                cpi_weight = 0.05   # Crescita: il Critic inizia a influenzare
+            else:
+                cpi_weight = 0.1    # Pieno: il Critic guida il miglioramento
 
         # FIX #1: bc_lambda ora moltiplica effettivamente la BC loss
         policy_loss = self.bc_lambda * bc_loss + cpi_weight * q_improvement
@@ -354,7 +355,7 @@ class SACAgent:
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
             tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
 
-        return qf_loss.item(), policy_loss.item(), 0.0
+        return qf_loss.item(), policy_loss.item(), adv_mask.mean().item()
 
     def update_critic_only(self, memory: ReplayBuffer, batch_size: int):
         """Aggiorna SOLO il Critic (e il target) — usato per il pre-training offline.
@@ -405,6 +406,142 @@ class SACAgent:
             p.requires_grad = True
 
         return qf_loss.item()
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Adaptive Scheduler
+# ──────────────────────────────────────────────────────────────────────
+
+class AdaptiveScheduler:
+    """Regola λ_bc, σ, cpi_weight, α in base alle metriche di training.
+
+    Ogni `eval_every` episodi, analizza una finestra mobile di metriche
+    e adatta i parametri per massimizzare il progresso dell'agente.
+    """
+
+    def __init__(self, bc_lambda=1.0, sigma=0.1, cpi_weight=0.01,
+                 alpha=0.02, window=50, eval_every=50):
+        # Parametri adattivi correnti
+        self.bc_lambda = bc_lambda
+        self.sigma = sigma
+        self.cpi_weight = cpi_weight
+        self.alpha = alpha
+
+        # Configurazione
+        self.window = window
+        self.eval_every = eval_every
+
+        # Storico metriche
+        self.rewards = deque(maxlen=window * 2)
+        self.steps_list = deque(maxlen=window * 2)
+        self.critic_losses = deque(maxlen=1000)
+        self.adv_hits = deque(maxlen=500)
+
+        # Stima step per giro completo (~70s a 50Hz)
+        self.LAP_STEPS_ESTIMATE = 3500
+
+    def record_episode(self, reward, steps):
+        """Registra reward e steps di un episodio completato."""
+        self.rewards.append(reward)
+        self.steps_list.append(steps)
+
+    def record_update(self, critic_loss, adv_hit_rate):
+        """Registra metriche di un singolo update Actor+Critic."""
+        self.critic_losses.append(critic_loss)
+        self.adv_hits.append(adv_hit_rate)
+
+    def should_adapt(self, episode):
+        """True se è il momento di rivalutare i parametri."""
+        return (episode % self.eval_every == 0
+                and len(self.rewards) >= self.window)
+
+    def adapt(self):
+        """Ricalcola tutti i parametri. Ritorna (changes_dict, metrics_dict)."""
+        rewards = list(self.rewards)
+        steps = list(self.steps_list)
+        w = self.window
+
+        # ── Metriche ──
+        recent_r = rewards[-w:]
+        older_r = rewards[-2*w:-w] if len(rewards) >= 2*w else recent_r
+        reward_trend = np.mean(recent_r) - np.mean(older_r)
+        survival = np.mean(steps[-w:]) / self.LAP_STEPS_ESTIMATE
+
+        q_stab = 1.0
+        if len(self.critic_losses) > 100:
+            cl = list(self.critic_losses)[-500:]
+            q_stab = np.std(cl) / (np.mean(cl) + 1e-8)
+
+        adv_rate = 0.0
+        if len(self.adv_hits) > 50:
+            adv_rate = np.mean(list(self.adv_hits)[-200:])
+
+        changes = {}
+
+        # ── λ_bc: decade se reward stabile e agente sopravvive ──
+        old_lbc = self.bc_lambda
+        if reward_trend >= -10.0 and survival > 0.15:
+            self.bc_lambda = max(0.1, self.bc_lambda - 0.05)
+        elif reward_trend < -50.0:
+            self.bc_lambda = min(1.0, self.bc_lambda + 0.1)
+        if abs(self.bc_lambda - old_lbc) > 1e-6:
+            changes['λ_bc'] = (old_lbc, self.bc_lambda)
+
+        # ── σ_exploration: aumenta su stagnazione, riduce su progresso ──
+        old_sig = self.sigma
+        if abs(reward_trend) < 5.0 and survival < 0.3:
+            self.sigma = min(0.3, self.sigma + 0.02)
+        elif reward_trend > 20.0:
+            self.sigma = max(0.05, self.sigma - 0.02)
+        if abs(self.sigma - old_sig) > 1e-6:
+            changes['σ'] = (old_sig, self.sigma)
+
+        # ── cpi_weight: moderato dalla stabilità del Critic ──
+        old_cpi = self.cpi_weight
+        if q_stab < 1.0 and adv_rate > 0.1:
+            self.cpi_weight = min(0.2, self.cpi_weight + 0.01)
+        elif q_stab > 3.0:
+            self.cpi_weight = max(0.01, self.cpi_weight - 0.02)
+        if abs(self.cpi_weight - old_cpi) > 1e-6:
+            changes['cpi'] = (old_cpi, self.cpi_weight)
+
+        # ── α: spinta esplorativa quando Actor troppo deterministico ──
+        old_a = self.alpha
+        if adv_rate < 0.05 and survival < 0.2:
+            self.alpha = min(0.1, self.alpha + 0.005)
+        elif adv_rate > 0.3:
+            self.alpha = max(0.01, self.alpha - 0.005)
+        if abs(self.alpha - old_a) > 1e-6:
+            changes['α'] = (old_a, self.alpha)
+
+        metrics = {
+            'reward_trend': reward_trend,
+            'survival': survival,
+            'q_stability': q_stab,
+            'adv_hit_rate': adv_rate,
+        }
+
+        return changes, metrics
+
+    def state_dict(self):
+        """Serializza lo stato per il checkpoint."""
+        return {
+            'bc_lambda': self.bc_lambda,
+            'sigma': self.sigma,
+            'cpi_weight': self.cpi_weight,
+            'alpha': self.alpha,
+            'rewards': list(self.rewards),
+            'steps_list': list(self.steps_list),
+        }
+
+    def load_state_dict(self, d):
+        """Ripristina lo stato dal checkpoint."""
+        self.bc_lambda = d['bc_lambda']
+        self.sigma = d['sigma']
+        self.cpi_weight = d['cpi_weight']
+        self.alpha = d['alpha']
+        self.rewards.extend(d.get('rewards', []))
+        self.steps_list.extend(d.get('steps_list', []))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -679,8 +816,8 @@ def main():
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
     print(f"  Episodi: {args.episodes} | Buffer: {args.buffer_size}")
     print(f"  Actor LR: {args.actor_lr} | Critic LR: {args.critic_lr}")
-    print(f"  BC λ: {args.bc_lambda} → 0.1 over {args.bc_decay_episodes} ep | Tempo target: {args.target_time:.1f}s")
-    print(f"  Exploration σ: {args.exploration_sigma} | Actor freeze: {args.actor_freeze_episodes} ep | Critic warmup: {args.critic_warmup_steps} step")
+    print(f"  BC λ: {args.bc_lambda} (adattivo) | Tempo target: {args.target_time:.1f}s")
+    print(f"  Exploration σ: {args.exploration_sigma} (adattivo) | Actor freeze: {args.actor_freeze_episodes} ep | Critic warmup: {args.critic_warmup_steps} step")
     if args.resume:
         print(f"  Resume da: {args.resume}")
     print(f"{'=' * 64}\n")
@@ -799,15 +936,22 @@ def main():
         freeze_boundary = 1 + args.actor_freeze_episodes
         train_ep_counter = max(0, start_episode - freeze_boundary)
 
-        # Contatore locale per il decay di bc_lambda: parte da 0 ad ogni sessione
-        # (incluso resume), così il decay è sempre graduale dal valore corrente.
-        bc_decay_counter = 0
-        bc_lambda_start = agent.bc_lambda  # Valore iniziale di questa sessione
+        # ── Adaptive Scheduler ──
+        scheduler = AdaptiveScheduler(
+            bc_lambda=agent.bc_lambda,
+            sigma=args.exploration_sigma,
+            cpi_weight=0.01,
+            alpha=agent.alpha,
+        )
+        if is_resuming and 'scheduler' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler'])
+            print(f"  ✅ Scheduler adattivo ripristinato: λ_bc={scheduler.bc_lambda:.3f}, "
+                  f"σ={scheduler.sigma:.3f}, cpi={scheduler.cpi_weight:.3f}, α={scheduler.alpha:.4f}")
+        else:
+            print(f"  🔧 Scheduler adattivo inizializzato: λ_bc={scheduler.bc_lambda:.3f}, "
+                  f"σ={scheduler.sigma:.3f}, eval ogni {scheduler.eval_every} ep")
 
         for ep in range(start_episode, args.episodes + 1):
-            # bc_lambda: fissato al valore da CLI. Decade solo con lap completati
-            # (vedi logica performance-based a fine episodio).
-            # Il decay temporale è stato rimosso perché causa instabilità su resume.
 
             # ── Reset ──
             need_relaunch = (ep == 1) or (ep % args.relaunch_every == 0)
@@ -836,7 +980,6 @@ def main():
             is_freeze = (ep < freeze_boundary)
             if not is_freeze:
                 train_ep_counter += 1  # Incrementa contatore fase TRAIN
-                bc_decay_counter += 1  # Incrementa contatore decay bc_lambda
 
             for step in range(1, args.max_steps + 1):
                 # ── Selezione azione ──
@@ -853,8 +996,8 @@ def main():
                     # dove la BC policy crasha. Il rumore Gaussiano aggiunge
                     # diversità alle esperienze raccolte senza corrompere i pesi.
                     # Applicato solo a steer/accel/brake (non gear).
-                    if args.exploration_sigma > 0:
-                        noise = np.random.normal(0, args.exploration_sigma, size=3)
+                    if scheduler.sigma > 0:
+                        noise = np.random.normal(0, scheduler.sigma, size=3)
                         action[0] = np.clip(action[0] + noise[0], -1.0, 1.0)  # steer
                         action[1] = np.clip(action[1] + noise[1], -1.0, 1.0)  # accel
                         action[2] = np.clip(action[2] + noise[2], -1.0, 1.0)  # brake
@@ -910,16 +1053,16 @@ def main():
                         best_lap_time = ep_lap_time
                         print(f"  🏆 NUOVO BEST LAP: {ep_lap_time:.3f}s (precedente: {old_best:.3f}s)")
 
-                        # ── Decay λ_bc basato sulla performance ──
-                        # Quando l'agente si avvicina al HUMAN_BEST_TIME,
-                        # riduciamo il vincolo BC per permettere di superarlo.
-                        # λ = 1.0 quando best == worst, λ → 0.1 quando best ≈ human_best
+                        # ── Decay λ_bc basato sulla performance (bonus) ──
+                        # Override: quando l'agente batte il best, forza λ_bc
+                        # in base alla vicinanza al tempo umano migliore.
                         if HUMAN_WORST_TIME > HUMAN_BEST_TIME:
                             progress = (HUMAN_WORST_TIME - best_lap_time) / (HUMAN_WORST_TIME - HUMAN_BEST_TIME)
                             progress = max(0.0, min(1.0, progress))  # clamp [0, 1]
-                            new_lambda = max(0.1, args.bc_lambda * (1.0 - 0.9 * progress))
+                            new_lambda = max(0.1, 1.0 * (1.0 - 0.9 * progress))
+                            scheduler.bc_lambda = new_lambda
                             agent.bc_lambda = new_lambda
-                            print(f"    📉 BC λ aggiornato: {new_lambda:.3f} (progress: {progress:.1%})")
+                            print(f"    📉 BC λ aggiornato (performance): {new_lambda:.3f} (progress: {progress:.1%})")
 
                         # Salva i pesi migliori SUBITO
                         best_path = os.path.join(args.save_dir, "sac_actor_best.pth")
@@ -940,9 +1083,11 @@ def main():
                         agent.update_critic_only(memory, args.batch_size)
                     else:
                         # Fase TRAIN: update completo (Actor + Critic)
-                        # FIX #6: train_ep_counter è relativo alla fase TRAIN
-                        agent.update_parameters(memory, args.batch_size,
-                                                train_episode=train_ep_counter)
+                        qf_l, pi_l, adv_r = agent.update_parameters(
+                            memory, args.batch_size,
+                            train_episode=train_ep_counter,
+                            cpi_weight=scheduler.cpi_weight)
+                        scheduler.record_update(qf_l, adv_r)
                     total_updates += 1
 
                 if done:
@@ -953,20 +1098,38 @@ def main():
             lap_str = f"{ep_lap_time:.3f}s" if lap_completed else "N/A"
             phase = "FREEZE" if is_freeze else "TRAIN"
 
+            # Registra nel scheduler adattivo
+            scheduler.record_episode(episode_reward, step)
+
             print(
                 f"  Ep {ep:4d}/{args.episodes} | {phase} | {status} | "
                 f"Reward: {episode_reward:8.1f} | Steps: {step:5d} | "
                 f"LapTime: {lap_str} | Best: {best_lap_time:.3f}s | "
-                f"Updates: {total_updates} | α: {agent.alpha:.4f} | "
-                f"λ_bc: {agent.bc_lambda:.3f}"
+                f"Updates: {total_updates} | α: {scheduler.alpha:.4f} | "
+                f"λ_bc: {scheduler.bc_lambda:.3f} | σ: {scheduler.sigma:.3f}"
             )
 
             with open(log_path, 'a') as f:
                 f.write(
                     f"ep={ep},reward={episode_reward:.2f},steps={step},"
                     f"lap={status},lap_time={ep_lap_time:.3f},"
-                    f"best={best_lap_time:.3f},updates={total_updates}\n"
+                    f"best={best_lap_time:.3f},updates={total_updates},"
+                    f"bc_lambda={scheduler.bc_lambda:.3f},sigma={scheduler.sigma:.3f},"
+                    f"alpha={scheduler.alpha:.4f},cpi_weight={scheduler.cpi_weight:.3f}\n"
                 )
+
+            # ── Adattamento parametri ──
+            if scheduler.should_adapt(ep):
+                changes, metrics = scheduler.adapt()
+                # Applica i parametri adattivi all'agente
+                agent.bc_lambda = scheduler.bc_lambda
+                agent.alpha = scheduler.alpha
+                if changes:
+                    print(f"    🔧 Adattamento: {changes}")
+                    print(f"       Metriche: R_trend={metrics['reward_trend']:+.1f} "
+                          f"surv={metrics['survival']:.2f} "
+                          f"q_stab={metrics['q_stability']:.2f} "
+                          f"adv={metrics['adv_hit_rate']:.2%}")
 
             # ── Checkpoint (salvataggio completo per resume) ──
             if ep % args.checkpoint_every == 0:
@@ -982,6 +1145,7 @@ def main():
                     'total_updates': total_updates,
                     'bc_lambda': agent.bc_lambda,
                     'log_path': log_path,
+                    'scheduler': scheduler.state_dict(),
                 }, ckpt_path)
                 print(f"    💾 Checkpoint completo: {ckpt_path}")
 
@@ -1003,6 +1167,7 @@ def main():
             'total_updates': total_updates,
             'bc_lambda': agent.bc_lambda,
             'log_path': log_path,
+            'scheduler': scheduler.state_dict(),
         }, final_ckpt)
         torch.save(agent.actor.state_dict(), final_actor)
         print(f"\n  Checkpoint finale: {final_ckpt}")
