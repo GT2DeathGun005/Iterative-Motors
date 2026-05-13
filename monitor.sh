@@ -99,12 +99,16 @@ if [[ -n "$TRAINING_LOG" ]]; then
         AVG_REWARD=$(awk -F'reward=' '{split($2,a,","); sum+=a[1]; n++} END {if(n>0) printf "%.1f", sum/n; else print "N/A"}' "$TRAINING_LOG")
         MAX_REWARD=$(awk -F'reward=' '{split($2,a,","); if(a[1]+0 > max+0) max=a[1]} END {printf "%.1f", max}' "$TRAINING_LOG")
         AVG_STEPS=$(awk -F'steps=' '{split($2,a,","); sum+=a[1]; n++} END {if(n>0) printf "%.0f", sum/n; else print "N/A"}' "$TRAINING_LOG")
+        LAST_MASTERY=$(tail -1 "$TRAINING_LOG" | awk -F'mastery=' '{print $2}' | tr -d '\n')
 
         echo -e "\n${BOLD}Statistiche sessione:${NC}"
         echo -e "  Episodi completati: ${BOLD}$TOTAL_EP${NC}"
         echo -e "  Reward media:       ${BOLD}$AVG_REWARD${NC}"
         echo -e "  Reward massima:     ${BOLD}$MAX_REWARD${NC}"
         echo -e "  Steps medi:         ${BOLD}$AVG_STEPS${NC}"
+        if [[ -n "$LAST_MASTERY" ]]; then
+            echo -e "  Mastery attuale:    ${BOLD}$LAST_MASTERY${NC}"
+        fi
     fi
 fi
 

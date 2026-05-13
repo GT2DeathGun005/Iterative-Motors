@@ -1079,10 +1079,10 @@ def main():
         if is_resuming and 'scheduler' in ckpt:
             scheduler.load_state_dict(ckpt['scheduler'])
             print(f"  ✅ Scheduler adattivo ripristinato: λ_bc={scheduler.bc_lambda:.3f}, "
-                  f"σ={scheduler.sigma:.3f}, cpi={scheduler.cpi_weight:.3f}, α={scheduler.alpha:.4f}")
+                  f"σ={scheduler.sigma:.3f}, cpi={scheduler.cpi_weight:.3f}, α={scheduler.alpha:.4f}, mastery={scheduler.mastery:.3f}")
         else:
             print(f"  🔧 Scheduler adattivo inizializzato: λ_bc={scheduler.bc_lambda:.3f}, "
-                  f"σ={scheduler.sigma:.3f}, eval ogni {scheduler.eval_every} ep")
+                  f"σ={scheduler.sigma:.3f}, eval ogni {scheduler.eval_every} ep, mastery={scheduler.mastery:.3f}")
 
         for ep in range(start_episode, args.episodes + 1):
 
