@@ -584,10 +584,11 @@ class AdaptiveScheduler:
 
         changes = {}
 
-        # ── λ_bc: decade se reward stabile e agente sopravvive ──
+        # ── λ_bc: decade se reward è stabile (o cala lievemente per esplorazione) e agente sopravvive ──
         old_lbc = self.bc_lambda
         # Soglia abbassata da 0.15 a 0.08 per far decadere bc_lambda anche in stallo iniziale a ~400 step (survival ≈ 0.114)
-        if reward_trend >= -10.0 and survival > 0.08:
+        # Trend abbassato a -50.0 per tollerare cali naturali di reward durante l'esplorazione
+        if reward_trend >= -50.0 and survival > 0.08:
             self.bc_lambda = max(0.1, self.bc_lambda - 0.05)
         elif reward_trend < -150.0:
             # Cap dinamico via mastery: survival(1.0) → time-attack(0.4)
@@ -595,9 +596,9 @@ class AdaptiveScheduler:
         if abs(self.bc_lambda - old_lbc) > 1e-6:
             changes['λ_bc'] = (old_lbc, self.bc_lambda)
 
-        # ── σ_exploration: aumenta su stagnazione, riduce su progresso ──
+        # ── σ_exploration: aumenta su stagnazione o peggioramento, riduce su progresso ──
         old_sig = self.sigma
-        if abs(reward_trend) < 5.0 and survival < 0.3:
+        if reward_trend < 5.0 and survival < 0.4:
             self.sigma = min(0.3, self.sigma + 0.02)
         elif reward_trend > 20.0:
             # Floor dinamico via mastery: survival(0.05) → time-attack(0.08)
