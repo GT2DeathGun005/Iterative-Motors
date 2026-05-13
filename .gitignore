@@ -1,2 +1,12 @@
-train_set
-__pycache__
+# Escludi file Python precompilati
+__pycache__/
+*.pyc
+
+# Ignora tutti i file e le directory all'interno di train_set
+train_set/**
+
+# Forza Git a non ignorare le sottocartelle stesse (necessario per l'attraversamento)
+!train_set/**/
+
+# Forza Git a tracciare i file .gitkeep al loro interno
+!train_set/**/.gitkeep
