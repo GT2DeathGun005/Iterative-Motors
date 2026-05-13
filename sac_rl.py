@@ -443,7 +443,23 @@ class AdaptiveScheduler:
 
     Ogni `eval_every` episodi, analizza una finestra mobile di metriche
     e adatta i parametri per massimizzare il progresso dell'agente.
+
+    Mastery-Driven Phase Transition:
+        Il mastery score (0→1) misura quanto l'agente ha assimilato la pista,
+        calcolato da: lap completion rate (50%), survival consistency (30%),
+        e lap time convergence (20%). I limiti dei parametri vengono interpolati
+        linearmente tra "modalità sopravvivenza" (mastery=0) e "modalità
+        time-attack" (mastery=1). La transizione è bidirezionale: se l'agente
+        perde padronanza, i vincoli si rilassano automaticamente.
     """
+
+    # ── Limiti dei due regimi per l'interpolazione ──
+    # (survival_mode_value, time_attack_mode_value)
+    BOUNDS = {
+        'max_bc_lambda':  (1.0,  0.4),   # BC domina → BC regolarizza
+        'min_sigma':      (0.05, 0.08),  # esplorazione minima → floor strutturale
+        'max_cpi_weight': (0.20, 0.08),  # vincolo alto → vincolo rilassato
+    }
 
     def __init__(self, bc_lambda=1.0, sigma=0.1, cpi_weight=0.01,
                  alpha=0.02, window=50, eval_every=50):
@@ -463,13 +479,28 @@ class AdaptiveScheduler:
         self.critic_losses = deque(maxlen=1000)
         self.adv_hits = deque(maxlen=500)
 
+        # Storico lap completions e tempi (per mastery)
+        self.lap_completions = deque(maxlen=window * 2)
+        self.lap_times = deque(maxlen=20)
+
+        # Mastery score: 0.0 = nessuna padronanza, 1.0 = time-attack pieno
+        self.mastery = 0.0
+
         # Stima step per giro completo (~70s a 50Hz)
         self.LAP_STEPS_ESTIMATE = 3500
 
-    def record_episode(self, reward, steps):
-        """Registra reward e steps di un episodio completato."""
+    @staticmethod
+    def _lerp(survival_val, attack_val, t):
+        """Interpolazione lineare survival → attack."""
+        return survival_val + (attack_val - survival_val) * t
+
+    def record_episode(self, reward, steps, lap_completed=False, lap_time=0.0):
+        """Registra reward, steps e stato di completamento di un episodio."""
         self.rewards.append(reward)
         self.steps_list.append(steps)
+        self.lap_completions.append(1 if lap_completed else 0)
+        if lap_completed and lap_time > 0:
+            self.lap_times.append(lap_time)
 
     def record_update(self, critic_loss, adv_hit_rate):
         """Registra metriche di un singolo update Actor+Critic."""
@@ -481,11 +512,60 @@ class AdaptiveScheduler:
         return (episode % self.eval_every == 0
                 and len(self.rewards) >= self.window)
 
+    def _compute_mastery(self):
+        """Calcola il mastery score (0→1) da 3 componenti pesate.
+
+        Componenti:
+          1. Lap Completion Rate (50%): frequenza di completamento giri recenti
+          2. Survival Consistency (30%): stabilità della sopravvivenza
+          3. Lap Time Convergence (20%): convergenza dei tempi giro
+
+        Returns:
+            float: mastery score clamped in [0.0, 1.0]
+        """
+        w = self.window
+
+        # 1. Lap Completion Rate (peso: 50%)
+        if len(self.lap_completions) >= w:
+            recent_laps = list(self.lap_completions)[-w:]
+            lap_rate = sum(recent_laps) / len(recent_laps)
+        elif len(self.lap_completions) > 0:
+            laps = list(self.lap_completions)
+            lap_rate = sum(laps) / len(laps)
+        else:
+            lap_rate = 0.0
+
+        # 2. Survival Consistency (peso: 30%)
+        #    Quanto l'agente sopravvive stabilmente? (target: 60%+ del giro)
+        if len(self.steps_list) >= w:
+            mean_survival = np.mean(list(self.steps_list)[-w:]) / self.LAP_STEPS_ESTIMATE
+        else:
+            mean_survival = 0.0
+        survival_consistency = min(1.0, mean_survival / 0.6)
+
+        # 3. Lap Time Convergence (peso: 20%)
+        #    I tempi dei giri completati convergono? (bassa varianza = padronanza)
+        if len(self.lap_times) >= 3:
+            times = list(self.lap_times)
+            cv = np.std(times) / (np.mean(times) + 1e-8)  # Coefficiente di variazione
+            time_convergence = max(0.0, 1.0 - cv * 10)    # cv < 0.1 → convergenza alta
+        else:
+            time_convergence = 0.0
+
+        mastery = 0.5 * lap_rate + 0.3 * survival_consistency + 0.2 * time_convergence
+        return max(0.0, min(1.0, mastery))
+
     def adapt(self):
         """Ricalcola tutti i parametri. Ritorna (changes_dict, metrics_dict)."""
         rewards = list(self.rewards)
         steps = list(self.steps_list)
         w = self.window
+
+        # ── Mastery: interpola i limiti tra survival e time-attack ──
+        self.mastery = self._compute_mastery()
+        max_bc_lambda = self._lerp(*self.BOUNDS['max_bc_lambda'], self.mastery)
+        min_sigma = self._lerp(*self.BOUNDS['min_sigma'], self.mastery)
+        max_cpi_weight = self._lerp(*self.BOUNDS['max_cpi_weight'], self.mastery)
 
         # ── Metriche ──
         recent_r = rewards[-w:]
@@ -510,7 +590,8 @@ class AdaptiveScheduler:
         if reward_trend >= -10.0 and survival > 0.08:
             self.bc_lambda = max(0.1, self.bc_lambda - 0.05)
         elif reward_trend < -50.0:
-            self.bc_lambda = min(1.0, self.bc_lambda + 0.1)
+            # Cap dinamico via mastery: survival(1.0) → time-attack(0.4)
+            self.bc_lambda = min(max_bc_lambda, self.bc_lambda + 0.1)
         if abs(self.bc_lambda - old_lbc) > 1e-6:
             changes['λ_bc'] = (old_lbc, self.bc_lambda)
 
@@ -519,14 +600,16 @@ class AdaptiveScheduler:
         if abs(reward_trend) < 5.0 and survival < 0.3:
             self.sigma = min(0.3, self.sigma + 0.02)
         elif reward_trend > 20.0:
-            self.sigma = max(0.05, self.sigma - 0.02)
+            # Floor dinamico via mastery: survival(0.05) → time-attack(0.08)
+            self.sigma = max(min_sigma, self.sigma - 0.02)
         if abs(self.sigma - old_sig) > 1e-6:
             changes['σ'] = (old_sig, self.sigma)
 
         # ── cpi_weight: moderato dalla stabilità del Critic ──
         old_cpi = self.cpi_weight
         if q_stab < 1.0 and adv_rate > 0.1:
-            self.cpi_weight = min(0.2, self.cpi_weight + 0.01)
+            # Cap dinamico via mastery: survival(0.20) → time-attack(0.08)
+            self.cpi_weight = min(max_cpi_weight, self.cpi_weight + 0.01)
         elif q_stab > 3.0:
             self.cpi_weight = max(0.01, self.cpi_weight - 0.02)
         if abs(self.cpi_weight - old_cpi) > 1e-6:
@@ -546,6 +629,7 @@ class AdaptiveScheduler:
             'survival': survival,
             'q_stability': q_stab,
             'adv_hit_rate': adv_rate,
+            'mastery': self.mastery,
         }
 
         return changes, metrics
@@ -559,6 +643,9 @@ class AdaptiveScheduler:
             'alpha': self.alpha,
             'rewards': list(self.rewards),
             'steps_list': list(self.steps_list),
+            'lap_completions': list(self.lap_completions),
+            'lap_times': list(self.lap_times),
+            'mastery': self.mastery,
         }
 
     def load_state_dict(self, d):
@@ -569,6 +656,9 @@ class AdaptiveScheduler:
         self.alpha = d['alpha']
         self.rewards.extend(d.get('rewards', []))
         self.steps_list.extend(d.get('steps_list', []))
+        self.lap_completions.extend(d.get('lap_completions', []))
+        self.lap_times.extend(d.get('lap_times', []))
+        self.mastery = d.get('mastery', 0.0)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -799,8 +889,8 @@ def compute_lap_bonus(lap_time: float, best_time: float) -> float:
 def main():
     parser = argparse.ArgumentParser(description="SAC RL Training — TORCS Giro Secco (RLPD)")
     parser.add_argument("--episodes", type=int, default=1000, help="Episodi di training")
-    parser.add_argument("--max_steps", type=int, default=5000,
-                        help="Max step per episodio (~250s a 20Hz, ~3.5x tempo umano best)")
+    parser.add_argument("--max_steps", type=int, default=10000,
+                        help="Max step per episodio (~200s a 50Hz, ~2.8x tempo umano worst)")
     parser.add_argument("--bc_weights", type=str, default="train_set/checkpoints/bc_policy.pth",
                         help="Path ai pesi BC per warm start")
     parser.add_argument("--demo_dir", type=str, default="train_set/laps",
@@ -1158,14 +1248,17 @@ def main():
             phase = "FREEZE" if is_freeze else "TRAIN"
 
             # Registra nel scheduler adattivo
-            scheduler.record_episode(episode_reward, step)
+            scheduler.record_episode(episode_reward, step,
+                                     lap_completed=lap_completed,
+                                     lap_time=ep_lap_time)
 
             print(
                 f"  Ep {ep:4d}/{args.episodes} | {phase} | {status} | "
                 f"Reward: {episode_reward:8.1f} | Steps: {step:5d} | "
                 f"LapTime: {lap_str} | Best: {best_lap_time:.3f}s | "
                 f"Updates: {total_updates} | α: {scheduler.alpha:.4f} | "
-                f"λ_bc: {scheduler.bc_lambda:.3f} | σ: {scheduler.sigma:.3f}"
+                f"λ_bc: {scheduler.bc_lambda:.3f} | σ: {scheduler.sigma:.3f} | "
+                f"mastery: {scheduler.mastery:.3f}"
             )
 
             with open(log_path, 'a') as f:
@@ -1174,7 +1267,8 @@ def main():
                     f"lap={status},lap_time={ep_lap_time:.3f},"
                     f"best={best_lap_time:.3f},updates={total_updates},"
                     f"bc_lambda={scheduler.bc_lambda:.3f},sigma={scheduler.sigma:.3f},"
-                    f"alpha={scheduler.alpha:.4f},cpi_weight={scheduler.cpi_weight:.3f}\n"
+                    f"alpha={scheduler.alpha:.4f},cpi_weight={scheduler.cpi_weight:.3f},"
+                    f"mastery={scheduler.mastery:.3f}\n"
                 )
 
             # ── Adattamento parametri ──
@@ -1188,7 +1282,8 @@ def main():
                     print(f"       Metriche: R_trend={metrics['reward_trend']:+.1f} "
                           f"surv={metrics['survival']:.2f} "
                           f"q_stab={metrics['q_stability']:.2f} "
-                          f"adv={metrics['adv_hit_rate']:.2%}")
+                          f"adv={metrics['adv_hit_rate']:.2%} "
+                          f"mastery={metrics['mastery']:.3f}")
 
             # ── Checkpoint (salvataggio completo per resume) ──
             if ep % args.checkpoint_every == 0:
