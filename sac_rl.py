@@ -589,9 +589,9 @@ class AdaptiveScheduler:
         # Soglia abbassata da 0.15 a 0.08 per far decadere bc_lambda anche in stallo iniziale a ~400 step (survival ≈ 0.114)
         if reward_trend >= -10.0 and survival > 0.08:
             self.bc_lambda = max(0.1, self.bc_lambda - 0.05)
-        elif reward_trend < -50.0:
+        elif reward_trend < -150.0:
             # Cap dinamico via mastery: survival(1.0) → time-attack(0.4)
-            self.bc_lambda = min(max_bc_lambda, self.bc_lambda + 0.1)
+            self.bc_lambda = min(max_bc_lambda, self.bc_lambda + 0.02)
         if abs(self.bc_lambda - old_lbc) > 1e-6:
             changes['λ_bc'] = (old_lbc, self.bc_lambda)
 
