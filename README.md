@@ -16,7 +16,7 @@ La pipeline si compone di **tre fasi sequenziali**, ciascuna implementata in uno
 graph TD
     subgraph "Fase 1 · Data Collection"
         PS5[🎮 PS5 DualSense] -->|Pygame Polling| DC[data_collection.py]
-        T1[TORCS Corkscrew F1] -->|Sensori 29D + Lap Time| DC
+        T1[TORCS Corkscrew F1] -->|Sensori 30D + Lap Time| DC
         DC -->|Solo giri validi| H5[(lap_001.h5 ... lap_N.h5)]
         DC -->|Sessione completa| LOG[session_*.log]
     end
@@ -45,7 +45,7 @@ graph TD
 
 ### Il Problema del Cold Start nell'RL Puro
 
-Un agente SAC inizializzato casualmente in TORCS affronta un problema di **sample inefficiency critica**: con 29 sensori continui e 4 azioni continue, la probabilità di trovare un gradiente di reward positivo (es. completare la prima curva) per pura esplorazione casuale è estremamente bassa. L'agente finisce ripetutamente fuori pista, rallentando drasticamente l'apprendimento.
+Un agente SAC inizializzato casualmente in TORCS affronta un problema di **sample inefficiency critica**: con 30 sensori continui e 4 azioni continue, la probabilità di trovare un gradiente di reward positivo (es. completare la prima curva) per pura esplorazione casuale è estremamente bassa. L'agente finisce ripetutamente fuori pista, rallentando drasticamente l'apprendimento.
 
 ### La Soluzione: Warm Start via Imitation Learning
 
@@ -197,7 +197,10 @@ python behavioral_cloning.py --dataset train_set/laps --epochs 200 --batch_size 
 
 Il training usa:
 - **Steering-Weighted MSE Loss**: i campioni in curva (`|steer| > 0.1`) pesano **5x** di più nello sterzo per contrastare lo sbilanciamento dei dati (64.5% rettilinei). Senza questo peso, il modello converge verso `steer≈0` e sotto-sterza catastroficamente alla prima curva.
+- **Gear-Weighted MSE Loss**: i campioni relativi al cambio marcia pesano **5x** di più per costringere la rete a non tollerare il minimo errore nella selezione della marcia, sopperendo alla scarsità di dati sui cambi di marcia.
 - **Speed-Weighted MSE Loss (Partenza da fermo)**: i campioni a bassa velocità (`speedX < 0.8`, corrispondente a circa `< 40 km/h`) pesano **10x** di più su tutte le azioni per costringere la rete ad apprendere efficacemente la partenza da fermo (marcia 1 e acceleratore al 100%), mitigando la carenza di tali campioni nel dataset.
+
+> **Nota sull'Interazione BC -> RL**: L'addestramento Behavioral Cloning genera una policy iniziale estremamente rigida (linee fisse e marce esatte) grazie a queste penalità. Tuttavia, quando la policy passa alla fase di Reinforcement Learning (SAC), la `bc_loss` che agisce da elastico è una normale MSE senza super-penalità. Questo è intenzionale: permette all'agente RL di usare i dati BC come "linea guida iniziale" ma gli lascia la libertà di sperimentare traiettorie (e cambi marcia) lievemente diversi alla ricerca di giri sotto i 70s.
 - **Validation split 80/20** con seed fisso per riproducibilità. La split funge da regolarizzazione implicita: senza di essa (training su 100% dei dati) il modello overfitta, degradando la performance in ambiente reale (reward media: +20 vs +296 con early stopping).
 - **Early stopping** (patience=15 epoche) per prevenire overfitting
 - **GPU** automaticamente se disponibile (testato su RTX 4060 8GB)

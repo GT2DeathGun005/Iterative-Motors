@@ -265,6 +265,9 @@ class BehaviorCloningTrainer:
         weighted_sq = sq_error.clone()
         weighted_sq[:, 0] = sq_error[:, 0] * steer_weight
 
+        # Peso extra per il cambio (indice 3) per imparare meglio le marce
+        weighted_sq[:, 3] = sq_error[:, 3] * 5.0
+
         # Peso extra per bassa velocità (speedX è all'indice 21 dello stato)
         # speedX < 0.8 corrisponde a < 40 km/h
         speed_x = states[:, 21].abs()

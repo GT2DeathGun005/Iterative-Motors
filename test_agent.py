@@ -98,9 +98,10 @@ def flatten_state(state_dict: dict) -> np.ndarray:
             [_s('trackPos'), _s('speedX'), _s('speedY'), _s('speedZ')],
             _a('wheelSpinVel', 4) / 100.0,
             [_s('rpm') / 10000.0],
+            [_s('distFromStart') / 4000.0],
         ]).astype(np.float32)
     except Exception:
-        return np.zeros(29, dtype=np.float32)
+        return np.zeros(30, dtype=np.float32)
 
 
 def denormalize_action(action: np.ndarray) -> np.ndarray:

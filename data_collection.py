@@ -245,11 +245,12 @@ def flatten_state(state_dict: dict) -> np.ndarray:
             np.array([_scalar('speedZ')]),
             _array('wheelSpinVel', 4) / 100.0,
             np.array([_scalar('rpm') / 10000.0]),
+            np.array([_scalar('distFromStart') / 4000.0]),
         ])
         return state_vec.astype(np.float32)
     except Exception as e:
-        print(f"  [WARN] Errore in flatten_state: {e}. Ritorno vettore zero (29D).")
-        return np.zeros(29, dtype=np.float32)
+        print(f"  [WARN] Errore in flatten_state: {e}. Ritorno vettore zero (30D).")
+        return np.zeros(30, dtype=np.float32)
 
 
 # ──────────────────────────────────────────────────────────────────────
