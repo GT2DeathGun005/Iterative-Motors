@@ -127,6 +127,10 @@ def main():
                         help="Numero di giri da completare")
     parser.add_argument("--max_steps", type=int, default=15000,
                         help="Max step per giro (timeout)")
+    parser.add_argument("--sigma", type=float, default=None,
+                        help="Exploration noise σ (default: auto dal checkpoint, 0=deterministico)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Fissa il seed per rendere il rumore perfettamente riproducibile")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -136,7 +140,6 @@ def main():
     print(f"  Device: {device}")
     print(f"  Modello: {args.model.upper()} | Pesi: {args.weights}")
     print(f"  Giri da completare: {args.laps}")
-    print(f"{'=' * 64}\n")
 
     # ── Carica modello ──
     if args.model == "bc":
@@ -148,16 +151,41 @@ def main():
         print(f"  ❌ File pesi non trovato: {args.weights}")
         sys.exit(1)
 
-    checkpoint = torch.load(args.weights, map_location=device, weights_only=True)
+    # weights_only=False necessario per checkpoint completi che contengono oggetti numpy
+    try:
+        checkpoint = torch.load(args.weights, map_location=device, weights_only=True)
+    except Exception:
+        print("  ℹ️  Caricamento con weights_only=False (checkpoint completo)...")
+        checkpoint = torch.load(args.weights, map_location=device, weights_only=False)
+
+    # Estrai sigma dal checkpoint se disponibile
+    sigma = 0.0  # Default: deterministico
     if isinstance(checkpoint, dict) and "actor" in checkpoint:
-        print("  ℹ️ Rilevato checkpoint di training completo. Caricamento dei pesi dell'Actor...")
+        print("  ℹ️  Rilevato checkpoint completo. Caricamento pesi Actor...")
         state_dict = checkpoint["actor"]
+        if "episode" in checkpoint:
+            print(f"  📊 Episodio: {checkpoint['episode']}")
+        if "best_completed_lap_time" in checkpoint:
+            print(f"  📊 Best lap time: {checkpoint['best_completed_lap_time']:.3f}s")
+        # Estrai sigma dallo scheduler salvato nel checkpoint
+        if "scheduler" in checkpoint and "sigma" in checkpoint["scheduler"]:
+            sigma = float(checkpoint["scheduler"]["sigma"])
+            print(f"  📊 Sigma dal checkpoint: {sigma:.4f}")
     else:
         state_dict = checkpoint
 
+    # Override manuale da CLI
+    if args.sigma is not None:
+        sigma = args.sigma
+        print(f"  ℹ️  Sigma override da CLI: {sigma:.4f}")
+
     model.load_state_dict(state_dict)
     model.eval()
-    print(f"  ✅ Pesi caricati correttamente.\n")
+    print(f"  ✅ Pesi caricati correttamente.")
+
+    mode_str = f"σ={sigma:.4f} (quasi-deterministico)" if sigma > 0 else "DETERMINISTICO"
+    print(f"  🎯 Modalità: {mode_str}")
+    print(f"{'=' * 64}\n")
 
     # ── Ambiente ──
     print("  Inizializzazione TORCS...")
@@ -169,6 +197,15 @@ def main():
     try:
         while len(lap_times) < args.laps:
             total_laps_attempted += 1
+            
+            # Imposta il seed per riproducibilità esatta
+            # Se specificato, usiamo quello in loop. Altrimenti uno casuale nuovo.
+            import random
+            current_seed = args.seed if args.seed is not None else random.randint(0, 1000000)
+            np.random.seed(current_seed)
+            torch.manual_seed(current_seed)
+            random.seed(current_seed)
+            
             need_relaunch = (total_laps_attempted == 1) or (total_laps_attempted % 10 == 0)
 
             if total_laps_attempted == 1:
@@ -188,15 +225,22 @@ def main():
             lap_time = 0.0
 
             print(f"\n  {'─' * 50}")
-            print(f"  🏁 Tentativo #{total_laps_attempted}  "
+            print(f"  🏁 Tentativo #{total_laps_attempted} (Seed: {current_seed}) "
                   f"(giri completati: {len(lap_times)}/{args.laps})")
 
             for step in range(1, args.max_steps + 1):
-                # ── Inferenza deterministica ──
+                # ── Inferenza ──
                 with torch.no_grad():
                     state_t = torch.FloatTensor(state).to(device).unsqueeze(0)
                     action_t = model(state_t)
                     action = action_t.cpu().numpy()[0]
+
+                # ── Exploration noise (stesse condizioni del training) ──
+                if sigma > 0:
+                    noise = np.random.normal(0, sigma, size=3)
+                    action[0] = np.clip(action[0] + noise[0], -1.0, 1.0)  # steer
+                    action[1] = np.clip(action[1] + noise[1], -1.0, 1.0)  # accel
+                    action[2] = np.clip(action[2] + noise[2], -1.0, 1.0)  # brake
 
                 # ── Step nell'ambiente ──
                 env_action = denormalize_action(action)
@@ -248,6 +292,7 @@ def main():
     # ── Riepilogo ──
     print(f"\n{'=' * 64}")
     print(f"  📊 RIEPILOGO TEST")
+    print(f"  Sigma: {sigma:.4f}" + (" (deterministico)" if sigma == 0 else ""))
     print(f"  Giri completati: {len(lap_times)}/{total_laps_attempted} tentativi")
 
     if lap_times:

@@ -355,10 +355,10 @@ class SACAgent:
             # Il detach() impedisce ai gradienti di fluire attraverso la maschera.
             adv_mask = (min_q_pi.detach() > q_baseline).float()
 
-        # Applica Q-improvement SOLO dove advantage > 0 (maschera hard)
-        # Dove adv_mask=0, il gradiente è zero → il Critic non può degradare l'Actor
+        # Applica Q-improvement su tutte le azioni (non solo quelle migliori)
+        # L'Actor impara anche ad allontanarsi dalle traiettorie pessime (muri).
         q_scale = max(q_baseline.abs().mean().item(), 1.0)
-        q_improvement = -((min_q_pi * adv_mask) / q_scale).mean()
+        q_improvement = -(min_q_pi / q_scale).mean()
 
         # CPI schedule: usa il valore dallo scheduler adattivo, o fallback statico
         if cpi_weight is None:
