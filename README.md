@@ -15,11 +15,11 @@ La pipeline si compone di **tre fasi sequenziali**, ciascuna implementata in uno
 ```mermaid
 graph TD
     subgraph "Fase 1 · Data Collection"
-        PS5[🎮 PS5 DualSense] -->|Pygame Polling| DC[data_collection.py]
-        T1[TORCS Corkscrew F1] -->|Sensori 30D + Lap Time| DC
-        DC -->|Solo giri validi| H5[(lap_001.h5 ... lap_N.h5)]
-        DC -->|Sessione completa| LOG[session_*.log]
-    end
+    PS5[🎮 PS5 DualSense] -->|Pygame Polling| DC[data_collection.py]
+    T1[TORCS Corkscrew F1] -->|Sensori 30D + Lap Time| DC
+    DC -->|Solo giri validi| H5[(lap_001.h5 ... lap_N.h5)]
+    DC -->|Sessione completa| LOG[session_*.log]
+end
 
     subgraph "Fase 2 · Behavioral Cloning"
         H5 -->|Carica directory| BC[behavioral_cloning.py]
@@ -53,31 +53,11 @@ Un agente SAC inizializzato casualmente in TORCS affronta un problema di **sampl
 2. **Trasferimento Pesi**: Il backbone della rete BC (estrattore di feature + regressore della media) viene copiato direttamente nell'Actor del SAC.
 3. **Fine-Tuning RL**: Il SAC parte dal livello dell'esperto umano e usa l'esplorazione stocastica guidata dall'entropia per scoprire traiettorie più veloci, **superando il tetto delle abilità umane** (limite intrinseco del solo Imitation Learning).
 
-### 🎯 Strategia dei Dati Separati: Ideali vs Diversificati
+### 🎯 Strategia dei Dati: Solo Giri Completi
 
-La nostra pipeline implementa una **separazione strategica dei dati di addestramento** per massimizzare la stabilità del warm-start e la robustezza dell'apprendimento per rinforzo:
-
-```
-               [ DATI RACCOLTI ]
-               /               \
-              /                 \
-  [ Giri Completi Ideali ]    [ Curve con Linee Alternative ]
-  (Traiettoria e guida 100%   (Manovre errate + RECUPERO dell'auto)
-   pulite e perfette)                    |
-              |                          |
-              v                          v
-  [ Fase 2: Behavioral Cloning ]   [ Fase 3: SAC Replay Buffer ]
-  (Impara una guida di base        (Prefill completo: impara sia
-   lineare, solida e senza sbandate)  la linea ideale che il recupero)
-```
-
-- **Perché il Behavioral Cloning (Fase 2) vuole solo Dati Perfetti?**
-  L'addestramento supervisionato (BC) minimizza l'errore quadratico medio (MSE). Se includessimo traiettorie "sporche" o sbandate nel dataset di addestramento del BC, la rete calcolerebbe una media matematica di questi comportamenti divergenti (*multi-modal policy problem*), portando a un modello di base instabile che sbanda e va fuori pista da solo. Il BC deve quindi imparare **esclusivamente la linea ideale perfetta**.
-  
-- **Perché il Replay Buffer del SAC (Fase 3) vuole Sia Dati Perfetti che di Recupero?**
-  Durante il Reinforcement Learning, l'agente deve esplorare la pista. Se devia leggermente dalla traiettoria ideale, deve sapere come correggersi. Prefilando il Replay Buffer con gli snippet di curve diversificate (`lap_curve_diverse_*`), insegniamo al Critic del SAC che trovarsi fuori traiettoria ma effettuare una **manovra di recupero corretta** porta a una reward elevata, offrendo all'Actor un gradiente di miglioramento immediato senza costringerlo a sbattere a muro migliaia di volte prima di capire come salvarsi.
-  
-  > **Architettura Stratificata (Data Mixing):** Per evitare che un dataset sbilanci il Replay Buffer a sfavore dei tratti lineari (catastrophic forgetting), il campionamento dei mini-batch a livello di Dataloader è stratificato. Viene mantenuto il dataset originale come base al **75% delle transizioni** nel batch, iniettando le curve specifiche come expert injection al **25%**. Questo preserva le dinamiche rettilinee garantendo al contempo sufficienti gradienti per le manovre di svolta.
+La nostra pipeline utilizza esclusivamente **giri completi validati** per l'addestramento:
+- **Fase 2: Behavioral Cloning**: Impara una guida di base lineare e solida basata sulla linea ideale dei giri completi.
+- **Fase 3: SAC Replay Buffer**: Il Replay Buffer viene pre-riempito con i giri completi umani per offrire al Critic un gradiente di miglioramento immediato.
 
 ### Perché il Gear a 4 Dimensioni?
 
@@ -107,24 +87,16 @@ Lo script registra **un giro alla volta** con partenza da fermo e supporta due d
 
 #### 🎮 Parametri e Modalità di Raccolta
 ```bash
-# Esempio 1: Raccolta Giri Ideali usando il controller PS5 (default)
-python data_collection.py --output_dir train_set --mode ideal --device controller
+# Esempio: Raccolta Giri usando il controller PS5 (default)
+python data_collection.py --output_dir train_set --device controller
 
-# Esempio 2: Raccolta Traiettorie Diversificate usando la TASTIERA
-python data_collection.py --output_dir train_set --mode diverse --device keyboard
 ```
 
 - `--device controller` (default): Usa il controller PS5 DualSense.
 - `--device keyboard`: Usa la tastiera (WASD + Frecce). Apre una piccola finestra nera denominata `"Input Focus"`. **Mantieni il focus su tale finestra affinché Pygame possa registrare i tasti premuti.**
-- `--mode ideal` (default): Rappresenta la guida sulla linea ideale. All'arrivo del giro pulito, salva **sia il giro completo** in `laps/` che **gli snippet delle curve** in `laps/curves/`.
-- `--mode diverse`: Ideale per arricchire il dataset delle curve. Il pilota può guidare intenzionalmente linee diverse (es. traiettorie larghe o strette in curva), mantenendosi però **rigorosamente dentro la pista** (`abs(trackPos) <= 1.0`). All'arrivo, salva **solo** gli snippet delle curve in `laps/curves/` (evitando di inquinare i giri completi ideali usati nel Behavioral Cloning con traiettorie sub-ottimali).
+- Ogni giro completo validato (nessun incidente) viene salvato automaticamente in `laps/`.
 
-#### 🗺️ Algoritmo di Rilevamento Geometrico delle Curve
-Per evitare che le correzioni di traiettoria del pilota umano in rettilineo vengano scambiate per curve, il sistema analizza la geometria della pista tramite i 19 range finder del sensore `track`:
-1. **Visuale Frontale Ridotta**: Se la distanza misurata straight-ahead (`track[9]`) scende sotto i `130` metri, significa che la pista si sta chiudendo (la vettura si avvicina al muro esterno della curva).
-2. **Spostamento dell'Apice (Apex Shift)**: In rettilineo il sensore più lungo è sempre il 9 (centrale). In curva, la via di fuga si sposta a destra o sinistra, facendo sì che l'indice con valore massimo sia diverso da 9.
-3. **Asimmetria Profilo**: Se la somma delle distanze a sinistra `track[0:9]` differisce significativamente da quella a destra `track[10:19]`, la strada sta curvando.
-4. **Frenate/Tornanti Ciechi**: Se la visuale frontale scende sotto i `60` metri, la curva è rilevata istantaneamente.
+
 
 #### ⌨️ Mappatura Controlli di Guida
 
@@ -146,9 +118,7 @@ Per evitare che le correzioni di traiettoria del pilota umano in rettilineo veng
 - ✅ Il giro è stato completato con un lap time valido (`lastLapTime > 0`)
 
 **Organizzazione Output**:
-- `train_set/laps/lap_001.h5`, ... — Giri completi ideali (states + actions + metadata)
-- `train_set/laps/curves/lap_curve_001_0001.h5`, ... — Curve ideali estratte automaticamente
-- `train_set/laps/curves/lap_curve_diverse_001_0001.h5`, ... — Curve diversificate per la robustezza
+- `train_set/laps/lap_001.h5`, ... — Giri completi (states + actions + metadata)
 - `train_set/session_logs/session_*.log` — Log della sessione di raccolta
 
 **Interruzione**: `Ctrl+C` termina la sessione. Il giro corrente incompleto o non completato **non** viene salvato.
@@ -162,8 +132,6 @@ Il dataset completo contiene **20 giri validi** per un totale di **71.562 campio
 | Giri validi | 20 |
 | Campioni totali | 71.562 |
 | Durata media giro | ~71.6s (3578 step a 50Hz) |
-| Best lap | 71.038s (lap_017) |
-| Worst lap | 77.146s (lap_001) |
 
 **Spazio delle azioni** (4 dimensioni):
 | Azione | Range | Media | Distribuzione |
@@ -310,7 +278,7 @@ policy_loss = λ_bc · MSE(actor, bc_model)  +  w_cpi · (-Q(actor) · adv_mask 
 - ✅ Singolo forward pass Actor per BC e Q (nessun gradiente conflittuale)
 - ✅ Normalizzazione Q-scale previene instabilità per cambio di scala del Critic
 - ✅ `λ_bc` decade adattivamente in base alle metriche di training (reward trend, survival ratio)
-- ✅ **Replay Buffer Stratificato (Data Mixing)**: campionamento stratificato con mini-batch composti al 75% da traiettorie base (giri completi + online) e al 25% da curve snippet (expert injection) per ripristinare la densità delle transizioni lineari ed evitare catastrophic forgetting.
+- ✅ **Replay Buffer**: campionamento uniforme delle transizioni dai giri completi per massimizzare la stabilità dell'apprendimento.
 - ✅ **Exploration Noise adattivo**: σ aumenta su stagnazione, diminuisce quando l'agente migliora
 - ✅ **Launch Override**: partenza da fermo con `accel=1, brake=0, gear=1` finché `speedX < 10 km/h` (la BC non ha dati sufficienti per la partenza)
 - ✅ **Demo reward calcolata**: le transizioni demo usano la stessa reward function del training online (non flat `0.5`)

@@ -35,7 +35,7 @@ from gym_torcs import TorcsEnv
 
 class PolicyNetwork(nn.Module):
     """Rete BC: stato → azione deterministica (Tanh)."""
-    def __init__(self, state_dim=29, action_dim=4, hidden_size=256):
+    def __init__(self, state_dim=30, action_dim=4, hidden_size=256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_size),
@@ -54,7 +54,7 @@ class PolicyNetwork(nn.Module):
 
 class Actor(nn.Module):
     """Rete SAC Actor: stato → (mean, log_std). Per il test usiamo solo la mean."""
-    def __init__(self, state_dim=29, action_dim=4, hidden_size=256):
+    def __init__(self, state_dim=30, action_dim=4, hidden_size=256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_size),
@@ -78,7 +78,7 @@ class Actor(nn.Module):
 # ──────────────────────────────────────────────────────────────────────
 
 def flatten_state(state_dict: dict) -> np.ndarray:
-    """Appiattisce osservazione TORCS → vettore 29D."""
+    """Appiattisce osservazione TORCS → vettore 30D."""
     def _s(key, default=0.0):
         v = state_dict.get(key, default)
         if isinstance(v, np.ndarray):

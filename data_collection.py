@@ -10,7 +10,6 @@ Interrompere con Ctrl+C. Il giro corrente incompleto NON viene salvato.
 
 Formato output (se il giro è valido e completato):
     lap_001.h5, lap_002.h5, ...              (un file per giro valido)
-    lap_curve_001_0001.h5, ...               (snippet separati per ogni curva affrontata nel giro)
     session_logs/session_YYYYMMDD.log        (log di sessione testuale)
 """
 
@@ -209,7 +208,7 @@ class KeyboardController:
 # ──────────────────────────────────────────────────────────────────────
 
 def flatten_state(state_dict: dict) -> np.ndarray:
-    """Appiattisce il dizionario di osservazione TORCS in un vettore 1D (29D).
+    """Appiattisce il dizionario di osservazione TORCS in un vettore 1D (30D).
 
     Ordine: [angle(1), track(19), trackPos(1), speedX(1), speedY(1), speedZ(1),
              wheelSpinVel(4)/100, rpm(1)/10000]
@@ -273,44 +272,7 @@ def _get_last_lap_time(obs: dict) -> float:
     return float(llt)
 
 
-def is_on_curve(obs: dict) -> bool:
-    """Rileva se l'auto si trova in curva basandosi sulla geometria del tracciato.
 
-    Analizza i sensori 'track' (19 range finders) e l'angolo 'angle' per determinare
-    la curvatura della strada, indipendentemente dall'azione di sterzo del pilota.
-    """
-    track = obs.get('track', None)
-    if track is None:
-        return False
-
-    track = np.array(track, dtype=np.float32).flatten()
-    if track.shape[0] < 19:
-        return False
-
-    # 1. Distanza massima e indice del sensore più lungo
-    max_idx = np.argmax(track)
-
-    # 2. Distanza frontale (sensore 9, a 0 gradi rispetto all'auto)
-    front_dist = track[9]
-
-    # 3. Analisi di asimmetria dei sensori laterali
-    left_sum = np.sum(track[0:9])
-    right_sum = np.sum(track[10:19])
-    asymmetry = abs(left_sum - right_sum) / (min(left_sum, right_sum) + 1e-5)
-
-    # 4. Condizione di curva geometrica
-    is_curved = False
-
-    # Se la visuale davanti è chiusa, verifichiamo deviazione del percorso o asimmetria
-    if front_dist < 130.0:
-        if abs(max_idx - 9) >= 2 or asymmetry > 0.15:
-            is_curved = True
-
-    # Gestione curve cieche / tornanti molto stretti
-    if front_dist < 60.0:
-        is_curved = True
-
-    return is_curved
 
 
 
@@ -364,10 +326,6 @@ def main():
         help="Directory di output per i file HDF5 e il log (default: directory corrente)"
     )
     parser.add_argument(
-        "--mode", type=str, choices=["ideal", "diverse"], default="ideal",
-        help="Modalità di raccolta: 'ideal' (traiettoria ideale, salva giro + curve) o 'diverse' (traiettorie diverse in curva, salva solo curve)"
-    )
-    parser.add_argument(
         "--device", type=str, choices=["controller", "keyboard"], default="controller",
         help="Dispositivo di input: 'controller' (PS5 DualSense) o 'keyboard' (tastiera WASD)"
     )
@@ -403,8 +361,6 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     laps_dir = os.path.join(output_dir, "laps")
     os.makedirs(laps_dir, exist_ok=True)
-    curves_dir = os.path.join(laps_dir, "curves")
-    os.makedirs(curves_dir, exist_ok=True)
 
     # ── Session log ──
     log_dir = os.path.join(output_dir, "session_logs")
@@ -464,15 +420,7 @@ def main():
             lap_states: list = []
             lap_actions: list = []
 
-            # ── Buffer per estrazione automatica curve ──
-            curve_snippets = []
-            is_in_curve = False
-            pre_curve_buffer_states = deque(maxlen=100) # 2 sec a 50Hz
-            pre_curve_buffer_actions = deque(maxlen=100)
-            current_curve_states = []
-            current_curve_actions = []
-            curve_cooldown = 0
-            POST_CURVE_FRAMES = 250 # 5 sec a 50Hz
+
 
             # ── Stato di validità del giro ──
             lap_valid = True
@@ -513,34 +461,7 @@ def main():
                 lap_states.append(state_vec.copy())
                 lap_actions.append(action.copy())
 
-                # ── Estrazione automatica curve (Geometrica) ──
-                curve_detected = is_on_curve(ob_next)
-                if curve_detected:
-                    if not is_in_curve:
-                        is_in_curve = True
-                        print(f"  [Curve] ↪️ Inizio curva rilevato geometricamente (distanza frontale: {ob_next.get('track', [0]*10)[9]:.1f}m)")
-                        current_curve_states.extend(list(pre_curve_buffer_states))
-                        current_curve_actions.extend(list(pre_curve_buffer_actions))
-                    current_curve_states.append(state_vec.copy())
-                    current_curve_actions.append(action.copy())
-                    curve_cooldown = POST_CURVE_FRAMES
-                elif is_in_curve:
-                    current_curve_states.append(state_vec.copy())
-                    current_curve_actions.append(action.copy())
-                    curve_cooldown -= 1
-                    if curve_cooldown <= 0:
-                        is_in_curve = False
-                        print(f"  [Curve] ↩️ Fine curva (cooldown scaduto).")
-                        if lap_valid:
-                            curve_snippets.append((
-                                np.stack(current_curve_states),
-                                np.stack(current_curve_actions)
-                            ))
-                        current_curve_states = []
-                        current_curve_actions = []
-                else:
-                    pre_curve_buffer_states.append(state_vec.copy())
-                    pre_curve_buffer_actions.append(action.copy())
+
 
                 state_vec = next_state_vec
                 ob = ob_next
@@ -583,57 +504,26 @@ def main():
                 states_np = np.stack(lap_states)
                 actions_np = np.stack(lap_actions)
 
-                # Se siamo in modalità 'ideal', salviamo il giro completo in laps_dir
-                if args.mode == "ideal":
-                    lap_counter += 1
-                    filename = f"lap_{lap_counter:03d}.h5"
-                    filepath = os.path.join(laps_dir, filename)
+                lap_counter += 1
+                filename = f"lap_{lap_counter:03d}.h5"
+                filepath = os.path.join(laps_dir, filename)
 
-                    with h5py.File(filepath, 'w') as h5f:
-                        h5f.create_dataset('states', data=states_np, compression="gzip")
-                        h5f.create_dataset('actions', data=actions_np, compression="gzip")
-                        h5f.attrs['lap_time'] = lap_time
-                        h5f.attrs['num_steps'] = len(lap_states)
-                        h5f.attrs['timestamp'] = datetime.now().isoformat()
-                    print(f"  ✅ GIRO VALIDO (Ideale) — Salvato giro completo: {filename}")
-                else:
-                    print(f"  ✅ GIRO VALIDO (Diverso) — Giro completato correttamente. Salvataggio solo dei dati curva...")
-
-                # ── Salvataggio Snippet Curve ──
-                if is_in_curve:
-                    curve_snippets.append((
-                        np.stack(current_curve_states),
-                        np.stack(current_curve_actions)
-                    ))
-
-                saved_curves_count = 0
-                for c_states, c_actions in curve_snippets:
-                    existing_curves = [
-                        f for f in os.listdir(curves_dir)
-                        if f.startswith("lap_curve_") and f.endswith(".h5")
-                    ]
-                    c_idx = len(existing_curves) + 1
-
-                    if args.mode == "ideal":
-                        c_filename = f"lap_curve_{lap_counter:03d}_{c_idx:04d}.h5"
-                    else:
-                        c_filename = f"lap_curve_diverse_{lap_attempt:03d}_{c_idx:04d}.h5"
-
-                    c_filepath = os.path.join(curves_dir, c_filename)
-                    with h5py.File(c_filepath, 'w') as h5f:
-                        h5f.create_dataset('states', data=c_states, compression="gzip")
-                        h5f.create_dataset('actions', data=c_actions, compression="gzip")
-                        h5f.attrs['num_steps'] = len(c_states)
-                        h5f.attrs['timestamp'] = datetime.now().isoformat()
-                    saved_curves_count += 1
+                with h5py.File(filepath, 'w') as h5f:
+                    h5f.create_dataset('states', data=states_np, compression="gzip")
+                    h5f.create_dataset('actions', data=actions_np, compression="gzip")
+                    h5f.attrs['lap_time'] = lap_time
+                    h5f.attrs['num_steps'] = len(lap_states)
+                    h5f.attrs['timestamp'] = datetime.now().isoformat()
+                
+                print(f"  ✅ GIRO VALIDO — Salvato: {filename}")
 
                 session_saved += 1
 
                 log_entry = (
-                    f"[{'SAVED_IDEAL' if args.mode == 'ideal' else 'SAVED_DIVERSE'}] | Lap Time: {lap_time:.3f}s | "
-                    f"Steps: {len(lap_states)} | Curve: {saved_curves_count} | {datetime.now().isoformat()}"
+                    f"[SAVED] | Lap Time: {lap_time:.3f}s | "
+                    f"Steps: {len(lap_states)} | {datetime.now().isoformat()}"
                 )
-                print(f"     Lap Time: {lap_time:.3f}s | Steps: {len(lap_states)} | Curve salvate in 'curves/': {saved_curves_count}")
+                print(f"     Lap Time: {lap_time:.3f}s | Steps: {len(lap_states)}")
 
             else:
                 # ── Giro scartato ──

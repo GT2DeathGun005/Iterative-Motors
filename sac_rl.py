@@ -62,44 +62,18 @@ def weights_init_(m):
 
 class ReplayBuffer:
     def __init__(self, capacity: int):
-        self.base_buffer = deque(maxlen=capacity)
-        self.curve_buffer = deque(maxlen=capacity)
+        self.buffer = deque(maxlen=capacity)
 
-    def push(self, state, action, reward, next_state, done, is_curve=False):
-        if is_curve:
-            self.curve_buffer.append((state, action, reward, next_state, done))
-        else:
-            self.base_buffer.append((state, action, reward, next_state, done))
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size: int):
-        # Campionamento stratificato: 75% base, 25% curve
-        if len(self.curve_buffer) == 0:
-            batch = random.sample(self.base_buffer, batch_size)
-        elif len(self.base_buffer) == 0:
-            batch = random.sample(self.curve_buffer, batch_size)
-        else:
-            curve_batch_size = int(round(batch_size * 0.25))
-            curve_batch_size = max(0, min(curve_batch_size, len(self.curve_buffer)))
-            base_batch_size = batch_size - curve_batch_size
-            
-            base_batch_size = max(0, min(base_batch_size, len(self.base_buffer)))
-            if base_batch_size + curve_batch_size < batch_size:
-                needed = batch_size - (base_batch_size + curve_batch_size)
-                if len(self.base_buffer) > base_batch_size:
-                    base_batch_size += min(needed, len(self.base_buffer) - base_batch_size)
-                elif len(self.curve_buffer) > curve_batch_size:
-                    curve_batch_size += min(needed, len(self.curve_buffer) - curve_batch_size)
-
-            batch_base = random.sample(self.base_buffer, base_batch_size)
-            batch_curve = random.sample(self.curve_buffer, curve_batch_size)
-            batch = batch_base + batch_curve
-            random.shuffle(batch)
-            
+        batch = random.sample(self.buffer, batch_size)
         state, action, reward, next_state, done = map(np.stack, zip(*batch))
         return state, action, reward, next_state, done
 
     def __len__(self):
-        return len(self.base_buffer) + len(self.curve_buffer)
+        return len(self.buffer)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -755,7 +729,7 @@ def prefill_buffer_from_demos(memory: ReplayBuffer, demo_dir: str):
     Ogni coppia (state_t, action_t) → (state_t+1) diventa una transizione.
     Le azioni vengono normalizzate in formato SAC (tanh [-1,1]).
     La reward viene calcolata dalle componenti del vettore stato usando
-    la stessa formula della reward online (speed, center, angle, time penalty).
+    la stessa formula della reward online.
     """
     h5_files = sorted(glob.glob(os.path.join(demo_dir, "**/lap_*.h5"), recursive=True))
     if not h5_files:
@@ -769,26 +743,20 @@ def prefill_buffer_from_demos(memory: ReplayBuffer, demo_dir: str):
             states = h5f['states'][:]
             actions = h5f['actions'][:]
 
-        is_curve_snippet = "lap_curve_" in os.path.basename(h5_path)
-
         n_transitions = len(states) - 1
         for i in range(n_transitions):
             norm_action = normalize_action(actions[i])
             reward = compute_demo_reward(states[i], states[i + 1])
             
-            # FIX #5: ultima transizione di ogni giro demo → mask=0.0 (terminale)
-            # ECCEZIONE: per gli snippet delle curve, l'episodio non finisce realmente lì,
-            # quindi il Critic deve fare bootstrap (mask=1.0) sul next_state.
-            is_last = (i == n_transitions - 1)
-            mask = 0.0 if (is_last and not is_curve_snippet) else 1.0
+            # L'ultima transizione di ogni giro demo → mask=0.0 (terminale)
+            mask = 0.0 if (i == n_transitions - 1) else 1.0
             
-            memory.push(states[i], norm_action, reward, states[i + 1], mask, is_curve=is_curve_snippet)
+            memory.push(states[i], norm_action, reward, states[i + 1], mask)
             rewards_sum += reward
             total += 1
 
     avg_reward = rewards_sum / total if total > 0 else 0.0
     print(f"  ✅ Buffer pre-riempito con {total:,} transizioni da {len(h5_files)} giri demo")
-    print(f"     -> Base transitions: {len(memory.base_buffer):,} | Curve transitions: {len(memory.curve_buffer):,}")
     print(f"     Reward media demo: {avg_reward:.3f}")
     return total
 
@@ -910,11 +878,11 @@ def main():
                         help="Learning rate dell'actor (basso per preservare BC)")
     parser.add_argument("--critic_lr", type=float, default=3e-4,
                         help="Learning rate del critic")
-    parser.add_argument("--bc_lambda", type=float, default=0.75,
-                        help="Coefficiente regolarizzazione BC (0=disabilitato, default: 0.75)")
+    parser.add_argument("--bc_lambda", type=float, default=1.0,
+                        help="Coefficiente regolarizzazione BC (0=disabilitato, default: 1.0)")
     parser.add_argument("--critic_warmup_steps", type=int, default=10000,
                         help="Step di pre-training offline del Critic prima del loop episodi")
-    parser.add_argument("--actor_freeze_episodes", type=int, default=5,
+    parser.add_argument("--actor_freeze_episodes", type=int, default=50,
                         help="Episodi in cui l'Actor è congelato (solo Critic si aggiorna)")
     parser.add_argument("--bc_decay_episodes", type=int, default=500,
                         help="Episodi su cui decadere bc_lambda linearmente fino a 0.1")
@@ -924,7 +892,7 @@ def main():
                         help="Salva checkpoint ogni N episodi")
     parser.add_argument("--resume", type=str, default="",
                         help="Path a un checkpoint completo per riprendere il training")
-    parser.add_argument("--exploration_sigma", type=float, default=0.1,
+    parser.add_argument("--exploration_sigma", type=float, default=0.05,
                         help="Deviazione standard del rumore Gaussiano aggiunto alle azioni in fase TRAIN (0=disabilitato)")
     args = parser.parse_args()
 

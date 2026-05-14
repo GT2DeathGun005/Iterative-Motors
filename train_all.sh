@@ -46,8 +46,8 @@ SAC_EPISODES=10000
 SAC_MAX_STEPS=10000
 SAC_TARGET_TIME=71.038
 SAC_CRITIC_WARMUP=10000
-SAC_BC_LAMBDA=0.75
-SAC_FREEZE_EPISODES=5
+SAC_BC_LAMBDA=1.0
+SAC_FREEZE_EPISODES=50
 SAC_BATCH_SIZE=256
 SAC_RELAUNCH_EVERY=20
 SAC_CHECKPOINT_EVERY=50
@@ -221,7 +221,8 @@ if $RUN_SAC; then
         --bc_lambda $SAC_BC_LAMBDA \
         --batch_size $SAC_BATCH_SIZE \
         --relaunch_every $SAC_RELAUNCH_EVERY \
-        --checkpoint_every $SAC_CHECKPOINT_EVERY"
+        --checkpoint_every $SAC_CHECKPOINT_EVERY \
+        --exploration_sigma 0.05"
 
     # Aggiungi --resume se specificato
     if [[ -n "$RESUME_PATH" ]]; then
