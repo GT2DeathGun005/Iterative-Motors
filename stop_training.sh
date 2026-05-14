@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════
-#  stop_training.sh — Ferma tutti i processi di training AIcar
+#  stop_training.sh — Ferma i processi di training AIcar
 #
 #  Ferma in modo pulito:
-#    - sac_rl.py (SAC training)
-#    - test_agent.py (Seed search)
+#    - behavioral_cloning.py (BC training)
 #    - torcs-bin (simulatore TORCS)
 #    - xvfb-run (display virtuale)
 #
@@ -37,31 +36,20 @@ if [[ "${1:-}" == "--force" ]]; then
 fi
 
 echo -e "\n${BOLD}${RED}══════════════════════════════════════════${NC}"
-echo -e "${BOLD}${RED}  🛑  Stop Training AIcar${NC}"
+echo -e "${BOLD}${RED}  🛑  Stop AIcar Processes${NC}"
 echo -e "${BOLD}${RED}══════════════════════════════════════════${NC}\n"
 
 KILLED=0
 
-# ── SAC RL ──
-SAC_PIDS=$(pgrep -f "sac_rl.py" 2>/dev/null || true)
-if [[ -n "$SAC_PIDS" ]]; then
-    for pid in $SAC_PIDS; do
-        log_info "Fermando sac_rl.py (PID: $pid)..."
+# ── Behavioral Cloning ──
+BC_PIDS=$(pgrep -f "behavioral_cloning.py" 2>/dev/null || true)
+if [[ -n "$BC_PIDS" ]]; then
+    for pid in $BC_PIDS; do
+        log_info "Fermando behavioral_cloning.py (PID: $pid)..."
         kill -"$SIGNAL" "$pid" 2>/dev/null && KILLED=$((KILLED + 1))
     done
 else
-    log_info "Nessun processo sac_rl.py trovato."
-fi
-
-# ── Test Agent (Seed Search) ──
-TEST_PIDS=$(pgrep -f "test_agent.py" 2>/dev/null || true)
-if [[ -n "$TEST_PIDS" ]]; then
-    for pid in $TEST_PIDS; do
-        log_info "Fermando test_agent.py (PID: $pid)..."
-        kill -"$SIGNAL" "$pid" 2>/dev/null && KILLED=$((KILLED + 1))
-    done
-else
-    log_info "Nessun processo test_agent.py trovato."
+    log_info "Nessun processo behavioral_cloning.py trovato."
 fi
 
 # ── TORCS ──
@@ -84,22 +72,13 @@ if [[ -n "$XVFB_PIDS" ]]; then
     done
 fi
 
-# ── Behavioral Cloning ──
-BC_PIDS=$(pgrep -f "behavioral_cloning.py" 2>/dev/null || true)
-if [[ -n "$BC_PIDS" ]]; then
-    for pid in $BC_PIDS; do
-        log_info "Fermando behavioral_cloning.py (PID: $pid)..."
-        kill -"$SIGNAL" "$pid" 2>/dev/null && KILLED=$((KILLED + 1))
-    done
-fi
-
 # ── Aspetta che i processi terminino ──
 if [[ $KILLED -gt 0 ]]; then
     log_info "Attesa terminazione processi..."
-    sleep 3
+    sleep 2
 
     # Verifica che siano effettivamente terminati
-    REMAINING=$(pgrep -f "sac_rl.py|test_agent.py|torcs-bin" 2>/dev/null || true)
+    REMAINING=$(pgrep -f "behavioral_cloning.py|torcs-bin" 2>/dev/null || true)
     if [[ -n "$REMAINING" ]]; then
         log_warn "Alcuni processi ancora attivi. Forzo la chiusura..."
         for pid in $REMAINING; do
@@ -117,15 +96,16 @@ echo ""
 if [[ $KILLED -gt 0 ]]; then
     log_ok "${BOLD}$KILLED processi fermati.${NC}"
 else
-    log_ok "Nessun processo di training in esecuzione."
+    log_ok "Nessun processo in esecuzione."
 fi
 
 # ── Stato finale ──
-REMAINING_CHECK=$(pgrep -f "sac_rl.py|test_agent.py|torcs-bin|behavioral_cloning.py" 2>/dev/null || true)
+REMAINING_CHECK=$(pgrep -f "behavioral_cloning.py|torcs-bin" 2>/dev/null || true)
 if [[ -z "$REMAINING_CHECK" ]]; then
-    log_ok "Tutti i processi di training sono stati fermati."
+    log_ok "Tutti i processi sono stati fermati."
 else
     log_warn "Processi ancora attivi:"
     ps -p $(echo "$REMAINING_CHECK" | tr '\n' ',') -o pid,cmd 2>/dev/null
 fi
 echo ""
+

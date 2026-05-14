@@ -130,35 +130,38 @@ def load_dataset(path: str) -> Dataset:
 class PolicyNetwork(nn.Module):
     """Rete Actor per Behavioral Cloning: stato → azione continua.
 
-    Architettura feed-forward con LayerNorm e output Tanh [-1, 1].
-    Struttura del Sequential (per riferimento nel warm start SAC):
-      net.0: Linear(state_dim → hidden)
-      net.1: LayerNorm(hidden)
-      net.2: ReLU
-      net.3: Linear(hidden → hidden)
-      net.4: LayerNorm(hidden)
-      net.5: ReLU
-      net.6: Linear(hidden → action_dim)
-      net.7: Tanh
+    Architettura deep feed-forward con LayerNorm e output Tanh [-1, 1].
+    Struttura: 30 -> 256 -> 512 -> 512 -> 256 -> 4
     """
 
     def __init__(self, state_dim: int = 30, action_dim: int = 4,
-                 hidden_size: int = 256):
+                 hidden_size: int = 512):
         super(PolicyNetwork, self).__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_size),       # 0
-            nn.LayerNorm(hidden_size),                # 1
-            nn.ReLU(),                                # 2
-            nn.Linear(hidden_size, hidden_size),      # 3
-            nn.LayerNorm(hidden_size),                # 4
-            nn.ReLU(),                                # 5
-            nn.Linear(hidden_size, action_dim),       # 6
-            nn.Tanh()                                 # 7
+            nn.Linear(state_dim, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.ReLU(),
+            
+            nn.Linear(hidden_size, action_dim),
+            nn.Tanh()
         )
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         return self.net(state)
+
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -211,8 +214,8 @@ class BehaviorCloningTrainer:
     # Peso extra per lo sterzo in curva. Senza questo, la MSE media converge
     # verso steer≈0 perché il 64.5% dei campioni è in rettilineo, causando
     # sotto-sterzo catastrofico che porta fuori pista alla prima curva.
-    STEER_CURVE_WEIGHT = 5.0
-    STEER_CURVE_THRESHOLD = 0.1  # |steer_normalized| sopra questa soglia
+    STEER_CURVE_WEIGHT = 10.0
+    STEER_CURVE_THRESHOLD = 0.02  # |steer_normalized| sopra questa soglia
 
     def __init__(self, model: nn.Module, dataset: Dataset,
                  batch_size: int = 128, val_split: float = 0.2,
@@ -269,6 +272,9 @@ class BehaviorCloningTrainer:
         # Applica il peso SOLO allo sterzo
         weighted_sq = sq_error.clone()
         weighted_sq[:, 0] = sq_error[:, 0] * steer_weight
+
+        # Peso extra per il freno (indice 2)
+        weighted_sq[:, 2] = sq_error[:, 2] * 5.0
 
         # Peso extra per il cambio (indice 3) per imparare meglio le marce
         weighted_sq[:, 3] = sq_error[:, 3] * 5.0
