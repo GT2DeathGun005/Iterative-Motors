@@ -106,26 +106,24 @@ def load_dataset(path: str) -> Dataset:
             raise FileNotFoundError(
                 f"Nessun file lap_*.h5 trovato in {path} o nelle sue sottocartelle"
             )
-        print(f"  Trovati {len(h5_files)} file HDF5. Cerco il golden lap...")
+        print(f"  Trovati {len(h5_files)} file HDF5. Carico l'intero dataset...")
         
-        best_file = None
-        min_samples = float('inf')
+        datasets = []
+        total_samples = 0
         
         for f in h5_files:
             try:
                 ds = TorcsHDF5Dataset(f)
-                if len(ds) < min_samples:
-                    min_samples = len(ds)
-                    best_file = f
+                datasets.append(ds)
+                total_samples += len(ds)
             except Exception as e:
                 print(f"  [Warning] Impossibile leggere {f}: {e}")
                 
-        if best_file is None:
+        if not datasets:
             raise ValueError("Nessun dataset valido trovato.")
             
-        print(f"  🏆 Golden Lap selezionato: {os.path.relpath(best_file, path)} ({min_samples} campioni)")
-        golden_ds = TorcsHDF5Dataset(best_file)
-        return golden_ds, len(golden_ds)
+        print(f"  📚 Dataset caricato: {len(datasets)} giri, {total_samples} campioni totali.")
+        return ConcatDataset(datasets), total_samples
     else:
         ds = TorcsHDF5Dataset(path)
         print(f"  Caricato {os.path.basename(path)}: {len(ds)} campioni")
@@ -285,6 +283,13 @@ class BehaviorCloningTrainer:
         for states, targets in self.train_loader:
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
+
+            # ── Data Augmentation: State Noise ──
+            # Aggiungiamo un leggero rumore bianco allo stato per forzare la robustezza.
+            # Questo aiuta l'agente a recuperare se si scosta leggermente dalla traiettoria ideale.
+            if self.model.training:
+                noise = torch.randn_like(states) * 0.005 # 0.5% di rumore
+                states = states + noise
 
             # Normalizza i target nel range [-1, 1] per il Tanh
             targets_norm = normalize_actions(targets)
