@@ -34,7 +34,6 @@ CHECKPOINT_DIR="train_set/checkpoints"
 # BC Hyperparameters
 BC_EPOCHS=300
 BC_BATCH_SIZE=256
-BC_PATIENCE=20
 
 # ── Funzioni utility ──
 timestamp() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -68,7 +67,7 @@ mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR"
 # ═══════════════════════════════════════════════════════════════════════
 log_phase "🧠  Training: Behavioral Cloning"
 log_info "Dataset: $DEMO_DIR ($DEMO_COUNT giri)"
-log_info "Epochs: $BC_EPOCHS | Batch: $BC_BATCH_SIZE | Patience: $BC_PATIENCE"
+log_info "Epochs: $BC_EPOCHS | Batch: $BC_BATCH_SIZE"
 log_info "Output: $BC_WEIGHTS"
 
 python -u behavioral_cloning.py \
