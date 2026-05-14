@@ -430,7 +430,42 @@ Poiché i giri migliori spesso avvengono grazie a questa esplorazione *prima* ch
 python test_agent.py --weights train_set/checkpoints/sac_checkpoint_best.pth --model sac --seed 12345 --laps 1
 ```
 
+#### 📜 Logging, Esclusione Seed e Resume (`--resume`)
+
+Per ottimizzare la ricerca dei giri migliori, `test_agent.py` integra un sistema di tracciamento avanzato:
+
+1. **Logging persistente**: Ogni tentativo viene registrato automaticamente in `train_set/session_logs/test_results.log`, salvando pesi, sigma, seed, esito e lap time. Non è più necessario monitorare costantemente la console.
+2. **Esclusione automatica**: All'avvio, lo script legge lo storico dal log. Se un seed è già stato testato per la combinazione attuale di pesi e sigma (sia fallito che completato), viene inserito in una blacklist e **non verrà mai più generato casualmente**, eliminando i test duplicati.
+3. **Resume intelligente (`--resume`)**: Aggiungendo questa flag, lo script pre-caricherà dallo storico anche il conto dei giri completati con successo. Se ad esempio richiedi `--laps 10` e ne hai già completati 4 nello storico per quella specifica configurazione, lo script cercherà di completarne solo altri 6. Se l'obiettivo è già stato raggiunto, lo script stamperà il riepilogo storico e terminerà istantaneamente.
+
+```bash
+# Ricerca di nuovi seed ottimali, riprendendo esattamente da dove si era lasciato
+python test_agent.py --weights train_set/checkpoints/sac_actor_best.pth --model sac --laps 10 --resume
+```
+
 > **Nota sui File Pesi:** È fortemente raccomandato usare il file completo `sac_checkpoint_best.pth` per i test esplorativi, poiché include lo stato dell'AdaptiveScheduler e permette allo script di estrarre il `sigma` corretto. Il file più leggero `sac_actor_best.pth` contiene invece solo i nudi pesi della rete neurale: se usi quest'ultimo, lo script non saprà quale rumore applicare (`sigma=0` di default) a meno che tu non lo fornisca esplicitamente da terminale (es. `--sigma 0.062 --seed 12345`).
+
+#### ⚡ Ricerca Seed in Background (Headless)
+
+Per avviare una lunga ricerca di seed ottimali senza tenere bloccato il terminale e senza intralciare lo schermo, abbiamo uno script wrapper dedicato (`search_seeds.sh`) che esegue automaticamente l'agente in background puntando al miglior checkpoint, escludendo i seed già provati (`--resume`) e gestendo il server virtuale **Xvfb**.
+
+```bash
+# Avvia la ricerca cercando di completare 50 giri in totale (valore di default)
+./search_seeds.sh
+
+# Avvia la ricerca con un obiettivo specifico (es. 10 giri completati)
+./search_seeds.sh 10
+
+# Controlla se la ricerca sta girando e visualizza al volo gli ultimi log
+./search_seeds.sh --status
+
+# Ferma la ricerca in esecuzione in modo pulito
+./search_seeds.sh --stop
+```
+
+**Monitoraggio della sessione (manuale):**
+- Per vedere l'avanzamento completo: `tail -f train_set/session_logs/test_stdout.log`
+- Per consultare solo i risultati e i seed: `tail -f train_set/session_logs/test_results.log`
 
 ### ⚡ Training Headless (Velocizzato)
 

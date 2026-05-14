@@ -19,6 +19,7 @@ import os
 import sys
 import argparse
 import time
+import datetime
 import numpy as np
 import torch
 import torch.nn as nn
@@ -131,6 +132,8 @@ def main():
                         help="Exploration noise σ (default: auto dal checkpoint, 0=deterministico)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Fissa il seed per rendere il rumore perfettamente riproducibile")
+    parser.add_argument("--resume", action="store_true",
+                        help="Riprende il test da dove lasciato (legge test_results.log per escludere i seed e riprendere i lap completati)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -187,21 +190,68 @@ def main():
     print(f"  🎯 Modalità: {mode_str}")
     print(f"{'=' * 64}\n")
 
+    # ── Lettura History (Resume e Seed Esclusi) ──
+    log_dir = os.path.join(os.path.dirname(__file__), "train_set", "session_logs")
+    log_file = os.path.join(log_dir, "test_results.log")
+    
+    tested_seeds = set()
+    lap_times = []
+    total_laps_attempted = 0
+    weights_basename = os.path.basename(args.weights)
+
+    if os.path.exists(log_file):
+        with open(log_file, "r") as f:
+            for line in f:
+                if f"Weights: {weights_basename}," in line and f"Sigma: {sigma:.4f}," in line:
+                    try:
+                        seed_part = line.split("Seed: ")[1].split(",")[0]
+                        seed_val = int(seed_part)
+                        tested_seeds.add(seed_val)
+                        
+                        if args.resume:
+                            total_laps_attempted += 1
+                            if "Status: SUCCESS" in line:
+                                time_part = line.split("LapTime: ")[1].split("s")[0]
+                                lap_times.append(float(time_part))
+                    except Exception:
+                        pass
+                        
+    if len(tested_seeds) > 0:
+        print(f"  📜 Trovati {len(tested_seeds)} seed già testati per questa configurazione.")
+    if args.resume and len(lap_times) > 0:
+        print(f"  ▶️  Resume attivo: trovati {len(lap_times)} giri completati in precedenza.")
+        if len(lap_times) >= args.laps:
+            print(f"  ✅ Obiettivo di {args.laps} giri completati già raggiunto!")
+            
+            # Stampa riepilogo rapido ed esci
+            print(f"\n{'=' * 64}")
+            print(f"  📊 RIEPILOGO TEST STORICO")
+            print(f"  Sigma: {sigma:.4f}" + (" (deterministico)" if sigma == 0 else ""))
+            print(f"  Best:  {min(lap_times):.3f}s | Media: {sum(lap_times)/len(lap_times):.3f}s")
+            print(f"{'=' * 64}\n")
+            sys.exit(0)
+
     # ── Ambiente ──
     print("  Inizializzazione TORCS...")
     env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=False)
-
-    lap_times = []
-    total_laps_attempted = 0
 
     try:
         while len(lap_times) < args.laps:
             total_laps_attempted += 1
             
             # Imposta il seed per riproducibilità esatta
-            # Se specificato, usiamo quello in loop. Altrimenti uno casuale nuovo.
             import random
-            current_seed = args.seed if args.seed is not None else random.randint(0, 1000000)
+            if args.seed is not None:
+                current_seed = args.seed
+                if current_seed in tested_seeds:
+                    print(f"  ⚠️  Attenzione: il seed {current_seed} è già stato testato in precedenza.")
+            else:
+                while True:
+                    current_seed = random.randint(0, 1000000)
+                    if current_seed not in tested_seeds:
+                        break
+            tested_seeds.add(current_seed)
+            
             np.random.seed(current_seed)
             torch.manual_seed(current_seed)
             random.seed(current_seed)
@@ -278,10 +328,28 @@ def main():
             # ── Risultato del giro ──
             if lap_completed:
                 lap_times.append(lap_time)
+                status_str = "SUCCESS"
+                lap_str = f"{lap_time:.3f}s"
                 print(f"  ✅ GIRO COMPLETATO: {lap_time:.3f}s  "
                       f"({len(lap_times)}/{args.laps})")
             else:
+                status_str = "FAIL"
+                lap_str = "N/A"
                 print(f"  ❌ Giro non completato (step: {step})")
+            
+            # ── Logging su file ──
+            log_dir = os.path.join(os.path.dirname(__file__), "train_set", "session_logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, "test_results.log")
+            with open(log_file, "a") as f:
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                f.write(f"[{ts}] Model: {args.model.upper()}, Weights: {os.path.basename(args.weights)}, "
+                        f"Seed: {current_seed}, Sigma: {sigma:.4f}, Status: {status_str}, "
+                        f"LapTime: {lap_str}, Steps: {step}\n")
+                        
+            if not lap_completed and args.seed is not None:
+                print(f"  🛑 Il test con seed fisso ({args.seed}) è terminato. Esco per evitare un loop infinito.")
+                break
 
     except KeyboardInterrupt:
         print(f"\n\n  🛑 Test interrotto dall'utente.")

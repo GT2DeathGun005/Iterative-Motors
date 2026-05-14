@@ -4,6 +4,7 @@
 #
 #  Ferma in modo pulito:
 #    - sac_rl.py (SAC training)
+#    - test_agent.py (Seed search)
 #    - torcs-bin (simulatore TORCS)
 #    - xvfb-run (display virtuale)
 #
@@ -52,6 +53,17 @@ else
     log_info "Nessun processo sac_rl.py trovato."
 fi
 
+# ── Test Agent (Seed Search) ──
+TEST_PIDS=$(pgrep -f "test_agent.py" 2>/dev/null || true)
+if [[ -n "$TEST_PIDS" ]]; then
+    for pid in $TEST_PIDS; do
+        log_info "Fermando test_agent.py (PID: $pid)..."
+        kill -"$SIGNAL" "$pid" 2>/dev/null && KILLED=$((KILLED + 1))
+    done
+else
+    log_info "Nessun processo test_agent.py trovato."
+fi
+
 # ── TORCS ──
 TORCS_PIDS=$(pgrep -f "torcs-bin" 2>/dev/null || true)
 if [[ -n "$TORCS_PIDS" ]]; then
@@ -87,7 +99,7 @@ if [[ $KILLED -gt 0 ]]; then
     sleep 3
 
     # Verifica che siano effettivamente terminati
-    REMAINING=$(pgrep -f "sac_rl.py|torcs-bin" 2>/dev/null || true)
+    REMAINING=$(pgrep -f "sac_rl.py|test_agent.py|torcs-bin" 2>/dev/null || true)
     if [[ -n "$REMAINING" ]]; then
         log_warn "Alcuni processi ancora attivi. Forzo la chiusura..."
         for pid in $REMAINING; do
@@ -109,7 +121,7 @@ else
 fi
 
 # ── Stato finale ──
-REMAINING_CHECK=$(pgrep -f "sac_rl.py|torcs-bin|behavioral_cloning.py" 2>/dev/null || true)
+REMAINING_CHECK=$(pgrep -f "sac_rl.py|test_agent.py|torcs-bin|behavioral_cloning.py" 2>/dev/null || true)
 if [[ -z "$REMAINING_CHECK" ]]; then
     log_ok "Tutti i processi di training sono stati fermati."
 else
