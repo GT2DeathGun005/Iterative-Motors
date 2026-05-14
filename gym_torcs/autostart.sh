@@ -1,13 +1,33 @@
 #!/bin/bash
-# Autostart TORCS: Race → Quick Race → New Race → Start
+# Autostart TORCS: Race → Practice → New Race → Start
 # Richiede xte (pacchetto xautomation)
-# Semplicemente 4 Enter sulla prima opzione di ogni schermata.
+# Invia Return, 5 volte Down, e poi 3 Return per avviare Practice Mode.
 
 xte 'key Return'
-xte 'usleep 500000'
+xte 'usleep 200000'
 xte 'key Return'
-xte 'usleep 500000'
+xte 'usleep 200000'
+xte 'key Down'
+xte 'usleep 200000'
+xte 'key Down'
+xte 'usleep 200000'
+xte 'key Down'
+xte 'usleep 200000'
+xte 'key Down'
+xte 'usleep 200000'
+xte 'key Down'
+xte 'usleep 200000'
 xte 'key Return'
-xte 'usleep 500000'
+xte 'usleep 200000'
 xte 'key Return'
-xte 'usleep 500000'
+
+
+
+
+
+
+
+
+
+
+

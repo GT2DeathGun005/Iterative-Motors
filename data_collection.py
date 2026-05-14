@@ -256,12 +256,20 @@ def flatten_state(state_dict: dict) -> np.ndarray:
 #  Funzione helper: estrai trackPos come scalare
 # ──────────────────────────────────────────────────────────────────────
 
-def _get_track_pos(obs: dict) -> float:
-    """Estrae trackPos come float scalare dall'osservazione."""
-    tp = obs.get('trackPos', 0.0)
-    if isinstance(tp, np.ndarray):
-        return float(tp.flat[0])
-    return float(tp)
+def _get_dist_from_start(obs: dict) -> float:
+    """Estrae distFromStart come float scalare dall'osservazione."""
+    dfs = obs.get('distFromStart', 0.0)
+    if isinstance(dfs, np.ndarray):
+        return float(dfs.flat[0])
+    return float(dfs)
+
+
+def _get_cur_lap_time(obs: dict) -> float:
+    """Estrae curLapTime come float scalare dall'osservazione."""
+    clt = obs.get('curLapTime', 0.0)
+    if isinstance(clt, np.ndarray):
+        return float(clt.flat[0])
+    return float(clt)
 
 
 def _get_last_lap_time(obs: dict) -> float:
@@ -401,18 +409,21 @@ def main():
 
     TARGET_DT = 1.0 / 50.0  # 50 Hz target
     lap_attempt = 0
+    force_relaunch = False
 
     try:
         while True:
             lap_attempt += 1
 
             # ── Reset ambiente ──
-            # Relaunch periodico per evitare memory leak, e al primo giro
-            need_relaunch = (lap_attempt == 1) or (lap_attempt % args.relaunch_every == 0)
+            # Relaunch periodico, al primo giro, o se richiesto (es. fuori pista)
+            need_relaunch = (lap_attempt == 1) or (lap_attempt % args.relaunch_every == 0) or force_relaunch
             if lap_attempt == 1:
                 ob = env.reset(relaunch=True)
             else:
                 ob = env.reset(relaunch=need_relaunch)
+            
+            force_relaunch = False  # Reset flag dopo l'uso
 
             state_vec = flatten_state(ob)
 
@@ -424,13 +435,15 @@ def main():
 
             # ── Stato di validità del giro ──
             lap_valid = True
-            invalidation_step: Optional[int] = None
             invalidation_reason = ""
             lap_completed = False
             lap_time = 0.0
+            went_off_track = False
 
-            # ── Snapshot iniziale di lastLapTime per rilevare la transizione ──
+            # ── Snapshot iniziale di timing e posizione per rilevare la transizione ──
             prev_last_lap_time = _get_last_lap_time(ob)
+            prev_cur_lap_time = _get_cur_lap_time(ob)
+            prev_dist = _get_dist_from_start(ob)
 
             # ── Reset marcia ──
             controller.gear = 1
@@ -466,26 +479,68 @@ def main():
                 state_vec = next_state_vec
                 ob = ob_next
 
-                # ── Validazione: uscita di pista ──
-                track_pos = _get_track_pos(ob_next)
-                if lap_valid and abs(track_pos) > 1.0:
+                # ── Controllo fuori pista (Taglio curva) ──
+                current_track_pos = ob_next.get('trackPos', 0.0)
+                if isinstance(current_track_pos, np.ndarray):
+                    current_track_pos = current_track_pos.flat[0]
+                
+                # Usiamo 1.25 come limite per permettere una guida più aggressiva sui cordoli.
+                if abs(current_track_pos) > 1.25:
+                    print(f"\n  ❌ [OFF-TRACK] trackPos: {current_track_pos:.2f} - Riavvio immediato simulazione.")
+                    went_off_track = True
+                    lap_completed = True
                     lap_valid = False
-                    invalidation_step = step
-                    invalidation_reason = (
-                        f"Uscita di pista (trackPos = {track_pos:.3f})"
-                    )
-                    # Stampa SOLO al cambio di stato (una volta sola)
-                    print(f"\n  ⚠️  GIRO INVALIDATO allo step {step}: {invalidation_reason}")
-                    print(f"  Status: [INVALIDO] — i dati NON saranno salvati\n")
+                    invalidation_reason = f"Fuori pista (trackPos: {current_track_pos:.2f})"
+                    force_relaunch = True
+                    break
 
                 # ── Rilevamento completamento giro ──
                 current_last_lap = _get_last_lap_time(ob_next)
-                if current_last_lap > 0.0 and abs(current_last_lap - prev_last_lap_time) > 0.01:
+                current_cur_lap = _get_cur_lap_time(ob_next)
+                current_dist = _get_dist_from_start(ob_next)
+
+                # Log ogni 2 secondi circa (100 step)
+                if step % 100 == 0:
+                    print(f"    [Step {step:4d}] CurTime: {current_cur_lap:6.2f} | LastLap: {current_last_lap:6.2f} | Dist: {current_dist:7.1f} | OffTrack: {went_off_track}", end='\r')
+
+                # CONDIZIONE A: TORCS aggiorna il lastLapTime (Metodo primario e più affidabile)
+                if current_last_lap > 0.0 and abs(current_last_lap - prev_last_lap_time) > 0.0001:
                     lap_completed = True
-                    lap_time = current_last_lap
+                    if went_off_track:
+                        lap_valid = False
+                        invalidation_reason = "Giro invalidato (taglio curva o fuori pista)"
+                        print(f"\n  ⚠️  TRAGUARDO (A)! {invalidation_reason}")
+                    else:
+                        lap_valid = True
+                        lap_time = current_last_lap
+                        print(f"\n  🏁 TRAGUARDO (A)! Lap time rilevato: {lap_time:.3f}s")
+
+                # CONDIZIONE B: Reset di curLapTime (Metodo secondario per giri invalidati)
+                elif current_cur_lap < 1.5 and prev_cur_lap_time > 5.0:
+                    lap_completed = True
+                    # Se siamo qui, TORCS non ha aggiornato lastLapTime (quindi è invalido)
+                    lap_valid = False
+                    invalidation_reason = "Giro invalidato da TORCS (taglio o uscita)"
+                    print(f"\n  ⚠️  TRAGUARDO (B)! {invalidation_reason} (CurTime resettato)")
+
+                # CONDIZIONE C: Reset di distFromStart (Metodo di emergenza se i timer falliscono)
+                elif current_dist < 50.0 and prev_dist > 500.0:
+                    # Abbiamo passato il traguardo (distanza resettata)
+                    # Aspettiamo 10 step per vedere se lastLapTime si aggiorna prima di chiudere
+                    # Ma per sicurezza, se dopo un po' non succede nulla, chiudiamo come invalido.
+                    if step > 500: # Evita reset spuri alla partenza
+                        lap_completed = True
+                        lap_valid = False
+                        invalidation_reason = "Fine giro rilevata da posizione (timer TORCS non aggiornato)"
+                        print(f"\n  ⚠️  TRAGUARDO (C)! {invalidation_reason}")
+
+                prev_cur_lap_time = current_cur_lap
+                prev_dist = current_dist
 
                 # ── Uscita dal loop del giro ──
-                if lap_completed or done or not lap_valid:
+                if lap_completed or done:
+                    if done and not lap_completed:
+                        print("\n  [Info] Simulazione terminata esternamente (TORCS chiuso).")
                     break
 
                 # ── Frame rate control dinamico (50Hz) ──
@@ -529,9 +584,9 @@ def main():
                 # ── Giro scartato ──
                 session_discarded += 1
                 if not lap_completed:
-                    reason = "Giro non completato (nessun lap time registrato)"
+                    reason = "Giro non completato (interrotto o timeout)"
                 else:
-                    reason = f"Uscita di pista allo step {invalidation_step}"
+                    reason = invalidation_reason if invalidation_reason else "Tempo non valido"
 
                 log_entry = (
                     f"[DISCARDED] Tentativo #{lap_attempt} | Motivo: {reason} | "

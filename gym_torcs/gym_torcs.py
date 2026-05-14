@@ -170,7 +170,7 @@ class TorcsEnv:
 
         self.time_step += 1
 
-        return self.get_obs(), reward, client.R.d['meta'], {}
+        return self.get_obs(), reward, client.R.d['meta'] or client.so is None, {}
 
     def reset(self, relaunch=False):
         #print("Reset")
