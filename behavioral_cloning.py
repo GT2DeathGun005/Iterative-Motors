@@ -90,33 +90,42 @@ class TorcsHDF5Dataset(Dataset):
 
 
 def load_dataset(path: str) -> Dataset:
-    """Carica un dataset da un file .h5 o da una directory di file lap_*.h5.
-
-    Se `path` è una directory, concatena tutti i file lap_*.h5 trovati.
-    Se `path` è un singolo file, lo carica direttamente.
+    """Carica un dataset da un file .h5 o da una directory.
+    
+    Se `path` è una directory, analizza tutti i file lap_*.h5 (ignorando le curve)
+    e seleziona SOLO quello con il minor numero di campioni (il giro più veloce).
+    Questo garantisce l'apprendimento del "golden lap" deterministico.
     """
     if os.path.isdir(path):
         h5_files = sorted(glob.glob(os.path.join(path, "**/lap_*.h5"), recursive=True))
         
-        # Filtriamo gli snippet delle curve (sia ideali che diverse).
-        # Il BC usa ESCLUSIVAMENTE i giri completi (che contengono già le curve).
-        # Gli snippet separati servono solo per la stratificazione del Replay Buffer in sac_rl.py.
+        # Filtriamo gli snippet delle curve
         h5_files = [f for f in h5_files if "lap_curve_" not in os.path.basename(f)]
         
         if not h5_files:
             raise FileNotFoundError(
                 f"Nessun file lap_*.h5 trovato in {path} o nelle sue sottocartelle"
             )
-        print(f"  Trovati {len(h5_files)} file HDF5:")
-        datasets = []
-        total_samples = 0
+        print(f"  Trovati {len(h5_files)} file HDF5. Cerco il golden lap...")
+        
+        best_file = None
+        min_samples = float('inf')
+        
         for f in h5_files:
-            ds = TorcsHDF5Dataset(f)
-            datasets.append(ds)
-            total_samples += len(ds)
-            print(f"    ✓ {os.path.relpath(f, path)}: {len(ds)} campioni")
-        print(f"  Totale: {total_samples} campioni")
-        return ConcatDataset(datasets), total_samples
+            try:
+                ds = TorcsHDF5Dataset(f)
+                if len(ds) < min_samples:
+                    min_samples = len(ds)
+                    best_file = f
+            except Exception as e:
+                print(f"  [Warning] Impossibile leggere {f}: {e}")
+                
+        if best_file is None:
+            raise ValueError("Nessun dataset valido trovato.")
+            
+        print(f"  🏆 Golden Lap selezionato: {os.path.relpath(best_file, path)} ({min_samples} campioni)")
+        golden_ds = TorcsHDF5Dataset(best_file)
+        return golden_ds, len(golden_ds)
     else:
         ds = TorcsHDF5Dataset(path)
         print(f"  Caricato {os.path.basename(path)}: {len(ds)} campioni")
@@ -131,7 +140,7 @@ class PolicyNetwork(nn.Module):
     """Rete Actor per Behavioral Cloning: stato → azione continua.
 
     Architettura deep feed-forward con LayerNorm e output Tanh [-1, 1].
-    Struttura: 30 -> 256 -> 512 -> 512 -> 256 -> 4
+    Struttura: 30 -> 512 -> 512 -> 512 -> 512 -> 4
     """
 
     def __init__(self, state_dim: int = 30, action_dim: int = 4,
@@ -197,18 +206,9 @@ class BehaviorCloningTrainer:
     Features:
       - Loss pesata: lo sterzo in curva (|steer| > 0.1) pesa 5x di più
         per contrastare lo sbilanciamento dei dati (64.5% rettilinei)
-      - Validation split 80/20 con seed fisso per riproducibilità
-      - Early stopping basato sulla val loss
-      - Salvataggio automatico del miglior checkpoint
-
-    Nota sulla validation split:
-      La split 80/20 funge da regolarizzazione implicita: il modello si
-      ferma quando inizia a memorizzare il rumore nei dati anziché i pattern
-      di guida. Senza di essa (training su 100%) il modello raggiunge
-      train loss molto basse (0.021) ma overffitta, degradando la performance
-      in ambiente reale (reward media: +20 vs +296 con early stopping).
-      Con ~71k campioni mescolati da 20 giri, la probabilità di perdere tutti
-      i campioni di una curva specifica è trascurabile.
+      - Training deterministico: nessun validation split per overfittare 
+        perfettamente il "golden lap" senza data leakage sequenziale.
+      - Salvataggio del modello basato sulla migliore train loss.
     """
 
     # Peso extra per lo sterzo in curva. Senza questo, la MSE media converge
@@ -218,8 +218,7 @@ class BehaviorCloningTrainer:
     STEER_CURVE_THRESHOLD = 0.02  # |steer_normalized| sopra questa soglia
 
     def __init__(self, model: nn.Module, dataset: Dataset,
-                 batch_size: int = 128, val_split: float = 0.2,
-                 lr: float = 3e-4, device: str = "cpu"):
+                 batch_size: int = 128, lr: float = 3e-4, device: str = "cpu"):
         self.device = torch.device(device)
         self.model = model.to(self.device)
         print(f"  Modello spostato su: {self.device}")
@@ -228,29 +227,17 @@ class BehaviorCloningTrainer:
             self.model.parameters(), lr=lr, weight_decay=1e-5
         )
 
-        # ── Validation split ──
-        total = len(dataset)
-        val_size = int(total * val_split)
-        train_size = total - val_size
-
-        self.train_dataset, self.val_dataset = random_split(
-            dataset, [train_size, val_size],
-            generator=torch.Generator().manual_seed(42)
-        )
+        # ── Nessun validation split, training al 100% sul golden lap ──
+        self.train_dataset = dataset
 
         self.train_loader = DataLoader(
             self.train_dataset, batch_size=batch_size,
             shuffle=True, num_workers=2, pin_memory=(device != "cpu")
         )
-        self.val_loader = DataLoader(
-            self.val_dataset, batch_size=batch_size,
-            shuffle=False, num_workers=2, pin_memory=(device != "cpu")
-        )
 
-        self.best_val_loss = float('inf')
-        self.patience_counter = 0
+        self.best_train_loss = float('inf')
 
-        print(f"  Split: {train_size} train / {val_size} val")
+        print(f"  Dataset size: {len(self.train_dataset)} campioni (100% training)")
 
     def _weighted_mse(self, predictions, targets_norm, states):
         """MSE con peso extra sullo sterzo in curva e sulla partenza da fermo.
@@ -312,52 +299,24 @@ class BehaviorCloningTrainer:
 
         return total_loss / len(self.train_loader)
 
-    def validate(self) -> float:
-        self.model.eval()
-        total_loss = 0.0
-
-        with torch.no_grad():
-            for states, targets in self.val_loader:
-                states = states.to(self.device, non_blocking=True)
-                targets = targets.to(self.device, non_blocking=True)
-
-                targets_norm = normalize_actions(targets)
-                predictions = self.model(states)
-                loss = self._weighted_mse(predictions, targets_norm, states)
-                total_loss += loss.item()
-
-        return total_loss / len(self.val_loader)
-
-    def train(self, max_epochs: int = 200, patience: int = 15,
+    def train(self, max_epochs: int = 200, 
               checkpoint_path: str = "train_set/checkpoints/bc_policy.pth"):
         print(f"\n  Inizio training Behavioral Cloning su {self.device}...")
-        print(f"  Max epochs: {max_epochs} | Patience: {patience}\n")
+        print(f"  Max epochs: {max_epochs} (No validation split - Overfitting Golden Lap)\n")
 
         for epoch in range(max_epochs):
             train_loss = self.train_epoch()
-            val_loss = self.validate()
 
             improved = ""
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.patience_counter = 0
+            if train_loss < self.best_train_loss:
+                self.best_train_loss = train_loss
                 torch.save(self.model.state_dict(), checkpoint_path)
                 improved = " ★ saved"
-            else:
-                self.patience_counter += 1
 
             print(
                 f"  Epoch {epoch+1:03d}/{max_epochs} | "
-                f"Train MSE: {train_loss:.6f} | "
-                f"Val MSE: {val_loss:.6f}{improved}"
+                f"Train MSE: {train_loss:.6f}{improved}"
             )
-
-            if self.patience_counter >= patience:
-                print(
-                    f"\n  Early stopping all'epoca {epoch+1}. "
-                    f"Miglior Val Loss: {self.best_val_loss:.6f}"
-                )
-                break
 
         print(f"\n  Training completato. Miglior checkpoint: {checkpoint_path}")
 
