@@ -4,8 +4,7 @@ Behavioral Cloning (Imitation Learning) — TORCS Giro Secco
 Addestra una PolicyNetwork sulle dimostrazioni umane (HDF5) per il warm start del SAC.
 
 Features:
-  - Supporto multi-file: accetta sia un singolo .h5 sia una directory di lap_*.h5
-  - Caricamento automatico dei mini-episodi in curva (i file lap_curve_*.h5)
+  - Supporto multi-file: accetta sia un singolo .h5 sia una directory di lap_*.h5 (solo giri completi)
   - Normalizzazione corretta delle azioni per Tanh output [-1, 1]
   - Sanity check preventivi (NaN, Inf, gruppi mancanti)
   - Device CPU/CUDA coerente in tutta la pipeline
@@ -98,6 +97,12 @@ def load_dataset(path: str) -> Dataset:
     """
     if os.path.isdir(path):
         h5_files = sorted(glob.glob(os.path.join(path, "**/lap_*.h5"), recursive=True))
+        
+        # Filtriamo gli snippet delle curve (sia ideali che diverse).
+        # Il BC usa ESCLUSIVAMENTE i giri completi (che contengono già le curve).
+        # Gli snippet separati servono solo per la stratificazione del Replay Buffer in sac_rl.py.
+        h5_files = [f for f in h5_files if "lap_curve_" not in os.path.basename(f)]
+        
         if not h5_files:
             raise FileNotFoundError(
                 f"Nessun file lap_*.h5 trovato in {path} o nelle sue sottocartelle"
@@ -137,7 +142,7 @@ class PolicyNetwork(nn.Module):
       net.7: Tanh
     """
 
-    def __init__(self, state_dim: int = 29, action_dim: int = 4,
+    def __init__(self, state_dim: int = 30, action_dim: int = 4,
                  hidden_size: int = 256):
         super(PolicyNetwork, self).__init__()
 

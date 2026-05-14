@@ -283,7 +283,7 @@ class SACAgent:
     def load_bc_reference(self, bc_path: str):
         """Carica una copia congelata del BC model per la regularization."""
         from behavioral_cloning import PolicyNetwork
-        self.bc_model = PolicyNetwork().to(self.device)
+        self.bc_model = PolicyNetwork(state_dim=30).to(self.device)
         self.bc_model.load_state_dict(
             torch.load(bc_path, map_location=self.device, weights_only=True)
         )
