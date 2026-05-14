@@ -209,11 +209,8 @@ class BehaviorCloningTrainer:
       - Salvataggio del modello basato sulla migliore train loss.
     """
 
-    # Peso extra per lo sterzo in curva. Senza questo, la MSE media converge
-    # verso steer≈0 perché il 64.5% dei campioni è in rettilineo, causando
-    # sotto-sterzo catastrofico che porta fuori pista alla prima curva.
-    STEER_CURVE_WEIGHT = 10.0
-    STEER_CURVE_THRESHOLD = 0.02  # |steer_normalized| sopra questa soglia
+    # Limiti di soglia
+    STEER_CURVE_THRESHOLD = 0.05
 
     def __init__(self, model: nn.Module, dataset: Dataset,
                  batch_size: int = 128, lr: float = 3e-4, device: str = "cpu"):
@@ -238,40 +235,22 @@ class BehaviorCloningTrainer:
         print(f"  Dataset size: {len(self.train_dataset)} campioni (100% training)")
 
     def _weighted_mse(self, predictions, targets_norm, states):
-        """MSE con peso extra sullo sterzo in curva e sulla partenza da fermo.
-
-        Per i campioni dove |steer_target| > threshold, il peso dello sterzo
-        è STEER_CURVE_WEIGHT (5x). Per tutti gli altri campioni e dimensioni
-        il peso è 1.0 (MSE standard). Per la partenza a bassa velocità, applichiamo
-        un peso extra di 10x per forzare l'apprendimento di marcia 1 e gas.
-        """
-        # Errore quadratico per-dimensione [batch, 4]
+        """MSE focalizzata su Partenza e Cambio (meccaniche deterministiche)."""
         sq_error = (predictions - targets_norm) ** 2
 
-        # Peso per-campione sullo sterzo (dim 0)
-        steer_target = targets_norm[:, 0].abs()
-        is_curve = (steer_target > self.STEER_CURVE_THRESHOLD).float()
-        # Peso: 1.0 in rettilineo, STEER_CURVE_WEIGHT in curva
-        steer_weight = 1.0 + (self.STEER_CURVE_WEIGHT - 1.0) * is_curve
-
-        # Applica il peso SOLO allo sterzo
+        # Iniziamo con pesi neutri (1.0) per tutto
         weighted_sq = sq_error.clone()
-        weighted_sq[:, 0] = sq_error[:, 0] * steer_weight
 
-        # Peso extra per il freno (indice 2)
-        weighted_sq[:, 2] = sq_error[:, 2] * 5.0
+        # Peso massiccio per il cambio (indice 3) come richiesto
+        weighted_sq[:, 3] = sq_error[:, 3] * 10.0
 
-        # Peso extra per il cambio (indice 3) per imparare meglio le marce
-        weighted_sq[:, 3] = sq_error[:, 3] * 5.0
-
-        # Peso extra per bassa velocità (speedX è all'indice 21 dello stato)
-        # speedX < 0.8 corrisponde a < 40 km/h
+        # Peso extra per bassa velocità (Partenza da fermo)
+        # speedX è all'indice 21 dello stato
         speed_x = states[:, 21].abs()
         is_low_speed = (speed_x < 0.8).float()
-        # Moltiplicatore 10x per i campioni a bassa velocità
         speed_weight = 1.0 + 9.0 * is_low_speed
 
-        # Applica il moltiplicatore a tutto il campione (tutte e 4 le dimensioni)
+        # Applichiamo il peso della velocità a tutte le azioni del campione
         weighted_sq = weighted_sq * speed_weight.unsqueeze(1)
 
         return weighted_sq.mean()

@@ -185,7 +185,7 @@ def main():
                 track_pos = float(np.array(next_obs.get('trackPos', 0.0)).flat[0])
                 angle = float(np.array(next_obs.get('angle', 0.0)).flat[0])
 
-                if abs(track_pos) > 1.0:
+                if abs(track_pos) > 1.25:
                     print(f"  ⚠️  Fuori pista allo step {step} (trackPos={track_pos:.3f})")
                     break
                 if np.cos(angle) < 0:
