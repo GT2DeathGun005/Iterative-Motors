@@ -282,14 +282,14 @@ class BehaviorCloningTrainer:
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
-            # ── Data Augmentation: Structured Noise (Balanced Recovery) ──
-            # 0.05 su trackPos è il valore perfetto: forte abbastanza per insegnare il recupero 
-            # ma coerente con i LIDAR geometrici per non causare allucinazioni sterzanti.
-            noise = torch.randn_like(states) * 0.002
-            noise[:, 20] = torch.randn(states.size(0), device=states.device) * 0.05   # trackPos: robustezza recupero
-            noise[:, 21] = torch.randn(states.size(0), device=states.device) * 0.01   # speedX: precisione frenata/cambio
-            noise[:, 22] = torch.randn(states.size(0), device=states.device) * 0.005  # speedY: moderato
-            noise[:, 23] = torch.randn(states.size(0), device=states.device) * 0.005  # speedZ: moderato
+            # ── Data Augmentation: Structured Noise (Robust Recovery) ──
+            # Rumore strutturato forte su trackPos e speedX per insegnare il recupero 
+            # e la staccata adattiva in condizioni sballate (covariate shift a runtime).
+            noise = torch.randn_like(states) * 0.01
+            noise[:, 20] = torch.randn(states.size(0), device=states.device) * 0.15   # trackPos: forte per riallineamento
+            noise[:, 21] = torch.randn(states.size(0), device=states.device) * 0.30   # speedX: forte per staccata adattiva
+            noise[:, 22] = torch.randn(states.size(0), device=states.device) * 0.05   # speedY: moderato
+            noise[:, 23] = torch.randn(states.size(0), device=states.device) * 0.05   # speedZ: moderato
             states = states + noise
 
             self.optimizer.zero_grad()

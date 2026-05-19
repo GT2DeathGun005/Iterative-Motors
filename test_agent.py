@@ -179,8 +179,8 @@ def main():
         while len(lap_times) < args.laps:
             total_attempts += 1
             
-            # Reset ambiente
-            obs = env.reset(relaunch=(total_attempts == 1 or total_attempts % 10 == 0))
+            # Reset ambiente con relaunch forzato ad ogni tentativo per garantire uno stato fisico iniziale pulito ed identico
+            obs = env.reset(relaunch=True)
             state = flatten_state(obs)
 
             # Lap tracking
@@ -228,8 +228,8 @@ def main():
                     'gear': int(env_action[3])
                 })
 
-                # ── Check fuoripista/spin ──
-                if abs(track_pos) > 1.25:
+                # ── Check fuoripista/spin (soglia a 1.50 per consentire l'uso delle vie di fuga asfaltate e dei cordoli estesi) ──
+                if abs(track_pos) > 1.50:
                     print(f"  ⚠️  Fuori pista allo step {step} (trackPos={track_pos:.3f})")
                     break
                 if np.cos(angle) < 0:
