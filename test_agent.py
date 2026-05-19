@@ -27,44 +27,54 @@ from gym_torcs import TorcsEnv
 # ──────────────────────────────────────────────────────────────────────
 
 class PolicyNetwork(nn.Module):
-    """Rete Actor per Behavioral Cloning: stato → azione continua.
+    """Rete Actor per Behavioral Cloning con architettura Multi-Head:
+    stato (30D) → testa continua (steer, accel, brake) & testa discreta (gear).
 
-    Architettura deep feed-forward con LayerNorm, Dropout e output Tanh [-1, 1].
-    Il Dropout è attivo solo durante il training; a eval() è trasparente.
-    Struttura: 30 -> 512 -> 512 -> 512 -> 512 -> 4
+    Il backbone estrae feature condivise. Le due teste separate evitano
+    le oscillazioni e i ritardi tipici della regressione sul cambio marcia.
     """
 
-    def __init__(self, state_dim: int = 30, action_dim: int = 4,
-                 hidden_size: int = 512, dropout: float = 0.1):
+    def __init__(self, state_dim: int = 30, hidden_size: int = 512):
         super(PolicyNetwork, self).__init__()
 
-        self.net = nn.Sequential(
+        self.backbone = nn.Sequential(
             nn.Linear(state_dim, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            nn.Dropout(dropout),
-
+            
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            nn.Dropout(dropout),
-
+            
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            nn.Dropout(dropout),
-
+            
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            nn.Dropout(dropout),
-
-            nn.Linear(hidden_size, action_dim),
-            nn.Tanh()
         )
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        return self.net(state)
+        # Testa continua per: steer (1), accel (1), brake (1)
+        self.continuous_head = nn.Linear(hidden_size, 3)
+        
+        # Testa discreta per la marcia (7 classi: 0, 1, 2, 3, 4, 5, 6)
+        self.gear_head = nn.Linear(hidden_size, 7)
+
+    def forward(self, state: torch.Tensor):
+        features = self.backbone(state)
+        
+        cont_out = self.continuous_head(features)
+        
+        # Separiamo e applichiamo le attivazioni corrette
+        steer = torch.tanh(cont_out[:, 0:1])          # [-1, 1]
+        accel_brake = torch.sigmoid(cont_out[:, 1:3])   # [0, 1]
+        
+        continuous = torch.cat([steer, accel_brake], dim=1) # 3D: [steer, accel, brake]
+        
+        gear_logits = self.gear_head(features)          # 7D logits
+        
+        return continuous, gear_logits
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -106,14 +116,16 @@ def flatten_state(state_dict: dict) -> np.ndarray:
         return np.zeros(30, dtype=np.float32)
 
 
-def denormalize_action(action: np.ndarray) -> np.ndarray:
-    """Converte azione Tanh [-1,1] → formato env TORCS."""
+def denormalize_action(cont_action: np.ndarray, gear: int) -> np.ndarray:
+    """Converte l'azione continua (3D) + marcia (int) nel formato TORCS.
+
+    Gli output di accel e brake derivano da un'attivazione Sigmoid [0, 1].
+    """
     env_action = np.zeros(4, dtype=np.float32)
-    env_action[0] = np.clip(action[0], -1.0, 1.0)               # steer
-    env_action[1] = np.clip((action[1] + 1.0) / 2.0, 0.0, 1.0)  # accel
-    env_action[2] = np.clip((action[2] + 1.0) / 2.0, 0.0, 1.0)  # brake
-    gear = int(round((action[3] + 1.0) * 3.0))                   # gear
-    env_action[3] = float(max(0, min(6, gear)))
+    env_action[0] = np.clip(cont_action[0], -1.0, 1.0)               # steer
+    env_action[1] = np.clip(cont_action[1], 0.0, 1.0)                # accel
+    env_action[2] = np.clip(cont_action[2], 0.0, 1.0)                # brake
+    env_action[3] = float(max(0, min(6, gear)))                      # gear
     return env_action
 
 
@@ -178,6 +190,7 @@ def main():
 
             lap_completed = False
             lap_time = 0.0
+            telemetry_data = []
 
             print(f"\n  {'─' * 50}")
             print(f"  🏁 Tentativo #{total_attempts} (giri completati: {len(lap_times)}/{args.laps})")
@@ -186,18 +199,36 @@ def main():
                 # ── Inferenza DETERMINISTICA (Pure BC, zero correzioni) ──
                 with torch.no_grad():
                     state_t = torch.FloatTensor(state).to(device).unsqueeze(0)
-                    action_t = model(state_t)
-                    action = action_t.cpu().numpy()[0]
+                    pred_cont, pred_gear_logits = model(state_t)
+                    
+                    cont_action = pred_cont.cpu().numpy()[0]          # [steer, accel, brake]
+                    gear_logits = pred_gear_logits.cpu().numpy()[0]    # 7D
+                    gear = int(np.argmax(gear_logits))
 
                 # ── Step nell'ambiente (azione pura dal modello) ──
-                env_action = denormalize_action(action)
+                env_action = denormalize_action(cont_action, gear)
                 next_obs, _, env_done, _ = env.step(env_action)
                 next_state = flatten_state(next_obs)
 
-                # ── Check fuoripista/spin ──
+                # Salva telemetria step
+                dist_m = float(next_state[29] * 4000.0)
+                spd_kmh = float(next_state[21] * 50.0)
                 track_pos = float(np.array(next_obs.get('trackPos', 0.0)).flat[0])
                 angle = float(np.array(next_obs.get('angle', 0.0)).flat[0])
+                
+                telemetry_data.append({
+                    'step': step,
+                    'dist': dist_m,
+                    'speed': spd_kmh,
+                    'trackPos': track_pos,
+                    'angle': angle,
+                    'steer': float(env_action[0]),
+                    'accel': float(env_action[1]),
+                    'brake': float(env_action[2]),
+                    'gear': int(env_action[3])
+                })
 
+                # ── Check fuoripista/spin ──
                 if abs(track_pos) > 1.25:
                     print(f"  ⚠️  Fuori pista allo step {step} (trackPos={track_pos:.3f})")
                     break
@@ -207,8 +238,7 @@ def main():
 
                 # ── Telemetria ogni 200 step ──
                 if step % 200 == 0:
-                    spd = next_state[21] * 50.0
-                    print(f"    [Step {step:4d}] tp={track_pos:+.3f} | spd={spd:.0f}km/h | steer={env_action[0]:+.3f} | accel={env_action[1]:.2f} | brake={env_action[2]:.2f} | gear={int(env_action[3])}")
+                    print(f"    [Step {step:4d}] tp={track_pos:+.3f} | spd={spd_kmh:.0f}km/h | steer={env_action[0]:+.3f} | accel={env_action[1]:.2f} | brake={env_action[2]:.2f} | gear={int(env_action[3])}")
 
                 # ── Check completamento giro ──
                 current_last_lap = float(raw.get('lastLapTime', 0.0))
@@ -221,6 +251,16 @@ def main():
 
                 state = next_state
                 if env_done: break
+
+            # Salva telemetria in CSV a fine tentativo
+            import csv
+            os.makedirs('/home/whitehat/.gemini/antigravity/brain/d7ddb9d3-ff72-412a-9935-fa161dfbdc58/scratch', exist_ok=True)
+            csv_path = f'/home/whitehat/.gemini/antigravity/brain/d7ddb9d3-ff72-412a-9935-fa161dfbdc58/scratch/telemetry_attempt_{total_attempts}.csv'
+            with open(csv_path, 'w', newline='') as f_csv:
+                writer = csv.DictWriter(f_csv, fieldnames=['step', 'dist', 'speed', 'trackPos', 'angle', 'steer', 'accel', 'brake', 'gear'])
+                writer.writeheader()
+                writer.writerows(telemetry_data)
+            print(f"  📊 Telemetria del tentativo salvata in: {csv_path}")
 
             if lap_completed:
                 lap_times.append(lap_time)

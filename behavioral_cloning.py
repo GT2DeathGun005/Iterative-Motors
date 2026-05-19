@@ -132,83 +132,61 @@ def load_dataset(path: str) -> Dataset:
                 
         if not datasets:
             raise ValueError("Nessun dataset valido trovato.")
-            
         print(f"  📚 Dataset caricato: {len(datasets)} giri, {total_samples} campioni totali.")
         return ConcatDataset(datasets), total_samples
     else:
         ds = TorcsHDF5Dataset(path)
         print(f"  Caricato {os.path.basename(path)}: {len(ds)} campioni")
         return ds, len(ds)
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  Policy Network
-# ──────────────────────────────────────────────────────────────────────
-
 class PolicyNetwork(nn.Module):
-    """Rete Actor per Behavioral Cloning: stato → azione continua.
+    """Rete Actor per Behavioral Cloning con architettura Multi-Head:
+    stato (30D) → testa continua (steer, accel, brake) & testa discreta (gear).
 
-    Architettura deep feed-forward con LayerNorm, Dropout e output Tanh [-1, 1].
-    Il Dropout (p=0.1) regolarizza la rete e la rende più robusta al covariate
-    shift tipico del Behavioral Cloning, forzando rappresentazioni ridondanti.
-    Struttura: 30 -> 512 -> 512 -> 512 -> 512 -> 4
+    Il backbone estrae feature condivise. Le due teste separate evitano
+    le oscillazioni e i ritardi tipici della regressione sul cambio marcia.
     """
 
-    def __init__(self, state_dim: int = 30, action_dim: int = 4,
-                 hidden_size: int = 512, dropout: float = 0.1):
+    def __init__(self, state_dim: int = 30, hidden_size: int = 512):
         super(PolicyNetwork, self).__init__()
 
-        self.net = nn.Sequential(
+        self.backbone = nn.Sequential(
             nn.Linear(state_dim, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            nn.Dropout(dropout),
             
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            nn.Dropout(dropout),
             
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            nn.Dropout(dropout),
             
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(hidden_size, action_dim),
-            nn.Tanh()
         )
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        return self.net(state)
+        # Testa continua per: steer (1), accel (1), brake (1)
+        self.continuous_head = nn.Linear(hidden_size, 3)
+        
+        # Testa discreta per la marcia (7 classi: 0, 1, 2, 3, 4, 5, 6)
+        self.gear_head = nn.Linear(hidden_size, 7)
 
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  Normalizzazione azioni (target mapping per Tanh)
-# ──────────────────────────────────────────────────────────────────────
-
-def normalize_actions(actions: torch.Tensor) -> torch.Tensor:
-    """Normalizza il tensore azioni dal range naturale al range Tanh [-1, 1].
-
-    Input ranges:
-      [0] steering: [-1, 1]  → invariato
-      [1] accel:    [0, 1]   → [-1, 1]  con x*2-1
-      [2] brake:    [0, 1]   → [-1, 1]  con x*2-1
-      [3] gear:     [0, 6]   → [-1, 1]  con (x/3)-1
-
-    Gear mapping: 0→-1.0, 1→-0.667, 2→-0.333, 3→0.0, 4→0.333, 5→0.667, 6→1.0
-    Tutti i valori sono raggiungibili da Tanh.
-    """
-    norm = actions.clone()
-    norm[:, 1] = actions[:, 1] * 2.0 - 1.0    # accel [0,1] → [-1,1]
-    norm[:, 2] = actions[:, 2] * 2.0 - 1.0    # brake [0,1] → [-1,1]
-    norm[:, 3] = actions[:, 3] / 3.0 - 1.0    # gear  [0,6] → [-1,1]
-    return norm
+    def forward(self, state: torch.Tensor):
+        features = self.backbone(state)
+        
+        cont_out = self.continuous_head(features)
+        
+        # Separiamo e applichiamo le attivazioni corrette
+        steer = torch.tanh(cont_out[:, 0:1])          # [-1, 1]
+        accel_brake = torch.sigmoid(cont_out[:, 1:3])   # [0, 1]
+        
+        continuous = torch.cat([steer, accel_brake], dim=1) # 3D: [steer, accel, brake]
+        
+        gear_logits = self.gear_head(features)          # 7D logits
+        
+        return continuous, gear_logits
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -216,13 +194,14 @@ def normalize_actions(actions: torch.Tensor) -> torch.Tensor:
 # ──────────────────────────────────────────────────────────────────────
 
 class BehaviorCloningTrainer:
-    """Addestra la PolicyNetwork con Weighted MSE loss.
+    """Addestra la PolicyNetwork con Loss combinata MSE + CrossEntropy.
 
     Features:
-      - Loss pesata bilanciata: sterzo in curva (3x), freno (2x), cambio (3x)
+      - Loss continua pesata per sterzo, acceleratore e freno (5x freno)
+      - Classificazione discreta con CrossEntropy per la marcia (gear)
       - Validation split 80/20 con Early Stopping (patience=30)
       - Cosine Annealing LR scheduler
-      - Data augmentation con rumore gaussiano sugli stati
+      - Data augmentation con rumore gaussiano strutturato sugli stati
       - Salvataggio del modello basato sulla migliore validation loss
     """
 
@@ -261,30 +240,39 @@ class BehaviorCloningTrainer:
 
         print(f"  Dataset split: {train_size} train / {val_size} val")
 
-    def _weighted_mse(self, predictions, targets_norm):
-        """MSE pesata per bilanciare sterzo, freni e cambi marcia.
-
-        Pesi:
-          - Steer: 1x base, 3x in curva (|steer| > 0.1)
-          - Accel: 1x
-          - Brake: 5x (le frenate sono rare ma critiche per la sicurezza)
-          - Gear:  3x
-        """
-        sq_error = (predictions - targets_norm) ** 2
-
-        # Pesi per canale: [steer, accel, brake, gear]
-        channel_weights = torch.tensor([1.0, 1.0, 5.0, 3.0],
-                                       device=predictions.device)
-
+    def _combined_loss(self, pred_continuous, pred_gear_logits, target_actions):
+        # target_actions ha dimensione: [batch_size, 4]
+        # [0] steer, [1] accel, [2] brake, [3] gear (float)
+        
+        # 1. Loss Continua (Weighted MSE)
+        targets_cont = target_actions[:, 0:3]
+        sq_error = (pred_continuous - targets_cont) ** 2
+        
+        # Pesi per canale continuo: [steer, accel, brake]
+        channel_weights = torch.tensor([1.0, 1.0, 5.0], device=pred_continuous.device)
+        
+        # Boost freno dinamico: se l'umano frena (target > 0.05), aumentiamo il peso del freno di 25x!
+        brake_target = targets_cont[:, 2]
+        brake_boost = 1.0 + 24.0 * (brake_target > 0.05).float()
+        
         # Boost sterzo in curva (3x)
-        steer_target = targets_norm[:, 0].abs()
+        steer_target = targets_cont[:, 0].abs()
         is_curve = (steer_target > self.STEER_CURVE_THRESHOLD).float()
         steer_boost = 1.0 + 2.0 * is_curve  # 1x rettilineo, 3x curva
-
+        
         weighted_sq = sq_error * channel_weights.unsqueeze(0)
         weighted_sq[:, 0] = weighted_sq[:, 0] * steer_boost
-
-        return weighted_sq.mean()
+        weighted_sq[:, 2] = weighted_sq[:, 2] * brake_boost
+        loss_cont = weighted_sq.mean()
+        
+        # 2. Loss Discreta (CrossEntropy per il Gear)
+        # Il target della marcia deve essere di tipo Long per CrossEntropy
+        targets_gear = target_actions[:, 3].long()
+        loss_gear = nn.functional.cross_entropy(pred_gear_logits, targets_gear)
+        
+        # Combinazione bilanciata: la CrossEntropy ha un peso di 2.0 per allinearsi alla scala del MSE
+        total_loss = loss_cont + 2.0 * loss_gear
+        return total_loss
 
     def train_epoch(self) -> float:
         self.model.train()
@@ -294,26 +282,19 @@ class BehaviorCloningTrainer:
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
-            # ── Data Augmentation: Structured Noise ──
-            # Il covariate shift nel BC causa stati diversi a runtime.
-            # Applichiamo rumore STRUTTURATO: forte su trackPos e velocità
-            # (le feature che divergono per prime), leggero sui LIDAR (le
-            # feature che indicano la geometria della curva e non devono
-            # essere corrotte). Così il modello impara a reagire alla
-            # FORMA della curva (LIDAR) anziché alla posizione esatta.
-            noise = torch.randn_like(states) * 0.01       # base leggera
-            noise[:, 20] = torch.randn(states.size(0), device=states.device) * 0.15   # trackPos: forte
-            noise[:, 21] = torch.randn(states.size(0), device=states.device) * 0.3    # speedX: forte
-            noise[:, 22] = torch.randn(states.size(0), device=states.device) * 0.05   # speedY: moderato
-            noise[:, 23] = torch.randn(states.size(0), device=states.device) * 0.05   # speedZ: moderato
+            # ── Data Augmentation: Structured Noise (Balanced Recovery) ──
+            # 0.05 su trackPos è il valore perfetto: forte abbastanza per insegnare il recupero 
+            # ma coerente con i LIDAR geometrici per non causare allucinazioni sterzanti.
+            noise = torch.randn_like(states) * 0.002
+            noise[:, 20] = torch.randn(states.size(0), device=states.device) * 0.05   # trackPos: robustezza recupero
+            noise[:, 21] = torch.randn(states.size(0), device=states.device) * 0.01   # speedX: precisione frenata/cambio
+            noise[:, 22] = torch.randn(states.size(0), device=states.device) * 0.005  # speedY: moderato
+            noise[:, 23] = torch.randn(states.size(0), device=states.device) * 0.005  # speedZ: moderato
             states = states + noise
 
-            # Normalizza i target nel range [-1, 1] per il Tanh
-            targets_norm = normalize_actions(targets)
-
             self.optimizer.zero_grad()
-            predictions = self.model(states)
-            loss = self._weighted_mse(predictions, targets_norm)
+            pred_cont, pred_gear = self.model(states)
+            loss = self._combined_loss(pred_cont, pred_gear, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
@@ -331,9 +312,8 @@ class BehaviorCloningTrainer:
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
-            targets_norm = normalize_actions(targets)
-            predictions = self.model(states)
-            loss = self._weighted_mse(predictions, targets_norm)
+            pred_cont, pred_gear = self.model(states)
+            loss = self._combined_loss(pred_cont, pred_gear, targets)
             total_loss += loss.item()
 
         return total_loss / len(self.val_loader)
@@ -386,7 +366,7 @@ class BehaviorCloningTrainer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Behavioral Cloning per agente TORCS (Giro Secco)"
+        description="Behavioral Cloning per agente TORCS (Giro Secco) - Multi-Head"
     )
     parser.add_argument(
         "--dataset", type=str, default="train_set/laps",
@@ -404,7 +384,7 @@ def main():
     # ── Device ──
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n{'=' * 64}")
-    print(f"  🧠 BEHAVIORAL CLONING — TORCS Giro Secco")
+    print(f"  🧠 BEHAVIORAL CLONING — TORCS Giro Secco (Multi-Head)")
     print(f"  Device: {device}")
     if device == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
@@ -416,17 +396,15 @@ def main():
     dataset, total_samples = load_dataset(args.dataset)
 
     # ── Rileva dimensioni ──
-    # Accedi al primo campione per ottenere le dimensioni
     sample_state, sample_action = dataset[0]
     state_dim = sample_state.shape[0]
-    action_dim = sample_action.shape[0]
-    print(f"  Dimensioni: state={state_dim}, action={action_dim}")
+    print(f"  Dimensioni: state={state_dim}, action_dim=4 (steer, accel, brake, gear)")
 
     # ── Assicurati che la directory di output esista ──
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
     # ── Modello ──
-    model = PolicyNetwork(state_dim=state_dim, action_dim=action_dim)
+    model = PolicyNetwork(state_dim=state_dim)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Parametri totali: {total_params:,}")
 
@@ -441,9 +419,8 @@ def main():
 
     trainer.train(max_epochs=args.epochs, checkpoint_path=args.output, patience=30)
 
-    print("\n  ✅ Addestramento Behavioral Cloning completato.")
+    print("\n  ✅ Addestramento Behavioral Cloning Multi-Head completato.")
     print(f"  Pesi salvati in: {args.output}\n")
-
 
 if __name__ == "__main__":
     main()

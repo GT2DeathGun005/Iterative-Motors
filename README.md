@@ -115,17 +115,19 @@ python behavioral_cloning.py \
 ```
 
 Il training utilizza:
-- **Validation Split 80/20** con **Early Stopping** (patience 30 epoche) per evitare overfitting
-- **Cosine Annealing LR** da `3e-4` fino a `1e-6` per una convergenza stabile
-- **Weighted MSE Loss** bilanciata: sterzo in curva 3×, freno 2×, cambio marcia 3×
-- **Data Augmentation** con rumore gaussiano (σ=0.01) sugli stati per robustezza
-- **Gradient Clipping** (max_norm=1.0) per stabilità dei gradienti
+- **Validation Split 80/20** con **Early Stopping** (patience 30 epoche) per evitare overfitting.
+- **Cosine Annealing LR** da `3e-4` fino a `1e-6` per una convergenza stabile.
+- **Loss Combinata Multi-Head**: $\mathcal{L} = \mathcal{L}_{\text{MSE continua}} + 2 \times \mathcal{L}_{\text{CrossEntropy gear}}$.
+- **Dynamic Brake Boost (25x)**: l'errore sul canale del freno è pesato 25× nei campioni con frenata attiva dell'umano (`brake_target > 0.05`) per forzare staccate vigorose a runtime ed eliminare lo sbilanciamento del dataset (dove il freno è spento per il 95% del tempo).
+- **Steer Boost (3x)**: errore del canale di sterzata pesato 3× nelle curve strette.
+- **Data Augmentation con Rumore Strutturato Coerente**: rumore su `trackPos` calibrato a `0.05` per forzare la robustezza al *covariate shift* spaziale (politica di recupero aderenza), e rumore su `speedX` confinato a `0.01` per preservare il tempismo delle marce e delle staccate.
+- **Gradient Clipping** (max_norm=1.0) per la stabilità dei gradienti.
 
 **Output:** `train_set/checkpoints/bc_policy.pth`
 
 ### 3. Test Deterministico (Inference)
 
-Avvia TORCS e lancia l'agente autonomo. Il modello guida in modalità interamente deterministica.
+Avvia TORCS e lancia l'agente autonomo. Il modello guida in modalità interamente deterministica ed end-to-end (senza alcuna limitazione o guardrail euristico a runtime).
 
 ```bash
 python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 3
@@ -147,16 +149,22 @@ python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 3
 
 ## 🔧 Dettagli Tecnici
 
-### Deep Policy Network
+### PolicyNetwork Multi-Head
+
+La rete Actor non è più a regressione continua singola (che portava a predizioni decimali confuse per la marcia come `2.5`, ritardando le scalate e le staccate). Adotta ora un'architettura **Multi-Head**:
+- **Backbone Comune**: 4 layer densi (512 unità ciascuno) con `LayerNorm` e attivazione `ReLU`. Estrae feature spaziali e cinematiche condivise dallo stato 30D.
+- **Testa Continua**: output a 3 dimensioni per il controllo dello sterzo e dei pedali:
+  - `steer`: attivato via **Tanh** in $[-1, 1]$ per sterzate simmetriche.
+  - `accel` e `brake`: attivati via **Sigmoid** in $[0, 1]$ per mappare naturalmente i pedali.
+- **Testa Discreta**: output a 7 logit discreti per il cambio marcia (`gear` in $\{0, 1, 2, 3, 4, 5, 6\}$), addestrata tramite `CrossEntropyLoss`.
 
 | Parametro | Valore |
 |-----------|--------|
 | Input | 30 neuroni (vettore di osservazione) |
-| Hidden Layers | 4 × 512 neuroni |
-| Normalizzazione | LayerNorm dopo ogni layer nascosto |
-| Attivazione | ReLU (hidden), **Tanh** (output) |
-| Output | 4 neuroni: `[steering, accel, brake, gear]` in range `[-1, 1]` |
-| Parametri totali | ~810,000 |
+| Hidden Layers (Backbone) | 4 × 512 neuroni con LayerNorm + ReLU |
+| Continuous Head | 3 neuroni (steer [Tanh], accel [Sigmoid], brake [Sigmoid]) |
+| Gear Head (Discreta) | 7 neuroni (logits marcia per CrossEntropy) |
+| Parametri totali | ~813,000 |
 
 ### Vettore di Osservazione (30D)
 
@@ -182,14 +190,14 @@ Lo stato è un vettore 1D di 30 valori, costruito da `flatten_state()`:
 
 ### Mapping delle Azioni
 
-Le azioni della rete sono in range Tanh `[-1, 1]` e vengono de-normalizzate per TORCS:
+Gli output della PolicyNetwork Multi-Head vengono convertiti in azioni TORCS in modo simmetrico all'addestramento:
 
-| Azione | Range rete | → Range TORCS | Formula |
-|--------|-----------|---------------|---------|
-| Steering | [-1, 1] | [-1, 1] | diretto |
-| Accelerator | [-1, 1] | [0, 1] | `(x + 1) / 2` |
-| Brake | [-1, 1] | [0, 1] | `(x + 1) / 2` |
-| Gear | [-1, 1] | {0, 1, ..., 6} | `round((x + 1) × 3)` clamp [0, 6] |
+| Azione | Provenienza Rete | Range Rete | → Range TORCS | Decodifica |
+|--------|------------------|------------|---------------|------------|
+| Steering | Testa Continua (Tanh) | [-1, 1] | [-1, 1] | Diretto |
+| Accelerator | Testa Continua (Sigmoid) | [0, 1] | [0, 1] | Diretto |
+| Brake | Testa Continua (Sigmoid) | [0, 1] | [0, 1] | Diretto |
+| Gear | Testa Discreta (Argmax Logits) | 7 classi | {0, 1, ..., 6} | Indice del logit massimo |
 
 ---
 
