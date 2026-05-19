@@ -29,31 +29,36 @@ from gym_torcs import TorcsEnv
 class PolicyNetwork(nn.Module):
     """Rete Actor per Behavioral Cloning: stato → azione continua.
 
-    Architettura deep feed-forward con LayerNorm e output Tanh [-1, 1].
+    Architettura deep feed-forward con LayerNorm, Dropout e output Tanh [-1, 1].
+    Il Dropout è attivo solo durante il training; a eval() è trasparente.
     Struttura: 30 -> 512 -> 512 -> 512 -> 512 -> 4
     """
 
     def __init__(self, state_dim: int = 30, action_dim: int = 4,
-                 hidden_size: int = 512):
+                 hidden_size: int = 512, dropout: float = 0.1):
         super(PolicyNetwork, self).__init__()
 
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            
+            nn.Dropout(dropout),
+
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            
+            nn.Dropout(dropout),
+
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            
+            nn.Dropout(dropout),
+
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            
+            nn.Dropout(dropout),
+
             nn.Linear(hidden_size, action_dim),
             nn.Tanh()
         )
@@ -67,7 +72,12 @@ class PolicyNetwork(nn.Module):
 # ──────────────────────────────────────────────────────────────────────
 
 def flatten_state(state_dict: dict) -> np.ndarray:
-    """Appiattisce osservazione TORCS → vettore 30D."""
+    """Appiattisce osservazione TORCS → vettore 30D.
+
+    NOTA: Le osservazioni provengono da gym_torcs.make_observaton() che già
+    normalizza track/200 e speed/default_speed(50). NON ri-dividere qui.
+    Deve essere identica a data_collection.flatten_state() per coerenza.
+    """
     def _s(key, default=0.0):
         v = state_dict.get(key, default)
         if isinstance(v, np.ndarray):
@@ -83,8 +93,11 @@ def flatten_state(state_dict: dict) -> np.ndarray:
     try:
         return np.concatenate([
             [_s('angle')],
-            _a('track', 19),
-            [_s('trackPos'), _s('speedX'), _s('speedY'), _s('speedZ')],
+            _a('track', 19),              # già /200 da make_observaton
+            [_s('trackPos')],
+            [_s('speedX')],               # già /50 da make_observaton
+            [_s('speedY')],               # già /50 da make_observaton
+            [_s('speedZ')],               # già /50 da make_observaton
             _a('wheelSpinVel', 4) / 100.0,
             [_s('rpm') / 10000.0],
             [_s('distFromStart') / 4000.0],
@@ -170,13 +183,13 @@ def main():
             print(f"  🏁 Tentativo #{total_attempts} (giri completati: {len(lap_times)}/{args.laps})")
 
             for step in range(1, args.max_steps + 1):
-                # ── Inferenza DETERMINISTICA ──
+                # ── Inferenza DETERMINISTICA (Pure BC, zero correzioni) ──
                 with torch.no_grad():
                     state_t = torch.FloatTensor(state).to(device).unsqueeze(0)
                     action_t = model(state_t)
                     action = action_t.cpu().numpy()[0]
 
-                # ── Step nell'ambiente ──
+                # ── Step nell'ambiente (azione pura dal modello) ──
                 env_action = denormalize_action(action)
                 next_obs, _, env_done, _ = env.step(env_action)
                 next_state = flatten_state(next_obs)
@@ -191,6 +204,11 @@ def main():
                 if np.cos(angle) < 0:
                     print(f"  ⚠️  Spin allo step {step} (angle={angle:.3f})")
                     break
+
+                # ── Telemetria ogni 200 step ──
+                if step % 200 == 0:
+                    spd = next_state[21] * 50.0
+                    print(f"    [Step {step:4d}] tp={track_pos:+.3f} | spd={spd:.0f}km/h | steer={env_action[0]:+.3f} | accel={env_action[1]:.2f} | brake={env_action[2]:.2f} | gear={int(env_action[3])}")
 
                 # ── Check completamento giro ──
                 current_last_lap = float(raw.get('lastLapTime', 0.0))
@@ -219,9 +237,12 @@ def main():
     print(f"\n{'=' * 64}")
     print(f"  📊 RIEPILOGO TEST")
     if lap_times:
+        print(f"  Giri completati: {len(lap_times)}/{args.laps}")
         print(f"  Best:  {min(lap_times):.3f}s | Media: {sum(lap_times)/len(lap_times):.3f}s")
+        for i, t in enumerate(lap_times):
+            print(f"  Giro {i+1}: {t:.3f}s")
     else:
-        print(f"  Nessun giro completato.")
+        print(f"  Nessun giro completato su {total_attempts} tentativi.")
     print(f"{'=' * 64}\n")
 
 

@@ -6,37 +6,6 @@ Questo repository implementa una pipeline end-to-end per addestrare un agente di
 
 ---
 
-## 🏛️ Architettura del Sistema
-
-La pipeline è stata semplificata per eliminare la complessità del Reinforcement Learning, affidandosi a un'architettura deep di **Behavioral Cloning** capace di catturare ogni sfumatura della guida esperta.
-
-```mermaid
-graph TD
-    subgraph "Fase 1 · Data Collection"
-    PS5[🎮 PS5 DualSense] -->|Pygame Polling| DC[data_collection.py]
-    T1[TORCS Corkscrew F1] -->|Sensori 30D + Lap Time| DC
-    DC -->|Solo giri validi| H5[(train_set/laps/lap_*.h5)]
-end
-
-    subgraph "Fase 2 · Behavioral Cloning Training"
-        H5 -->|Carica directory| BC[behavioral_cloning.py]
-        BC -->|Deep Policy Network| WEIGHTS[(train_set/checkpoints/bc_policy.pth)]
-    end
-
-    subgraph "Fase 3 · Deterministic Inference"
-        WEIGHTS -->|Inferenza Zero-Noise| TEST[test_agent.py]
-        TEST -->|Replica Giro Perfetto| T2[TORCS Corkscrew F1]
-    end
-```
-
-| Fase | Script | Descrizione |
-|------|--------|-------------|
-| 1. Data Collection | `data_collection.py` | Raccolta di giri ideali guidati da un umano (esperto). |
-| 2. BC Training | `behavioral_cloning.py` | Addestramento di una rete neurale profonda per imitare lo stato → azione dell'esperto. |
-| 3. Test & Eval | `test_agent.py` | Esecuzione deterministica del modello per validare la replicabilità del giro. |
-
----
-
 ## 🧠 Filosofia del Progetto: Pure Behavioral Cloning
 
 A differenza degli approcci ibridi, questo progetto punta sulla **massima fedeltà ai dati esperti**. Invece di esplorare traiettorie casuali tramite RL, l'agente utilizza una **Deep Policy Network** (4 layer nascosti, 30D → 512D) per mappare esattamente ogni sensore alla risposta corretta del pilota.
@@ -48,34 +17,30 @@ A differenza degli approcci ibridi, questo progetto punta sulla **massima fedelt
 
 ---
 
-## ⚙️ Istruzioni d'Uso (Step-by-Step)
+## 🏛️ Architettura del Sistema
 
-### 1. Raccolta Dati (Data Collection)
-Registra almeno **10-20 giri puliti** (senza uscire di pista). I giri vengono salvati automaticamente solo se completati correttamente.
+La pipeline si compone di tre fasi sequenziali:
 
-```bash
-# Esempio con controller PS5
-python data_collection.py --output_dir train_set --device controller
+```
+┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
+│  Fase 1              │     │  Fase 2              │     │  Fase 3              │
+│  DATA COLLECTION     │────▶│  BC TRAINING         │────▶│  TEST / INFERENCE    │
+│                      │     │                      │     │                      │
+│  🎮 PS5 / Tastiera   │     │  behavioral_cloning  │     │  test_agent.py       │
+│  data_collection.py  │     │  .py                 │     │  Zero-Noise          │
+│                      │     │                      │     │  Deterministico      │
+│  Output:             │     │  Output:             │     │                      │
+│  train_set/laps/     │     │  train_set/          │     │  Valutazione live    │
+│  lap_001.h5 ...      │     │  checkpoints/        │     │  su TORCS            │
+│                      │     │  bc_policy.pth       │     │                      │
+└──────────────────────┘     └──────────────────────┘     └──────────────────────┘
 ```
 
-### 2. Addestramento (Training)
-Lancia lo script `train_all.sh` per avviare l'addestramento della rete neurale sui dati esperti attualmente presenti nella cartella `laps/`.
-
-```bash
-./train_all.sh
-```
-
-Lo script applica internamente delle **Loss Pesate** per garantire la precisione:
-- **Steer Curve Weight (5x)**: Forza la precisione millimetrica in curva.
-- **Speed-Weighted Loss (10x)**: Garantisce partenze perfette e gestione ottimale delle marce basse.
-- **Early Stopping**: Ferma il training basandosi sulla validation loss per evitare l'overfitting.
-
-### 3. Test Deterministico (Inference)
-Valuta l'agente in modalità rigorosamente deterministica (zero rumore).
-
-```bash
-python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 3
-```
+| Fase | Script | Descrizione |
+|------|--------|-------------|
+| 1. Data Collection | `data_collection.py` | Raccolta di giri guidati da umano (esperto) con controller PS5 DualSense o tastiera WASD. Solo i giri completati senza uscite di pista vengono salvati. |
+| 2. BC Training | `behavioral_cloning.py` | Addestramento della PolicyNetwork sui dati esperti, con validation split 80/20 e early stopping. |
+| 3. Test & Eval | `test_agent.py` | Esecuzione deterministica del modello BC su TORCS per valutare la capacità di completare giri autonomi. |
 
 ---
 
@@ -83,26 +48,164 @@ python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 3
 
 ```
 AIcar/
-├── data_collection.py         # Fase 1: Raccolta dati umani
-├── behavioral_cloning.py      # Fase 2: Training della Deep Policy
-├── test_agent.py              # Fase 3: Inferenza deterministica
-├── train_all.sh               # 🚀 Script unico per il training
-├── stop_training.sh           # 🛑 Ferma i processi attivi
-├── monitor.sh                 # 📊 Monitoraggio status training
+├── data_collection.py         # Fase 1: Raccolta dati umani (PS5 / Tastiera)
+├── behavioral_cloning.py      # Fase 2: Training della Deep Policy Network
+├── test_agent.py              # Fase 3: Inferenza deterministica su TORCS
+├── train_all.sh               # 🚀 Script unico per lanciare il training BC
+├── stop_training.sh           # 🛑 Ferma i processi di training/TORCS
+├── monitor.sh                 # 📊 Monitoraggio status processi e checkpoint
 ├── README.md
 ├── gym_torcs/                 # Wrapper Python per TORCS
-└── train_set/                 # Dati e Checkpoint (HDF5, PTH)
+│   ├── gym_torcs.py           #   Ambiente OpenAI Gym per TORCS
+│   ├── snakeoil3_gym.py       #   Client UDP per comunicazione con TORCS
+│   └── autostart.sh           #   Automazione menu TORCS (via xte/xautomation)
+└── train_set/                 # Dati e Checkpoint
+    ├── laps/                  #   File HDF5 dei giri registrati (lap_001.h5 ...)
+    ├── checkpoints/           #   Pesi del modello (bc_policy.pth)
+    └── session_logs/          #   Log delle sessioni di data collection
 ```
 
 ---
 
-## 🔧 Dettagli Tecnici: Deep Policy Network
+## ⚙️ Istruzioni d'Uso
 
-La rete è stata potenziata per gestire la complessità del circuito Corkscrew:
-- **Input**: 30 sensori (Angolo, TrackPos, Speed, RPM, Distanza, 19 Track Lasers).
-- **Architettura**: 4 Layer lineari (256, 512, 512, 256) con **LayerNorm** e attivazioni **ReLU**.
-- **Output**: 4 azioni continue via **Tanh** (Steer, Accel, Brake, Gear).
-- **Optimizer**: Adam con Learning Rate adattivo e Weight Decay per la regolarizzazione.
+### Prerequisiti
+
+- Python 3.8+ con PyTorch, h5py, numpy, pygame
+- TORCS installato con circuito **Corkscrew** e vettura **F1**
+- `xautomation` (per `xte`, usato da `autostart.sh` per navigare i menu TORCS)
+- Controller PS5 DualSense (opzionale, altrimenti tastiera WASD)
+
+### 1. Raccolta Dati (Data Collection)
+
+Registra giri puliti guidando manualmente. Solo i giri completati senza uscire di pista (`|trackPos| < 1.25`) vengono salvati come file HDF5 separati.
+
+```bash
+# Con controller PS5 DualSense
+python data_collection.py --output_dir train_set --device controller
+
+# Con tastiera (WASD + frecce per le marce)
+python data_collection.py --output_dir train_set --device keyboard
+```
+
+**Opzioni utili:**
+- `--steering_deadzone 0.05` — Deadzone dello sterzo per il controller (default: 0.05)
+- `--tcs` / `--no-tcs` — Abilita/disabilita il Traction Control System (default: abilitato)
+- `--tcs_slip 5.0` — Soglia di slip per il TCS (default: 5.0)
+- `--relaunch_every 10` — Rilancia TORCS ogni N giri per prevenire memory leak
+
+**Output:** un file `train_set/laps/lap_NNN.h5` per ogni giro valido, contenente:
+- `states`: matrice `(N_steps, 30)` — vettore di osservazione 30D normalizzato
+- `actions`: matrice `(N_steps, 4)` — `[steering, accel, brake, gear]`
+- Attributi: `lap_time`, `num_steps`, `timestamp`
+
+### 2. Addestramento BC (Training)
+
+```bash
+# Metodo rapido (usa gli hyperparameter di default)
+./train_all.sh
+
+# Oppure direttamente con parametri personalizzati
+python behavioral_cloning.py \
+    --dataset train_set/laps \
+    --epochs 300 \
+    --batch_size 256 \
+    --lr 3e-4 \
+    --output train_set/checkpoints/bc_policy.pth
+```
+
+Il training utilizza:
+- **Validation Split 80/20** con **Early Stopping** (patience 30 epoche) per evitare overfitting
+- **Cosine Annealing LR** da `3e-4` fino a `1e-6` per una convergenza stabile
+- **Weighted MSE Loss** bilanciata: sterzo in curva 3×, freno 2×, cambio marcia 3×
+- **Data Augmentation** con rumore gaussiano (σ=0.01) sugli stati per robustezza
+- **Gradient Clipping** (max_norm=1.0) per stabilità dei gradienti
+
+**Output:** `train_set/checkpoints/bc_policy.pth`
+
+### 3. Test Deterministico (Inference)
+
+Avvia TORCS e lancia l'agente autonomo. Il modello guida in modalità interamente deterministica.
+
+```bash
+python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 3
+```
+
+**Opzioni:**
+- `--laps N` — Numero di giri da completare (default: 3)
+- `--max_steps N` — Timeout per giro in step (default: 15000)
+
+### Script di Supporto
+
+```bash
+./monitor.sh            # Mostra stato dei processi e checkpoint
+./stop_training.sh      # Ferma training e TORCS (SIGTERM)
+./stop_training.sh --force  # Kill forzato (SIGKILL)
+```
+
+---
+
+## 🔧 Dettagli Tecnici
+
+### Deep Policy Network
+
+| Parametro | Valore |
+|-----------|--------|
+| Input | 30 neuroni (vettore di osservazione) |
+| Hidden Layers | 4 × 512 neuroni |
+| Normalizzazione | LayerNorm dopo ogni layer nascosto |
+| Attivazione | ReLU (hidden), **Tanh** (output) |
+| Output | 4 neuroni: `[steering, accel, brake, gear]` in range `[-1, 1]` |
+| Parametri totali | ~810,000 |
+
+### Vettore di Osservazione (30D)
+
+Lo stato è un vettore 1D di 30 valori, costruito da `flatten_state()`:
+
+| Indice | Feature | Normalizzazione | Range tipico |
+|--------|---------|-----------------|--------------|
+| 0 | `angle` | nessuna (radianti) | [-0.6, 0.4] |
+| 1–19 | `track[19]` (sensori LIDAR) | /200 (via `gym_torcs`) | [0, 1] |
+| 20 | `trackPos` | nessuna | [-1, 1] |
+| 21 | `speedX` | /50 (via `gym_torcs`) | [0, ~5.7] |
+| 22 | `speedY` | /50 (via `gym_torcs`) | [-0.6, 0.8] |
+| 23 | `speedZ` | /50 (via `gym_torcs`) | [-0.4, 0.7] |
+| 24–27 | `wheelSpinVel[4]` | /100 | [0, ~2.6] |
+| 28 | `rpm` | /10000 | [0.5, 2.0] |
+| 29 | `distFromStart` | /4000 | [0, ~0.9] |
+
+> ⚠️ **IMPORTANTE:** La normalizzazione dei sensori avviene in due punti della pipeline e NON deve essere duplicata:
+> - `gym_torcs.make_observaton()` normalizza `track/200` e `speed/default_speed(50)`
+> - `data_collection.flatten_state()` normalizza `wheelSpinVel/100`, `rpm/10000`, `distFromStart/4000`
+>
+> `TorcsHDF5Dataset` e `test_agent.flatten_state()` NON devono ri-normalizzare track e speed.
+
+### Mapping delle Azioni
+
+Le azioni della rete sono in range Tanh `[-1, 1]` e vengono de-normalizzate per TORCS:
+
+| Azione | Range rete | → Range TORCS | Formula |
+|--------|-----------|---------------|---------|
+| Steering | [-1, 1] | [-1, 1] | diretto |
+| Accelerator | [-1, 1] | [0, 1] | `(x + 1) / 2` |
+| Brake | [-1, 1] | [0, 1] | `(x + 1) / 2` |
+| Gear | [-1, 1] | {0, 1, ..., 6} | `round((x + 1) × 3)` clamp [0, 6] |
+
+---
+
+## 🐛 Bug Risolti (Workflow Tracking)
+
+### [2026-05-19] Doppia Normalizzazione Features — CRITICO
+
+**Problema:** `TorcsHDF5Dataset` ri-divideva `track/200` e `speed/100`, ma i dati in HDF5 erano già normalizzati da `gym_torcs.make_observaton()` durante la data collection.
+
+**Impatto:** I 19 sensori LIDAR venivano compressi da range [0, 1] a [0, 0.005], rendendo l'agente cieco. La velocità passava da [0, 5.75] a [0, 0.057]. Il threshold `speed_x < 0.05` nella loss pesata era sempre vero (85.6% dei campioni), applicando un boost 5× indiscriminato.
+
+**Fix applicato:**
+- Rimossa la doppia normalizzazione da `TorcsHDF5Dataset` (`behavioral_cloning.py`)
+- Allineato `test_agent.py/flatten_state()` a `data_collection.py/flatten_state()` (nessuna ri-divisione di track e speed)
+- Sostituita la loss con `_weighted_mse` bilanciata: sterzo curva 3×, freno 2×, cambio 3× (era: sterzo 15×, cambio 10×, con low-speed boost 5× buggy)
+- Aggiunta validation split 80/20 + early stopping + cosine LR + gradient clipping
 
 ---
 

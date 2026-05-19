@@ -8,7 +8,16 @@ Features:
   - Normalizzazione corretta delle azioni per Tanh output [-1, 1]
   - Sanity check preventivi (NaN, Inf, gruppi mancanti)
   - Device CPU/CUDA coerente in tutta la pipeline
-  - Early stopping con validation split
+  - Validation split (80/20) con Early Stopping per evitare overfitting
+  - Cosine LR scheduler per convergenza dolce
+
+NOTA: I dati HDF5 sono GIÀ normalizzati dal data_collection.flatten_state():
+  - track[19]: /200 (via gym_torcs.make_observaton)
+  - speedX/Y/Z: /50 (via gym_torcs.make_observaton, default_speed=50)
+  - wheelSpinVel[4]: /100 (via data_collection.flatten_state)
+  - rpm: /10000 (via data_collection.flatten_state)
+  - distFromStart: /4000 (via data_collection.flatten_state)
+  NON ri-normalizzare in TorcsHDF5Dataset!
 
 Mapping delle azioni:
   [0] steering  [-1, 1]  → diretto (già in range Tanh)
@@ -32,6 +41,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, random_split
+import math
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -64,6 +74,12 @@ class TorcsHDF5Dataset(Dataset):
             states_np = h5f['states'][:]
             actions_np = h5f['actions'][:]
 
+            # ── NOTA: NESSUNA ri-normalizzazione ──
+            # I dati in HDF5 sono GIA' normalizzati da data_collection.flatten_state():
+            #   track[1:20] → /200 (via gym_torcs.make_observaton)
+            #   speedX/Y/Z[21:24] → /50 (via gym_torcs.make_observaton)
+            #   wheelSpinVel[24:28] → /100, rpm[28] → /10000, dist[29] → /4000
+
             # ── Sanity check numerici ──
             if np.any(np.isnan(states_np)):
                 raise ValueError(f"NaN rilevati in 'states' di {file_path}")
@@ -74,7 +90,7 @@ class TorcsHDF5Dataset(Dataset):
             if np.any(np.isinf(actions_np)):
                 raise ValueError(f"Inf rilevati in 'actions' di {file_path}")
 
-            # ── Clamp gear a [0, 6] (ignora retromarcia -1) ──
+            # ── Clamp gear a [0, 6] (esclude retromarcia -1) ──
             actions_np[:, 3] = np.clip(actions_np[:, 3], 0.0, 6.0)
 
             self.states = torch.tensor(states_np, dtype=torch.float32)
@@ -90,12 +106,7 @@ class TorcsHDF5Dataset(Dataset):
 
 
 def load_dataset(path: str) -> Dataset:
-    """Carica un dataset da un file .h5 o da una directory.
-    
-    Se `path` è una directory, analizza tutti i file lap_*.h5 (ignorando le curve)
-    e seleziona SOLO quello con il minor numero di campioni (il giro più veloce).
-    Questo garantisce l'apprendimento del "golden lap" deterministico.
-    """
+    """Carica e aggrega l'intero manifold di giri per migliorare la robustezza."""
     if os.path.isdir(path):
         h5_files = sorted(glob.glob(os.path.join(path, "**/lap_*.h5"), recursive=True))
         
@@ -137,30 +148,36 @@ def load_dataset(path: str) -> Dataset:
 class PolicyNetwork(nn.Module):
     """Rete Actor per Behavioral Cloning: stato → azione continua.
 
-    Architettura deep feed-forward con LayerNorm e output Tanh [-1, 1].
+    Architettura deep feed-forward con LayerNorm, Dropout e output Tanh [-1, 1].
+    Il Dropout (p=0.1) regolarizza la rete e la rende più robusta al covariate
+    shift tipico del Behavioral Cloning, forzando rappresentazioni ridondanti.
     Struttura: 30 -> 512 -> 512 -> 512 -> 512 -> 4
     """
 
     def __init__(self, state_dim: int = 30, action_dim: int = 4,
-                 hidden_size: int = 512):
+                 hidden_size: int = 512, dropout: float = 0.1):
         super(PolicyNetwork, self).__init__()
 
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
+            nn.Dropout(dropout),
             
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
+            nn.Dropout(dropout),
             
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
+            nn.Dropout(dropout),
             
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
+            nn.Dropout(dropout),
             
             nn.Linear(hidden_size, action_dim),
             nn.Tanh()
@@ -199,18 +216,18 @@ def normalize_actions(actions: torch.Tensor) -> torch.Tensor:
 # ──────────────────────────────────────────────────────────────────────
 
 class BehaviorCloningTrainer:
-    """Addestra la PolicyNetwork con Steering-Weighted MSE loss.
+    """Addestra la PolicyNetwork con Weighted MSE loss.
 
     Features:
-      - Loss pesata: lo sterzo in curva (|steer| > 0.1) pesa 5x di più
-        per contrastare lo sbilanciamento dei dati (64.5% rettilinei)
-      - Training deterministico: nessun validation split per overfittare 
-        perfettamente il "golden lap" senza data leakage sequenziale.
-      - Salvataggio del modello basato sulla migliore train loss.
+      - Loss pesata bilanciata: sterzo in curva (3x), freno (2x), cambio (3x)
+      - Validation split 80/20 con Early Stopping (patience=30)
+      - Cosine Annealing LR scheduler
+      - Data augmentation con rumore gaussiano sugli stati
+      - Salvataggio del modello basato sulla migliore validation loss
     """
 
     # Limiti di soglia
-    STEER_CURVE_THRESHOLD = 0.05
+    STEER_CURVE_THRESHOLD = 0.10  # soglia sterzo per curva (nel range [-1,1])
 
     def __init__(self, model: nn.Module, dataset: Dataset,
                  batch_size: int = 128, lr: float = 3e-4, device: str = "cpu"):
@@ -222,36 +239,50 @@ class BehaviorCloningTrainer:
             self.model.parameters(), lr=lr, weight_decay=1e-5
         )
 
-        # ── Nessun validation split, training al 100% sul golden lap ──
-        self.train_dataset = dataset
+        # ── Validation split 80/20 per Early Stopping ──
+        total = len(dataset)
+        val_size = max(1, int(total * 0.2))
+        train_size = total - val_size
+        self.train_dataset, self.val_dataset = random_split(
+            dataset, [train_size, val_size],
+            generator=torch.Generator().manual_seed(42)
+        )
 
         self.train_loader = DataLoader(
             self.train_dataset, batch_size=batch_size,
             shuffle=True, num_workers=2, pin_memory=(device != "cpu")
         )
+        self.val_loader = DataLoader(
+            self.val_dataset, batch_size=batch_size,
+            shuffle=False, num_workers=2, pin_memory=(device != "cpu")
+        )
 
-        self.best_train_loss = float('inf')
+        self.best_val_loss = float('inf')
 
-        print(f"  Dataset size: {len(self.train_dataset)} campioni (100% training)")
+        print(f"  Dataset split: {train_size} train / {val_size} val")
 
-    def _weighted_mse(self, predictions, targets_norm, states):
-        """MSE focalizzata su Partenza e Cambio (meccaniche deterministiche)."""
+    def _weighted_mse(self, predictions, targets_norm):
+        """MSE pesata per bilanciare sterzo, freni e cambi marcia.
+
+        Pesi:
+          - Steer: 1x base, 3x in curva (|steer| > 0.1)
+          - Accel: 1x
+          - Brake: 5x (le frenate sono rare ma critiche per la sicurezza)
+          - Gear:  3x
+        """
         sq_error = (predictions - targets_norm) ** 2
 
-        # Iniziamo con pesi neutri (1.0) per tutto
-        weighted_sq = sq_error.clone()
+        # Pesi per canale: [steer, accel, brake, gear]
+        channel_weights = torch.tensor([1.0, 1.0, 5.0, 3.0],
+                                       device=predictions.device)
 
-        # Peso massiccio per il cambio (indice 3) come richiesto
-        weighted_sq[:, 3] = sq_error[:, 3] * 10.0
+        # Boost sterzo in curva (3x)
+        steer_target = targets_norm[:, 0].abs()
+        is_curve = (steer_target > self.STEER_CURVE_THRESHOLD).float()
+        steer_boost = 1.0 + 2.0 * is_curve  # 1x rettilineo, 3x curva
 
-        # Peso extra per bassa velocità (Partenza da fermo)
-        # speedX è all'indice 21 dello stato
-        speed_x = states[:, 21].abs()
-        is_low_speed = (speed_x < 0.8).float()
-        speed_weight = 1.0 + 9.0 * is_low_speed
-
-        # Applichiamo il peso della velocità a tutte le azioni del campione
-        weighted_sq = weighted_sq * speed_weight.unsqueeze(1)
+        weighted_sq = sq_error * channel_weights.unsqueeze(0)
+        weighted_sq[:, 0] = weighted_sq[:, 0] * steer_boost
 
         return weighted_sq.mean()
 
@@ -263,46 +294,90 @@ class BehaviorCloningTrainer:
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
-            # ── Data Augmentation: State Noise ──
-            # Aggiungiamo un leggero rumore bianco allo stato per forzare la robustezza.
-            # Questo aiuta l'agente a recuperare se si scosta leggermente dalla traiettoria ideale.
-            if self.model.training:
-                noise = torch.randn_like(states) * 0.005 # 0.5% di rumore
-                states = states + noise
+            # ── Data Augmentation: Structured Noise ──
+            # Il covariate shift nel BC causa stati diversi a runtime.
+            # Applichiamo rumore STRUTTURATO: forte su trackPos e velocità
+            # (le feature che divergono per prime), leggero sui LIDAR (le
+            # feature che indicano la geometria della curva e non devono
+            # essere corrotte). Così il modello impara a reagire alla
+            # FORMA della curva (LIDAR) anziché alla posizione esatta.
+            noise = torch.randn_like(states) * 0.01       # base leggera
+            noise[:, 20] = torch.randn(states.size(0), device=states.device) * 0.15   # trackPos: forte
+            noise[:, 21] = torch.randn(states.size(0), device=states.device) * 0.3    # speedX: forte
+            noise[:, 22] = torch.randn(states.size(0), device=states.device) * 0.05   # speedY: moderato
+            noise[:, 23] = torch.randn(states.size(0), device=states.device) * 0.05   # speedZ: moderato
+            states = states + noise
 
             # Normalizza i target nel range [-1, 1] per il Tanh
             targets_norm = normalize_actions(targets)
 
             self.optimizer.zero_grad()
             predictions = self.model(states)
-            loss = self._weighted_mse(predictions, targets_norm, states)
+            loss = self._weighted_mse(predictions, targets_norm)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
 
             total_loss += loss.item()
 
         return total_loss / len(self.train_loader)
 
-    def train(self, max_epochs: int = 200, 
-              checkpoint_path: str = "train_set/checkpoints/bc_policy.pth"):
+    @torch.no_grad()
+    def validate(self) -> float:
+        self.model.eval()
+        total_loss = 0.0
+
+        for states, targets in self.val_loader:
+            states = states.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
+
+            targets_norm = normalize_actions(targets)
+            predictions = self.model(states)
+            loss = self._weighted_mse(predictions, targets_norm)
+            total_loss += loss.item()
+
+        return total_loss / len(self.val_loader)
+
+    def train(self, max_epochs: int = 200,
+              checkpoint_path: str = "train_set/checkpoints/bc_policy.pth",
+              patience: int = 30):
         print(f"\n  Inizio training Behavioral Cloning su {self.device}...")
-        print(f"  Max epochs: {max_epochs} (No validation split - Overfitting Golden Lap)\n")
+        print(f"  Max epochs: {max_epochs} | Early Stopping patience: {patience}\n")
+
+        # Cosine Annealing LR
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=max_epochs, eta_min=1e-6
+        )
+
+        patience_counter = 0
 
         for epoch in range(max_epochs):
             train_loss = self.train_epoch()
+            val_loss = self.validate()
+            lr = self.optimizer.param_groups[0]['lr']
+            scheduler.step()
 
             improved = ""
-            if train_loss < self.best_train_loss:
-                self.best_train_loss = train_loss
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
                 torch.save(self.model.state_dict(), checkpoint_path)
                 improved = " ★ saved"
+                patience_counter = 0
+            else:
+                patience_counter += 1
 
             print(
                 f"  Epoch {epoch+1:03d}/{max_epochs} | "
-                f"Train MSE: {train_loss:.6f}{improved}"
+                f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
+                f"LR: {lr:.2e}{improved}"
             )
 
-        print(f"\n  Training completato. Miglior checkpoint: {checkpoint_path}")
+            if patience_counter >= patience:
+                print(f"\n  ⏹ Early Stopping: nessun miglioramento per {patience} epoche.")
+                break
+
+        print(f"\n  Training completato. Best val loss: {self.best_val_loss:.6f}")
+        print(f"  Miglior checkpoint: {checkpoint_path}")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -317,7 +392,7 @@ def main():
         "--dataset", type=str, default="train_set/laps",
         help="Path al dataset HDF5 (file singolo o directory di lap_*.h5)"
     )
-    parser.add_argument("--epochs", type=int, default=200, help="Max epoche")
+    parser.add_argument("--epochs", type=int, default=300, help="Max epoche")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument(
@@ -364,7 +439,7 @@ def main():
         device=device
     )
 
-    trainer.train(max_epochs=args.epochs, checkpoint_path=args.output)
+    trainer.train(max_epochs=args.epochs, checkpoint_path=args.output, patience=30)
 
     print("\n  ✅ Addestramento Behavioral Cloning completato.")
     print(f"  Pesi salvati in: {args.output}\n")
