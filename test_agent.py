@@ -129,6 +129,31 @@ def denormalize_action(cont_action: np.ndarray, gear: int) -> np.ndarray:
     return env_action
 
 
+def apply_tcs(action: np.ndarray, obs: dict, slip_threshold: float = 5.0) -> np.ndarray:
+    wsv = obs.get('wheelSpinVel', None)
+    if wsv is None:
+        return action
+
+    wsv = np.array(wsv, dtype=np.float64).flatten()
+    if wsv.shape[0] < 4:
+        return action
+
+    # Slip = (rear avg) - (front avg)
+    rear_avg = (wsv[2] + wsv[3]) / 2.0
+    front_avg = (wsv[0] + wsv[1]) / 2.0
+    slip = rear_avg - front_avg
+
+    if slip > slip_threshold:
+        reduction = max(0.2, 1.0 - (slip - slip_threshold) / 30.0)
+        action = action.copy()
+        action[1] *= reduction  # Scala l'acceleratore
+
+    return action
+
+
+
+
+
 # ──────────────────────────────────────────────────────────────────────
 #  Main
 # ──────────────────────────────────────────────────────────────────────
@@ -196,17 +221,21 @@ def main():
             print(f"  🏁 Tentativo #{total_attempts} (giri completati: {len(lap_times)}/{args.laps})")
 
             for step in range(1, args.max_steps + 1):
-                # ── Inferenza DETERMINISTICA (Pure BC, zero correzioni) ──
+                # ── Inferenza DETERMINISTICA (Pure BC, sterzata/acceleratore/freno + marcia dal modello) ──
                 with torch.no_grad():
                     state_t = torch.FloatTensor(state).to(device).unsqueeze(0)
-                    pred_cont, pred_gear_logits = model(state_t)
-                    
+                    pred_cont, gear_logits = model(state_t)
                     cont_action = pred_cont.cpu().numpy()[0]          # [steer, accel, brake]
-                    gear_logits = pred_gear_logits.cpu().numpy()[0]    # 7D
-                    gear = int(np.argmax(gear_logits))
+                    gear = int(gear_logits.argmax(dim=1).item())
+                    if gear < 1: gear = 1  # Safety: no retromarcia/folle
 
-                # ── Step nell'ambiente (azione pura dal modello) ──
+                # ── Mutual exclusion accel/brake (come l'esperto umano) ──
+                if cont_action[2] > 0.05:
+                    cont_action[1] = 0.0  # Se freno, niente gas
+
+                # ── Step nell'ambiente (azione pura dal modello + TCS di sicurezza) ──
                 env_action = denormalize_action(cont_action, gear)
+                env_action = apply_tcs(env_action, obs)
                 next_obs, _, env_done, _ = env.step(env_action)
                 next_state = flatten_state(next_obs)
 
@@ -250,6 +279,7 @@ def main():
                     break
 
                 state = next_state
+                obs = next_obs
                 if env_done: break
 
             # Salva telemetria in CSV a fine tentativo

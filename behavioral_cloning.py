@@ -1,15 +1,14 @@
 """
 Behavioral Cloning (Imitation Learning) — TORCS Giro Secco
 
-Addestra una PolicyNetwork sulle dimostrazioni umane (HDF5) per il warm start del SAC.
+Addestra una PolicyNetwork Multi-Head sulle dimostrazioni umane (HDF5).
 
 Features:
   - Supporto multi-file: accetta sia un singolo .h5 sia una directory di lap_*.h5 (solo giri completi)
-  - Normalizzazione corretta delle azioni per Tanh output [-1, 1]
-  - Sanity check preventivi (NaN, Inf, gruppi mancanti)
   - Device CPU/CUDA coerente in tutta la pipeline
   - Validation split (80/20) con Early Stopping per evitare overfitting
   - Cosine LR scheduler per convergenza dolce
+  - Bojarski-style data augmentation per anti-covariate shift
 
 NOTA: I dati HDF5 sono GIÀ normalizzati dal data_collection.flatten_state():
   - track[19]: /200 (via gym_torcs.make_observaton)
@@ -19,17 +18,11 @@ NOTA: I dati HDF5 sono GIÀ normalizzati dal data_collection.flatten_state():
   - distFromStart: /4000 (via data_collection.flatten_state)
   NON ri-normalizzare in TorcsHDF5Dataset!
 
-Mapping delle azioni:
-  [0] steering  [-1, 1]  → diretto (già in range Tanh)
-  [1] accel     [0, 1]   → scalato a [-1, 1] con x*2-1
-  [2] brake     [0, 1]   → scalato a [-1, 1] con x*2-1
-  [3] gear      [0, 6]   → scalato a [-1, 1] con (x/3)-1
-
-Inversione (per inferenza):
-  steering = output[0]
-  accel    = (output[1] + 1) / 2
-  brake    = (output[2] + 1) / 2
-  gear     = round((output[3] + 1) * 3)   → clamp [0, 6]
+Mapping delle azioni (diretto, senza ri-mappatura):
+  [0] steering  [-1, 1]  → Tanh output
+  [1] accel     [0, 1]   → Sigmoid output
+  [2] brake     [0, 1]   → Sigmoid output
+  [3] gear      {0..6}   → CrossEntropy (7 classi)
 """
 
 import os
@@ -282,15 +275,27 @@ class BehaviorCloningTrainer:
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
-            # ── Data Augmentation: Structured Noise (Robust Recovery) ──
-            # Rumore strutturato forte su trackPos e speedX per insegnare il recupero 
-            # e la staccata adattiva in condizioni sballate (covariate shift a runtime).
-            noise = torch.randn_like(states) * 0.01
-            noise[:, 20] = torch.randn(states.size(0), device=states.device) * 0.15   # trackPos: forte per riallineamento
-            noise[:, 21] = torch.randn(states.size(0), device=states.device) * 0.30   # speedX: forte per staccata adattiva
-            noise[:, 22] = torch.randn(states.size(0), device=states.device) * 0.05   # speedY: moderato
-            noise[:, 23] = torch.randn(states.size(0), device=states.device) * 0.05   # speedZ: moderato
-            states = states + noise
+            # ── Data Augmentation: Bojarski-Style Synthetic Recovery (NVIDIA Autopilot) ──
+            # Insegna al modello come recuperare quando si sposta lateralmente (covariate shift).
+            # Perturbiamo coerentemente trackPos, track sensors e correggiamo il target di sterzo.
+            # NON tocchiamo speedX/Y/Z per non corrompere i punti di frenata.
+            delta_pos = torch.randn(states.size(0), device=states.device) * 0.08
+            delta_pos = torch.clamp(delta_pos, -0.15, 0.15)
+            
+            # 1. Perturbazione trackPos (indice 20)
+            states[:, 20] = states[:, 20] + delta_pos
+            
+            # 2. Perturbazione coerente dei 19 sensori track (indici 1:20)
+            sin_angles = torch.tensor([
+                -0.70711, -0.32557, -0.20791, -0.12187, -0.06976, -0.04362, -0.02967, 
+                -0.01745, -0.00873, 0.0, 0.00873, 0.01745, 0.02967, 0.04362, 
+                0.06976, 0.12187, 0.20791, 0.32557, 0.70711
+            ], device=states.device)
+            states[:, 1:20] = states[:, 1:20] - (delta_pos.unsqueeze(1) / 200.0) * sin_angles
+            
+            # 3. Correzione proporzionale target steer (indice 0)
+            targets[:, 0] = targets[:, 0] - 0.20 * delta_pos
+            targets[:, 0] = torch.clamp(targets[:, 0], -1.0, 1.0)
 
             self.optimizer.zero_grad()
             pred_cont, pred_gear = self.model(states)

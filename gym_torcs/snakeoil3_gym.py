@@ -217,18 +217,41 @@ class Client():
     def get_servers_input(self):
         '''Server's input is stored in a ServerState object'''
         if not self.so: return
-        sockdata= str()
+        sockdata = str()
 
+        # Svuota il buffer del socket leggendo tutti i pacchetti pendenti (non-blocking)
+        # per garantire che leggiamo solo la telemetria più recente (risolve il control lag UDP).
+        self.so.setblocking(False)
+        last_packet = None
         while True:
             try:
-                # Receive server data
-                sockdata,addr= self.so.recvfrom(data_size)
-                sockdata = sockdata.decode('utf-8')
+                data, addr = self.so.recvfrom(data_size)
+                if data:
+                    last_packet = data
+            except (BlockingIOError, socket.error):
+                break
+        
+        self.so.setblocking(True)
+
+        if last_packet is not None:
+            sockdata = last_packet.decode('utf-8')
+        else:
+            # Se il buffer era vuoto, facciamo una lettura bloccante singola per il prossimo pacchetto
+            try:
+                data, addr = self.so.recvfrom(data_size)
+                sockdata = data.decode('utf-8')
             except socket.error as emsg:
                 print('.', end=' ')
-                #print "Waiting for data on %d.............." % self.port
+
+        while True:
             if '***identified***' in sockdata:
                 print("Client connected on %d.............." % self.port)
+                # Leggiamo il prossimo pacchetto (bloccante)
+                try:
+                    data, addr = self.so.recvfrom(data_size)
+                    sockdata = data.decode('utf-8')
+                except socket.error:
+                    pass
                 continue
             elif '***shutdown***' in sockdata:
                 print((("Server has stopped the race on %d. "+
@@ -243,6 +266,12 @@ class Client():
                 self.shutdown()
                 return
             elif not sockdata: # Empty?
+                # Riprova leggendo il prossimo pacchetto
+                try:
+                    data, addr = self.so.recvfrom(data_size)
+                    sockdata = data.decode('utf-8')
+                except socket.error:
+                    pass
                 continue       # Try again.
             else:
                 self.S.parse_server_str(sockdata)
