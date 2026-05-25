@@ -278,24 +278,48 @@ class BehaviorCloningTrainer:
             # ── Data Augmentation: Bojarski-Style Synthetic Recovery (NVIDIA Autopilot) ──
             # Insegna al modello come recuperare quando si sposta lateralmente (covariate shift).
             # Perturbiamo coerentemente trackPos, track sensors e correggiamo il target di sterzo.
-            # NON tocchiamo speedX/Y/Z per non corrompere i punti di frenata.
+            # Riduciamo leggermente anche il target di accel se fuori asse per insegnare a parzializzare.
+            
+            # Genera offset laterale in trackPos (più leggero: ±0.15)
             delta_pos = torch.randn(states.size(0), device=states.device) * 0.08
             delta_pos = torch.clamp(delta_pos, -0.15, 0.15)
+            
+            # Estrarre angle (indice 0) e sensori di pista grezzi
+            angle = states[:, 0]
+            L_0 = states[:, 1] * 200.0   # Sensore -45 gradi
+            L_18 = states[:, 19] * 200.0  # Sensore 45 gradi
+            
+            # Calcolo geometrico dinamico della semi-larghezza della pista
+            W_L = L_18 * torch.sin(angle + 0.785398) # 45 gradi = 0.785398 rad
+            W_R = L_0 * torch.sin(0.785398 - angle)
+            W_half = torch.clamp((W_L + W_R) / 2.0, 4.0, 10.0) # clamping tra 4m e 10m
+            
+            # Spostamento laterale fisico in metri (scalato del 50% per correzione più leggera)
+            dy = delta_pos * W_half * 0.5
             
             # 1. Perturbazione trackPos (indice 20)
             states[:, 20] = states[:, 20] + delta_pos
             
-            # 2. Perturbazione coerente dei 19 sensori track (indici 1:20)
-            sin_angles = torch.tensor([
-                -0.70711, -0.32557, -0.20791, -0.12187, -0.06976, -0.04362, -0.02967, 
-                -0.01745, -0.00873, 0.0, 0.00873, 0.01745, 0.02967, 0.04362, 
-                0.06976, 0.12187, 0.20791, 0.32557, 0.70711
-            ], device=states.device)
-            states[:, 1:20] = states[:, 1:20] - (delta_pos.unsqueeze(1) / 200.0) * sin_angles
+            # 2. Perturbazione geometricamente coerente dei 19 sensori track (indici 1:20)
+            alpha = torch.tensor([
+                -45.0, -19.0, -12.0, -7.0, -4.0, -2.5, -1.7, -1.0, -0.5, 0.0, 
+                0.5, 1.0, 1.7, 2.5, 4.0, 7.0, 12.0, 19.0, 45.0
+            ], device=states.device) * 3.14159265 / 180.0
             
-            # 3. Correzione proporzionale target steer (indice 0)
-            targets[:, 0] = targets[:, 0] - 0.20 * delta_pos
+            # Angolo assoluto di ciascun raggio rispetto alla linea mediana
+            beta = angle.unsqueeze(1) + alpha.unsqueeze(0)
+            
+            # Perturbazione lineare sui 19 raggi
+            dL = - dy.unsqueeze(1) * torch.sin(beta)
+            states[:, 1:20] = torch.clamp(states[:, 1:20] + dL / 200.0, 0.0, 1.0)
+            
+            # 3. Correzione proporzionale target steer (indice 0) (più leggera: 0.12)
+            targets[:, 0] = targets[:, 0] - 0.12 * delta_pos
             targets[:, 0] = torch.clamp(targets[:, 0], -1.0, 1.0)
+            
+            # 4. Correzione parzializzazione throttle (indice 1) (più leggera: 15%)
+            targets[:, 1] = targets[:, 1] * (1.0 - 0.15 * delta_pos.abs())
+            targets[:, 1] = torch.clamp(targets[:, 1], 0.0, 1.0)
 
             self.optimizer.zero_grad()
             pred_cont, pred_gear = self.model(states)

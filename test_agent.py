@@ -151,7 +151,39 @@ def apply_tcs(action: np.ndarray, obs: dict, slip_threshold: float = 5.0) -> np.
     return action
 
 
+def apply_esp(action, obs, step=0):
+    """
+    Active Safety Envelope (ESP / Lane Keep Assist) - Versione Leggera
+    Agisce come fail-safe morbido solo in prossimità del limite estremo di pista (1.15).
+    Evita interventi bruschi per non destabilizzare la fisica dell'auto.
+    """
+    track_pos = obs.get('trackPos', 0.0)
+    if isinstance(track_pos, np.ndarray):
+        track_pos = track_pos.flat[0]
 
+    action = action.copy()
+
+    # Intervento sterzo molto leggero sopra 1.15
+    if abs(track_pos) > 1.15:
+        # Nudge proporzionale molto dolce
+        steer_nudge = -0.15 * (np.sign(track_pos) * (abs(track_pos) - 1.15))
+        action[0] = np.clip(action[0] + steer_nudge, -1.0, 1.0)
+        
+        # Parzializzazione gas e freno leggerissimi solo sopra 1.25 (vicino all'offtrack 1.50)
+        if abs(track_pos) > 1.25:
+            # Parzializzazione del gas (riduzione max del 30% per non tagliare bruscamente)
+            throttle_scale = max(0.70, 1.0 - 1.2 * (abs(track_pos) - 1.25))
+            action[1] *= throttle_scale
+            
+            # Frenata stabilizzante minima (max 0.05) per stabilizzare il retrotreno
+            brake_nudge = 0.20 * (abs(track_pos) - 1.25)
+            if brake_nudge > 0.01:
+                action[2] = max(action[2], min(0.05, brake_nudge))
+            
+            if step % 20 == 0:
+                print(f"    [ESP Soft] tp={track_pos:+.3f} | nudge={steer_nudge:+.3f} | scale={throttle_scale:.2f} | brake={action[2]:.2f}")
+
+    return action
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -233,9 +265,10 @@ def main():
                 if cont_action[2] > 0.05:
                     cont_action[1] = 0.0  # Se freno, niente gas
 
-                # ── Step nell'ambiente (azione pura dal modello + TCS di sicurezza) ──
+                # ── Step nell'ambiente (azione pura dal modello + TCS + ESP) ──
                 env_action = denormalize_action(cont_action, gear)
                 env_action = apply_tcs(env_action, obs)
+                env_action = apply_esp(env_action, obs, step)
                 next_obs, _, env_done, _ = env.step(env_action)
                 next_state = flatten_state(next_obs)
 
@@ -284,8 +317,8 @@ def main():
 
             # Salva telemetria in CSV a fine tentativo
             import csv
-            os.makedirs('/home/whitehat/.gemini/antigravity/brain/d7ddb9d3-ff72-412a-9935-fa161dfbdc58/scratch', exist_ok=True)
-            csv_path = f'/home/whitehat/.gemini/antigravity/brain/d7ddb9d3-ff72-412a-9935-fa161dfbdc58/scratch/telemetry_attempt_{total_attempts}.csv'
+            os.makedirs('/home/whitehat/.gemini/antigravity/brain/18bfeb4f-720e-4e89-9143-446a56955774/scratch', exist_ok=True)
+            csv_path = f'/home/whitehat/.gemini/antigravity/brain/18bfeb4f-720e-4e89-9143-446a56955774/scratch/telemetry_attempt_{total_attempts}.csv'
             with open(csv_path, 'w', newline='') as f_csv:
                 writer = csv.DictWriter(f_csv, fieldnames=['step', 'dist', 'speed', 'trackPos', 'angle', 'steer', 'accel', 'brake', 'gear'])
                 writer.writeheader()
