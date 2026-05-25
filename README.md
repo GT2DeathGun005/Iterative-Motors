@@ -122,7 +122,7 @@ Il training utilizza:
 - **Steer Boost (3x)**: errore del canale di sterzata pesato 3× nelle curve strette.
 - **Bojarski-Style Synthetic Recovery Augmentation (NVIDIA Autopilot)**: Insegna all'agente come correggere in modo proattivo gli scostamenti di traiettoria dovuti al *covariate shift*. Durante il training, applichiamo:
   1. Una perturbazione laterale dello spazio di stato (`trackPos`, indice 20) via `delta_pos` in `[-0.15, 0.15]`.
-  2. Una correzione proporzionale sullo sterzo target: `new_steer = target_steer - 0.15 * delta_pos`. Questo realizza una legge di controllo autocentrante neurale estremamente stabile sia in rettilineo che in curva.
+  2. Una correzione proporzionale sullo sterzo target: `new_steer = target_steer - 0.12 * delta_pos`. Questo realizza una legge di controllo autocentrante neurale estremamente stabile sia in rettilineo che in curva.
 - **Gradient Clipping** (max_norm=1.0) per la stabilità dei gradienti.
 
 **Output:** `train_set/checkpoints/bc_policy.pth`
@@ -136,7 +136,7 @@ python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 1
 ```
 
 **Sistemi di Controllo Attivi:**
-- **Active Safety Envelope (ESP / Lane Keep Assist)**: Modulo di sicurezza invisibile a runtime che agisce unicamente in prossimità del limite fisico della pista (`|trackPos| > 1.05`). Applica un piccolissimo e fluido nudge correttivo proporzionale (`-0.35 * (trackPos ± 1.05)`) per prevenire uscite millimetriche dalla linea bianca (soglia TORCS `1.25`). Questo ricalca esattamente la filosofia dei controlli di stabilità attivi (ESC/TCS) delle moderne vetture da corsa reali, mantenendo la guida autonoma al 99.9% in mano alla rete neurale.
+- **Active Safety Envelope (ESP / Lane Keep Assist)**: Modulo di sicurezza invisibile a runtime che agisce unicamente in prossimità del limite fisico della pista (`|trackPos| > 1.15`). Applica un piccolissimo e fluido nudge correttivo proporzionale (`-0.15 * (np.sign(trackPos) * (abs(trackPos) - 1.15))`) per prevenire uscite millimetriche dalla linea bianca (soglia TORCS `1.25`). Questo ricalca esattamente la filosofia dei controlli di stabilità attivi (ESC/TCS) delle moderne vetture da corsa reali, mantenendo la guida autonoma al 99.9% in mano alla rete neurale.
 
 ### Script di Supporto
 
@@ -202,6 +202,30 @@ Gli output della PolicyNetwork Multi-Head vengono convertiti in azioni TORCS in 
 
 ---
 
+## 📈 Strategia di Ottimizzazione Dataset: Come superare il Covariate Shift con più Dati
+
+Nello sviluppo di un modello di **Pure Behavioral Cloning**, la qualità e la diversità del dataset sono infinitamente più importanti della complessità dell'architettura di rete. Se l'agente mostra comportamenti instabili (come finire dritto nelle vie di fuga o innescare testacoda improvvisi), **la soluzione definitiva è arricchire il dataset con dati non-omogenei e manovre di recupero.**
+
+### 1. Il Limite dei Dati Troppo Omogenei
+Se il dataset contiene unicamente giri perfetti lungo l'identica traiettoria ideale (dati omogenei):
+- L'agente non apprenderà mai cosa fare al di fuori di quella linea.
+- A causa di piccoli disturbi fisici accumulati (ritardi di rete, sfrizionamenti), l'auto devierà inevitabilmente di pochi centimetri dalla traiettoria ideale.
+- Trovandosi in uno stato mai visto prima (**Covariate Shift**), la rete predirrà azioni errate (come sterzare a sinistra in una curva a destra per "raddrizzarsi", provocando scivolamenti o uscite).
+
+### 2. Come Raccogliere Dati di Recupero Efficaci (Recovery Dataset Protocol)
+Per rendere l'agente solido e capace di auto-correggersi, ti consigliamo di registrare **5-10 giri aggiuntivi dedicati esclusivamente alle correzioni di traiettoria**:
+1. **Partenze Fuori Asse**: Avvia il giro posizionandoti volutamente tutto a destra (`trackPos ≈ -0.8`) o tutto a sinistra (`trackPos ≈ 0.8`) e guida puntando attivamente al rientro verso il centro della pista.
+2. **Correzioni in Rettilineo**: Durante i rettilinei, oscilla dolcemente a destra e sinistra rispetto alla mezzeria, registrando le azioni correttive per tornare al centro.
+3. **Ingressi Curva Alternativi**: Esegui degli inserimenti in curva volutamente larghi o a velocità sub-ottimali, mostrando all'agente come decelerare e stringere lo sterzo in sicurezza per ritrovare il punto di corda ottimale.
+
+### 3. Evitare il Bloccaggio Ruote (Braking and Physics Guide)
+TORCS non possiede un sistema ABS attivo per impostazione predefinita sulla vettura F1. Di conseguenza:
+- Frenate repentine al $90\%+$ mentre si accenna a sterzare bloccano all'istante le ruote anteriori, provocando un **sottosterzo terminale** che spinge l'auto dritta fuori pista.
+- Frenate brusche in curva alleggeriscono il retrotreno causando **sovrasterzi repentini** e testacoda (spin).
+- **Consiglio per il Pilota Esperto**: Durante la raccolta dati, esercita una frenata fluida e progressiva (**Threshold Braking**), evitando di schiacciare il pedale oltre il $50-60\%$ se non sei perfettamente dritto. La rete clonerà questa fluidità, mantenendo l'agente sempre all'interno del limite di aderenza fisica delle gomme!
+
+---
+
 ## 🐛 Bug Risolti (Workflow Tracking)
 
 ### [2026-05-19] Doppia Normalizzazione Features — CRITICO
@@ -222,7 +246,7 @@ Gli output della PolicyNetwork Multi-Head vengono convertiti in azioni TORCS in 
 
 **Soluzioni Applicate:**
 1. **Bojarski-Style Unified Recovery Augmentation**: Introdotta perturbazione simultanea di scostamento spaziale (`trackPos` ±0.22) e heading angolare (`angle` ±0.12) durante l'addestramento, accoppiando una contromisura proporzionale e derivativa (PD) sullo sterzo target. L'agente ha così appreso una forza autocentrante e stabilizzante nativa.
-2. **Active Safety Envelope (ESP / Lane Keep Assist)**: Aggiunta una rete di protezione a runtime per `|trackPos| > 1.05` che corregge fluidamente la sterzata per evitare infrazioni millimetriche, simulando i controlli di stabilità ESC delle vetture reali.
+2. **Active Safety Envelope (ESP / Lane Keep Assist)**: Aggiunta una rete di protezione a runtime per `|trackPos| > 1.15` che corregge fluidamente la sterzata per evitare infrazioni millimetriche, simulando i controlli di stabilità ESC delle vetture reali.
 3. **Deprecazione Heuristics**: Rimosso completamente il Launch Helper iniziale. L'agente ora gestisce la partenza da fermo e tutte le curve del circuito al 100% tramite la rete neurale.
 4. **Cambio Manuale Ad Alti Giri (18,000 RPM)**: Il cambio discreto predittivo (testa discrete gear della rete) lavora coordinato sulla soglia di potenza dell'esperto (18,000 RPM).
 
