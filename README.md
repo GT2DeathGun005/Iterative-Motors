@@ -115,7 +115,7 @@ python behavioral_cloning.py \
 ```
 
 Il training utilizza:
-- **Validation Split 80/20** con **Early Stopping** (patience 30 epoche) per evitare overfitting.
+- **Validation Split 80/20** con **Early Stopping** (patience 100 epoche) per evitare overfitting.
 - **Cosine Annealing LR** da `3e-4` fino a `1e-6` per una convergenza stabile.
 - **Loss Combinata Multi-Head**: $\mathcal{L} = \mathcal{L}_{\text{MSE continua}} + 2 \times \mathcal{L}_{\text{CrossEntropy gear}}$.
 - **Dynamic Brake Boost (25x)**: l'errore sul canale del freno è pesato 25× nei campioni con frenata attiva dell'umano (`brake_target > 0.05`) per forzare staccate vigorose a runtime ed eliminare lo sbilanciamento del dataset (dove il freno è spento per il 95% del tempo).

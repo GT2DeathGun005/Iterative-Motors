@@ -349,7 +349,7 @@ class BehaviorCloningTrainer:
 
     def train(self, max_epochs: int = 200,
               checkpoint_path: str = "train_set/checkpoints/bc_policy.pth",
-              patience: int = 30):
+              patience: int = 100):
         print(f"\n  Inizio training Behavioral Cloning su {self.device}...")
         print(f"  Max epochs: {max_epochs} | Early Stopping patience: {patience}\n")
 
@@ -446,7 +446,7 @@ def main():
         device=device
     )
 
-    trainer.train(max_epochs=args.epochs, checkpoint_path=args.output, patience=30)
+    trainer.train(max_epochs=args.epochs, checkpoint_path=args.output, patience=100)
 
     print("\n  ✅ Addestramento Behavioral Cloning Multi-Head completato.")
     print(f"  Pesi salvati in: {args.output}\n")

@@ -32,7 +32,7 @@ class TorcsEnv:
         self.initial_run = True
 
         ##print("launch torcs")
-        os.system('pkill torcs')
+        os.system('pkill -9 -f torcs')
         time.sleep(0.5)
         if self.vision is True:
             os.system('torcs -nofuel -nodamage -vision > /dev/null 2>&1 &')
@@ -171,6 +171,12 @@ class TorcsEnv:
 
             ## TENTATIVE. Restarting TORCS every episode suffers the memory leak bug!
             if relaunch is True:
+                # Chiudiamo esplicitamente il socket UDP client precedente per evitare conflitti di porta bindata
+                if hasattr(self, 'client') and self.client is not None:
+                    try:
+                        self.client.so.close()
+                    except Exception:
+                        pass
                 self.reset_torcs()
                 print("### TORCS is RELAUNCHED ###")
 
@@ -190,22 +196,22 @@ class TorcsEnv:
         return self.get_obs()
 
     def end(self):
-        os.system('pkill torcs')
+        os.system('pkill -9 -f torcs')
 
     def get_obs(self):
         return self.observation
 
     def reset_torcs(self):
        #print("relaunch torcs")
-        os.system('pkill torcs')
-        time.sleep(0.5)
+        os.system('pkill -9 -f torcs')
+        time.sleep(1.5)  # Aumentato da 0.5 a 1.5 per garantire che il sistema operativo e X11 chiudano pulitamente il processo e liberino la porta UDP
         if self.vision is True:
             os.system('torcs -nofuel -nodamage -vision &')
         else:
             os.system('torcs -nofuel -nodamage &')
-        time.sleep(0.5)
+        time.sleep(1.5)  # Aumentato da 0.5 a 1.5 per dare tempo all'istanza di avviarsi e allocare la porta UDP
         os.system(f'sh {_AUTOSTART_SH}')
-        time.sleep(0.5)
+        time.sleep(1.0)  # Aumentato da 0.5 a 1.0 per dare tempo ad autostart.sh di completare la navigazione dei menu
 
     def agent_to_torcs(self, u):
         torcs_action = {'steer': u[0]}

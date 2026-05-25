@@ -330,6 +330,8 @@ def main():
                 print(f"  ✅ GIRO COMPLETATO: {lap_time:.3f}s")
             else:
                 print(f"  ❌ Fallito (step: {step})")
+                print("  🛑 Uscita forzata per garantire la pulizia dei processi. Riavvia lo script per un nuovo tentativo pulito.")
+                sys.exit(1)
 
     except KeyboardInterrupt:
         print(f"\n  🛑 Test interrotto.")
