@@ -103,9 +103,6 @@ def load_dataset(path: str) -> Dataset:
     if os.path.isdir(path):
         h5_files = sorted(glob.glob(os.path.join(path, "**/lap_*.h5"), recursive=True))
         
-        # Filtriamo gli snippet delle curve
-        h5_files = [f for f in h5_files if "lap_curve_" not in os.path.basename(f)]
-        
         if not h5_files:
             raise FileNotFoundError(
                 f"Nessun file lap_*.h5 trovato in {path} o nelle sue sottocartelle"

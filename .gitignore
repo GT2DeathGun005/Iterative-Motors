@@ -10,3 +10,12 @@ train_set/**
 
 # Forza Git a tracciare i file .gitkeep al loro interno
 !train_set/**/.gitkeep
+
+# Ignora tutti i file e le directory all'interno di telemetry
+telemetry/**
+
+# Forza Git a non ignorare le sottocartelle stesse (necessario per l'attraversamento)
+!telemetry/**/
+
+# Forza Git a tracciare i file .gitkeep al loro interno
+!telemetry/**/.gitkeep

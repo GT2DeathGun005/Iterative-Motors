@@ -53,14 +53,15 @@ AIcar/
 ├── test_agent.py              # Fase 3: Inferenza deterministica su TORCS
 ├── train_all.sh               # 🚀 Script unico per lanciare il training BC
 ├── stop_training.sh           # 🛑 Ferma i processi di training/TORCS
-├── monitor.sh                 # 📊 Monitoraggio status processi e checkpoint
 ├── README.md
 ├── gym_torcs/                 # Wrapper Python per TORCS
 │   ├── gym_torcs.py           #   Ambiente OpenAI Gym per TORCS
 │   ├── snakeoil3_gym.py       #   Client UDP per comunicazione con TORCS
 │   └── autostart.sh           #   Automazione menu TORCS (via xte/xautomation)
+├── telemetry/                 # Telemetria CSV dei test agent (auto-generata)
 └── train_set/                 # Dati e Checkpoint
     ├── laps/                  #   File HDF5 dei giri registrati (lap_001.h5 ...)
+    ├── laps_anomalous/        #   Giri isolati per anomalie (non usati dal BC)
     ├── checkpoints/           #   Pesi del modello (bc_policy.pth)
     └── session_logs/          #   Log delle sessioni di data collection
 ```
@@ -141,7 +142,6 @@ python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 1
 ### Script di Supporto
 
 ```bash
-./monitor.sh            # Mostra stato dei processi e checkpoint
 ./stop_training.sh      # Ferma training e TORCS (SIGTERM)
 ./stop_training.sh --force  # Kill forzato (SIGKILL)
 ```
@@ -245,10 +245,22 @@ TORCS non possiede un sistema ABS attivo per impostazione predefinita sulla vett
 **Problema:** L'agente soffriva di covariate shift nelle curve veloci e sul rettilineo iniziale, allontanandosi millimetricamente dalla linea ideale e superando la soglia di fuoripista (1.25). L'utilizzo di launch helper euristiche rompeva la purezza della guida autonoma neurale. Inoltre, la stabilità del cambio automatico precedente interferiva negativamente con la dinamica di frenata.
 
 **Soluzioni Applicate:**
-1. **Bojarski-Style Unified Recovery Augmentation**: Introdotta perturbazione simultanea di scostamento spaziale (`trackPos` ±0.22) e heading angolare (`angle` ±0.12) durante l'addestramento, accoppiando una contromisura proporzionale e derivativa (PD) sullo sterzo target. L'agente ha così appreso una forza autocentrante e stabilizzante nativa.
+1. **Bojarski-Style Unified Recovery Augmentation**: Introdotta perturbazione laterale dello stato (`trackPos` ±0.15) durante l'addestramento, con correzione proporzionale sullo sterzo target (`new_steer = target_steer - 0.12 * delta_pos`) e parzializzazione dell'acceleratore. L'agente ha così appreso una forza autocentrante e stabilizzante nativa.
 2. **Active Safety Envelope (ESP / Lane Keep Assist)**: Aggiunta una rete di protezione a runtime per `|trackPos| > 1.15` che corregge fluidamente la sterzata per evitare infrazioni millimetriche, simulando i controlli di stabilità ESC delle vetture reali.
 3. **Deprecazione Heuristics**: Rimosso completamente il Launch Helper iniziale. L'agente ora gestisce la partenza da fermo e tutte le curve del circuito al 100% tramite la rete neurale.
 4. **Cambio Manuale Ad Alti Giri (18,000 RPM)**: Il cambio discreto predittivo (testa discrete gear della rete) lavora coordinato sulla soglia di potenza dell'esperto (18,000 RPM).
+
+### [2026-05-25] Inquinamento Dataset — Anomalie Sterzata in Curva 10
+
+**Problema:** 19 giri su 66 nel dataset esperto contenevano un'anomalia di sottosterzo nella penultima curva (Curva 10, ~3175m-3255m). In questi giri, lo sterzo rimaneva esattamente `0.000` per oltre 60 metri durante la frenata, con ingresso in curva ritardato di ~40 metri. Questo comportamento inquinava la loss del BC, insegnando all'agente a non sterzare in tempo nella penultima curva.
+
+**Impatto:** L'agente usciva sistematicamente di pista nella penultima curva per sottosterzo indotto dal dataset. Il tasso di completamento giri scendeva drasticamente (~28% nella sessione peggiore).
+
+**Fix applicato:**
+- Analisi automatizzata di tutti i 66 giri con script di diagnostica per classificare l'Average Steer e Max Steer nella zona critica [3175m, 3255m]
+- Isolamento dei 19 giri anomali in `train_set/laps_anomalous/` (non eliminati, solo spostati fuori dal percorso di training)
+- Riaddestramento del modello BC sui 47 giri puliti rimanenti
+- Risultato: validation loss migliorata da `0.151478` a `0.148800`
 
 ---
 

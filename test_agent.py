@@ -13,6 +13,7 @@ import sys
 import argparse
 import time
 import datetime
+import csv
 import numpy as np
 import torch
 import torch.nn as nn
@@ -316,9 +317,9 @@ def main():
                 if env_done: break
 
             # Salva telemetria in CSV a fine tentativo
-            import csv
-            os.makedirs('/home/whitehat/.gemini/antigravity/brain/18bfeb4f-720e-4e89-9143-446a56955774/scratch', exist_ok=True)
-            csv_path = f'/home/whitehat/.gemini/antigravity/brain/18bfeb4f-720e-4e89-9143-446a56955774/scratch/telemetry_attempt_{total_attempts}.csv'
+            telemetry_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'telemetry')
+            os.makedirs(telemetry_dir, exist_ok=True)
+            csv_path = os.path.join(telemetry_dir, f'telemetry_attempt_{total_attempts}.csv')
             with open(csv_path, 'w', newline='') as f_csv:
                 writer = csv.DictWriter(f_csv, fieldnames=['step', 'dist', 'speed', 'trackPos', 'angle', 'steer', 'accel', 'brake', 'gear'])
                 writer.writeheader()
@@ -330,8 +331,8 @@ def main():
                 print(f"  ✅ GIRO COMPLETATO: {lap_time:.3f}s")
             else:
                 print(f"  ❌ Fallito (step: {step})")
-                print("  🛑 Uscita forzata per garantire la pulizia dei processi. Riavvia lo script per un nuovo tentativo pulito.")
-                sys.exit(1)
+                print("  ⚠️  Tentativo fallito. Prossimo tentativo...")
+                # Continua con il prossimo tentativo (il while loop riproverà con relaunch=True)
 
     except KeyboardInterrupt:
         print(f"\n  🛑 Test interrotto.")
