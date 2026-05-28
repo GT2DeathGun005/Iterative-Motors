@@ -36,10 +36,10 @@ from datetime import datetime
 #  Costanti
 # ──────────────────────────────────────────────────────────────────────
 
-DIST_FEATURE_IDX = 29       # Indice di distFromStart nel vettore 30D
+PRUNE_FEATURE_INDICES = [29]  # Drop only distFromStart in 30D (yields 29D)
 BACKUP_DIR_NAME = "dataset_backup"
 LOCK_FILE_NAME = ".LOCKED"
-PREPROCESSING_VERSION = "2.0"  # v2: drop distFromStart (v1 era linearizzazione)
+PREPROCESSING_VERSION = "4.0"  # v4: drop distFromStart (30D -> 29D)
 
 # Nomi feature (per il report di audit — vettore originale 30D)
 FEATURE_NAMES_30D = [
@@ -280,7 +280,7 @@ def drop_dist_from_start(laps_dir: str, dry_run: bool = False) -> tuple:
 
         try:
             with h5py.File(filepath, 'r') as h5f:
-                # Skip se già processato con v2
+                # Skip se già processato con v4
                 pv = h5f.attrs.get('preprocessing_version', None)
                 if pv == PREPROCESSING_VERSION:
                     skipped += 1
@@ -297,11 +297,11 @@ def drop_dist_from_start(laps_dir: str, dry_run: bool = False) -> tuple:
                 continue
 
             # Drop colonna 29 (distFromStart)
-            states_29d = np.delete(states, DIST_FEATURE_IDX, axis=1)
+            states_29d = np.delete(states, PRUNE_FEATURE_INDICES, axis=1)
 
             assert states_29d.shape[1] == 29, f"Shape dopo drop: {states_29d.shape}"
 
-            print(f"  ✅ {filename}: 30D → 29D (drop distFromStart[{DIST_FEATURE_IDX}]) | "
+            print(f"  ✅ {filename}: 30D → 29D (drop distFromStart) | "
                   f"{states.shape[0]} campioni")
 
             if dry_run:
@@ -339,7 +339,7 @@ def process_dataset(laps_dir: str, project_root: str, dry_run: bool = False):
     _assert_not_backup(laps_dir)
 
     print(f"\n{'=' * 70}")
-    print(f"  🔧 PREPROCESSING DATASET v2 — TORCS Path Following")
+    print(f"  🔧 PREPROCESSING DATASET v4 — TORCS Path Following")
     print(f"  Directory:  {laps_dir}")
     print(f"  Modalità:   {'DRY-RUN (nessuna modifica)' if dry_run else 'ESECUZIONE'}")
     print(f"  Operazione: Drop distFromStart (30D → 29D)")
@@ -351,7 +351,7 @@ def process_dataset(laps_dir: str, project_root: str, dry_run: bool = False):
     print(f"  {'─' * 60}")
     backup_path = create_backup(laps_dir, project_root)
 
-    # ── Fase 2: Ripristino da Backup (se i file sono stati modificati da v1) ──
+    # ── Fase 2: Ripristino da Backup (se i file sono stati modificati da v1, v2 o v3) ──
     # Controlla se i file correnti sono stati toccati da una versione precedente
     sample_file = sorted(glob.glob(os.path.join(laps_dir, "lap_*.h5")))[0]
     with h5py.File(sample_file, 'r') as h5f:
@@ -376,8 +376,7 @@ def process_dataset(laps_dir: str, project_root: str, dry_run: bool = False):
     # ── Fase 4: Drop distFromStart ──
     print(f"\n  ✂️  FASE 4: DROP distFromStart (30D → 29D)")
     print(f"  {'─' * 60}")
-    print(f"  Motivazione: correlazione con azioni ≈ 0, causa train-test mismatch")
-    print(f"  La rete deve guidare solo con sensori + velocità, non con la posizione.\n")
+    print(f"  Motivazione: correlazione con azioni ≈ 0, causa train-test mismatch.\n")
 
     processed, skipped, errors = drop_dist_from_start(laps_dir, dry_run=dry_run)
 

@@ -8,12 +8,19 @@ Questo repository implementa una pipeline end-to-end per addestrare un agente di
 
 ## 🧠 Filosofia del Progetto: Pure Behavioral Cloning
 
-A differenza degli approcci ibridi, questo progetto punta sulla **massima fedeltà ai dati esperti**. Invece di esplorare traiettorie casuali tramite RL, l'agente utilizza una **Deep Policy Network** (4 layer nascosti, 30D → 512D) per mappare esattamente ogni sensore alla risposta corretta del pilota.
+A differenza degli approcci ibridi, questo progetto punta sulla **massima fedeltà ai dati esperti**. Invece di esplorare traiettorie casuali tramite RL, l'agente utilizza una **Deep Policy Network Multi-Head** con **State Stacking Temporale Statico** per fittare l'orizzonte cinematico ideale.
+
+L'agente utilizza un input di **87D** composto dalla concatenazione di 3 frame temporali con **passo di stride statico $k = 6$ ($0.24\text{ secondi}$ totali)**:
+- $t - 12$ (passato)
+- $t - 6$ (passato recente)
+- $t$ (presente)
+
+Questo orizzonte consente alla rete di calcolare in modo stabile i trend macroscopici e la derivata di avvicinamento ai bordi della pista.
 
 ### Punti di forza della pipeline BC:
 1. **Stabilità Assoluta**: Nessun rischio di *catastrophic forgetting* o divergenza tipica del RL.
 2. **Determinismo**: A parità di stato iniziale, l'agente produrrà sempre la stessa traiettoria ideale.
-3. **Efficienza**: Il training richiede pochi minuti su GPU anziché ore di interazione con il simulatore.
+3. **Reattività Dinamica**: Lo stacking temporale mitiga la latenza fisica, mentre l'orizzonte a $0.24\text{s}$ rappresenta il perfetto punto di equilibrio cinematico (un orizzonte superiore come $0.40\text{s}$ introduce latenza di controllo, mentre uno consecutivo fallisce a percepire le variazioni dei sensori).
 
 ---
 
@@ -96,9 +103,9 @@ python data_collection.py --output_dir train_set --device keyboard
 - `--relaunch_every 10` — Rilancia TORCS ogni N giri per prevenire memory leak
 
 **Output:** un file `train_set/laps/lap_NNN.h5` per ogni giro valido, contenente:
-- `states`: matrice `(N_steps, 30)` — vettore di osservazione 30D normalizzato
+- `states`: matrice `(N_steps, 29)` — vettore di osservazione 29D normalizzato (dopo il drop v4 di `distFromStart`)
 - `actions`: matrice `(N_steps, 4)` — `[steering, accel, brake, gear]`
-- Attributi: `lap_time`, `num_steps`, `timestamp`
+- Attributi: `lap_time`, `num_steps`, `timestamp`, `preprocessing_version`
 
 ### 2. Addestramento BC (Training)
 
@@ -152,8 +159,8 @@ python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 1
 
 ### PolicyNetwork Multi-Head
 
-La rete Actor non è più a regressione continua singola (che portava a predizioni decimali confuse per la marcia come `2.5`, ritardando le scalate e le staccate). Adotta ora un'architettura **Multi-Head**:
-- **Backbone Comune**: 4 layer densi (512 unità ciascuno) con `LayerNorm` e attivazione `ReLU`. Estrae feature spaziali e cinematiche condivise dallo stato 30D.
+La rete Actor adotta un'architettura **Multi-Head** progettata per elaborare lo storico temporale:
+- **Backbone Comune**: 4 layer densi (512 unità ciascuno) con `LayerNorm` e attivazione `ReLU`. Estrae feature condivise dallo stack temporale 87D ($29 \times 3$ frame).
 - **Testa Continua**: output a 3 dimensioni per il controllo dello sterzo e dei pedali:
   - `steer`: attivato via **Tanh** in $[-1, 1]$ per sterzate simmetriche.
   - `accel` e `brake`: attivati via **Sigmoid** in $[0, 1]$ per mappare naturalmente i pedali.
@@ -161,31 +168,31 @@ La rete Actor non è più a regressione continua singola (che portava a predizio
 
 | Parametro | Valore |
 |-----------|--------|
-| Input | 30 neuroni (vettore di osservazione) |
+| Input | 87 neuroni (vettore di osservazione 29D × 3 frame stacked) |
 | Hidden Layers (Backbone) | 4 × 512 neuroni con LayerNorm + ReLU |
 | Continuous Head | 3 neuroni (steer [Tanh], accel [Sigmoid], brake [Sigmoid]) |
 | Gear Head (Discreta) | 7 neuroni (logits marcia per CrossEntropy) |
-| Parametri totali | ~813,000 |
+| Parametri totali | 842,250 |
 
-### Vettore di Osservazione (30D)
+### Vettore di Osservazione (29D)
 
-Lo stato è un vettore 1D di 30 valori, costruito da `flatten_state()`:
+Lo stato è un vettore 1D di 29 valori, costruito da `flatten_state()`:
 
-| Indice | Feature | Normalizzazione | Range tipico |
-|--------|---------|-----------------|--------------|
-| 0 | `angle` | nessuna (radianti) | [-0.6, 0.4] |
-| 1–19 | `track[19]` (sensori LIDAR) | /200 (via `gym_torcs`) | [0, 1] |
-| 20 | `trackPos` | nessuna | [-1, 1] |
-| 21 | `speedX` | /50 (via `gym_torcs`) | [0, ~5.7] |
-| 22 | `speedY` | /50 (via `gym_torcs`) | [-0.6, 0.8] |
-| 23 | `speedZ` | /50 (via `gym_torcs`) | [-0.4, 0.7] |
-| 24–27 | `wheelSpinVel[4]` | /100 | [0, ~2.6] |
-| 28 | `rpm` | /10000 | [0.5, 2.0] |
-| 29 | `distFromStart` | /4000 | [0, ~0.9] |
+| Indice | Feature | Normalizzazione | Range tipico | Stato |
+|--------|---------|-----------------|--------------|-------|
+| 0 | `angle` | nessuna (radianti) | [-0.6, 0.4] | Attivo |
+| 1–19 | `track[19]` (sensori LIDAR) | /200 (via `gym_torcs`) | [0, 1] | Attivo |
+| 20 | `trackPos` | nessuna | [-1, 1] | Attivo |
+| 21 | `speedX` | /50 (via `gym_torcs`) | [0, ~5.7] | Attivo |
+| 22 | `speedY` | /50 (via `gym_torcs`) | [-0.6, 0.8] | Attivo |
+| 23 | `speedZ` | /50 (via `gym_torcs`) | [-0.4, 0.7] | Attivo |
+| 24–27 | `wheelSpinVel[4]` | /100 | [0, ~2.6] | Attivo |
+| 28 | `rpm` | /10000 | [0.5, 2.0] | Attivo |
+| - | *distFromStart* | - | - | **Rimosso (v4)** |
 
 > ⚠️ **IMPORTANTE:** La normalizzazione dei sensori avviene in due punti della pipeline e NON deve essere duplicata:
 > - `gym_torcs.make_observaton()` normalizza `track/200` e `speed/default_speed(50)`
-> - `data_collection.flatten_state()` normalizza `wheelSpinVel/100`, `rpm/10000`, `distFromStart/4000`
+> - `data_collection.flatten_state()` normalizza `wheelSpinVel/100` e `rpm/10000`
 >
 > `TorcsHDF5Dataset` e `test_agent.flatten_state()` NON devono ri-normalizzare track e speed.
 
@@ -261,6 +268,16 @@ TORCS non possiede un sistema ABS attivo per impostazione predefinita sulla vett
 - Isolamento dei 19 giri anomali in `train_set/laps_anomalous/` (non eliminati, solo spostati fuori dal percorso di training)
 - Riaddestramento del modello BC sui 47 giri puliti rimanenti
 - Risultato: validation loss migliorata da `0.151478` a `0.148800`
+
+### [2026-05-28] Ottimizzazione Stride Temporale e Definizione dell'Architettura 29D (v4)
+
+**Problema:** L'aumento temporaneo a $k=10$ ($0.40\text{s}$) dell'orizzonte di State Stacking ha introdotto una latenza eccessiva di controllo (delay), provocando reazioni ritardate e conseguenti fuori pista. Al contempo, il passaggio ad uno stato puramente geometrico (24D) ha ridotto la sensibilità dell'agente sulle derapate in curva.
+
+**Soluzione Definitiva Applicata:**
+1. **Stabilizzazione su 29D**: Rimozione della sola feature discontinua `distFromStart` (causa di covariate shift al traguardo) per via del preprocessing v4, conservando le feature dinamiche di trazione (`wheelSpinVel` e `rpm`).
+2. **Consolidamento a $k=6$ ($0.24\text{s}$)**: Ripristinato lo stride temporale a $k=6$ (orizzonte temporale totale di 0.24 secondi) tramite stacking 87D degli stati $t-12$, $t-6$, $t$. Questo rappresenta il perfetto punto di equilibrio dinamico nel controllo deterministico a 50Hz.
+3. **Risultato**: Compilazione e integrità di tutta la codebase verificate con successo. Raggiunto minimo storico di validation loss pari a `0.1305`.
+4. **Stato Corrente dei Test (Limite Rilevato)**: ⚠️ *Nonostante questa configurazione (29D con $k=6$) sia empiricamente la migliore testata fino ad ora sul circuito di TORCS, l'agente non riesce ancora a completare un intero giro di pista senza incorrere in un'uscita.* La traiettoria risulta nettamente migliorata e più stabile, ma persistono criticità in transitori veloci.
 
 ---
 

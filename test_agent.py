@@ -30,7 +30,7 @@ from gym_torcs import TorcsEnv
 
 class PolicyNetwork(nn.Module):
     """Rete Actor per Behavioral Cloning con architettura Multi-Head:
-    stato (30D) → testa continua (steer, accel, brake) & testa discreta (gear).
+    stato (29D) → testa continua (steer, accel, brake) & testa discreta (gear).
 
     Il backbone estrae feature condivise. Le due teste separate evitano
     le oscillazioni e i ritardi tipici della regressione sul cambio marcia.
@@ -86,12 +86,7 @@ class PolicyNetwork(nn.Module):
 def flatten_state(state_dict: dict) -> np.ndarray:
     """Appiattisce osservazione TORCS → vettore 29D.
 
-    NOTA: Le osservazioni provengono da gym_torcs.make_observaton() che già
-    normalizza track/200 e speed/default_speed(50). NON ri-dividere qui.
     Deve essere identica a data_collection.flatten_state() per coerenza.
-
-    distFromStart è stata rimossa: correlazione ~0 con le azioni e causa
-    train-test mismatch per le discontinuità del simulatore al traguardo.
     """
     def _s(key, default=0.0):
         v = state_dict.get(key, default)
@@ -202,10 +197,6 @@ def main():
                         help="Numero di giri da completare")
     parser.add_argument("--max_steps", type=int, default=15000,
                         help="Max step per giro (timeout)")
-    parser.add_argument(
-        "--stride_type", type=str, default="static", choices=["static", "dynamic"],
-        help="Tipo di stride temporale: static (passo k=6) o dynamic (passo v-dipendente)"
-    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -214,7 +205,7 @@ def main():
     print(f"  🏁 TEST AGENTE AUTONOMO (BC) — TORCS")
     print(f"  Device: {device}")
     print(f"  Pesi: {args.weights}")
-    print(f"  Stride Type: {args.stride_type}")
+    print(f"  Stride Type: static (k=6, 0.24s)")
     print(f"  🎯 Modalità: DETERMINISTICA (Zero Noise)")
     print(f"{'=' * 64}\n")
 
@@ -249,9 +240,9 @@ def main():
             obs = env.reset(relaunch=True)
             initial_state = flatten_state(obs)
 
-            # Inizializza buffer storico per State Stacking (max 51 elementi per coprire k_max=25, i.e. 2*k_max=50)
-            state_buffer = deque(maxlen=51)
-            for _ in range(51):
+            # Inizializza buffer storico per State Stacking (esattamente 13 elementi: t-12, t-6, t)
+            state_buffer = deque(maxlen=13)
+            for _ in range(13):
                 state_buffer.append(initial_state)
 
             # Lap tracking
@@ -267,20 +258,11 @@ def main():
             print(f"  🏁 Tentativo #{total_attempts} (giri completati: {len(lap_times)}/{args.laps})")
 
             for step in range(1, args.max_steps + 1):
-                # Determina il passo temporale k
-                if args.stride_type == "static":
-                    k = 6
-                else:
-                    # Dynamic stride: clamp(round(300 / speedX), 2, 25)
-                    # speedX è all'indice 21 dell'ultimo stato (normalizzato /50)
-                    speed_x = float(state_buffer[-1][21]) * 50.0
-                    k = int(np.clip(np.round(300.0 / max(speed_x, 1.0)), 2, 25))
-
-                # Costruisce il vettore di stato 87D concatenando t-2k, t-k, t
+                # Costruisce il vettore di stato 87D concatenando t-12 (index 0), t-6 (index 6), t (index 12)
                 stacked_state = np.concatenate([
-                    state_buffer[-(1 + 2 * k)],
-                    state_buffer[-(1 + k)],
-                    state_buffer[-1]
+                    state_buffer[0],
+                    state_buffer[6],
+                    state_buffer[12]
                 ])
 
                 # ── Inferenza DETERMINISTICA (Pure BC, sterzata/acceleratore/freno + marcia dal modello) ──

@@ -44,9 +44,8 @@ import math
 class TorcsHDF5Dataset(Dataset):
     """Dataset da un singolo file HDF5 con gruppi 'states' e 'actions'.
 
-    Esegue lo stacking temporale di 3 frame:
-      - 'static': passo costante k=6 (0.24s totali)
-      - 'dynamic': passo k = clamp(round(300 / speedX), 2, 25) per mantenere Δs ≈ 12 metri
+    Esegue lo stacking temporale statico di 3 frame con passo costante k=6 (0.24s totali):
+      - t-12, t-6, t
 
     Esegue sanity check all'inizializzazione:
       - Verifica presenza dei gruppi richiesti
@@ -54,13 +53,12 @@ class TorcsHDF5Dataset(Dataset):
       - Clamp del gear a [0, 6] (esclude retromarcia)
     """
 
-    def __init__(self, file_path: str, stride_type: str = "static"):
+    def __init__(self, file_path: str):
         super().__init__()
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File dataset non trovato: {file_path}")
 
         self.file_path = file_path
-        self.stride_type = stride_type
 
         with h5py.File(self.file_path, 'r') as h5f:
             # ── Verifica gruppi ──
@@ -94,13 +92,7 @@ class TorcsHDF5Dataset(Dataset):
         return self.length
 
     def __getitem__(self, idx: int):
-        if self.stride_type == "static":
-            k = 6
-        else:
-            # Dynamic stride: C / speedX, clamped. speedX è all'indice 21 (normalizzato /50)
-            speed_x = float(self.states[idx, 21].item()) * 50.0
-            k = int(np.clip(np.round(300.0 / max(speed_x, 1.0)), 2, 25))
-
+        k = 6
         idx_t6 = max(0, idx - k)
         idx_t12 = max(0, idx - 2 * k)
 
@@ -112,7 +104,7 @@ class TorcsHDF5Dataset(Dataset):
         return stacked, self.actions[idx]
 
 
-def load_dataset(path: str, stride_type: str = "static") -> Dataset:
+def load_dataset(path: str) -> Dataset:
     """Carica e aggrega l'intero manifold di giri per migliorare la robustezza."""
     if os.path.isdir(path):
         h5_files = sorted(glob.glob(os.path.join(path, "**/lap_*.h5"), recursive=True))
@@ -128,7 +120,7 @@ def load_dataset(path: str, stride_type: str = "static") -> Dataset:
         
         for f in h5_files:
             try:
-                ds = TorcsHDF5Dataset(f, stride_type=stride_type)
+                ds = TorcsHDF5Dataset(f)
                 datasets.append(ds)
                 total_samples += len(ds)
             except Exception as e:
@@ -139,8 +131,7 @@ def load_dataset(path: str, stride_type: str = "static") -> Dataset:
         print(f"  📚 Dataset caricato: {len(datasets)} giri, {total_samples} campioni totali.")
         return ConcatDataset(datasets), total_samples
     else:
-        ds = TorcsHDF5Dataset(path, stride_type=stride_type)
-        print(f"  Caricato {os.path.basename(path)}: {len(ds)} campioni")
+        ds = TorcsHDF5Dataset(path)
         return ds, len(ds)
 class PolicyNetwork(nn.Module):
     """Rete Actor per Behavioral Cloning con architettura Multi-Head:
@@ -330,8 +321,8 @@ class BehaviorCloningTrainer:
                 dL = - dy.unsqueeze(1) * torch.sin(beta)
                 frame_states[:, 1:20] = torch.clamp(frame_states[:, 1:20] + dL / 200.0, 0.0, 1.0)
                 
-            # 3. Correzione proporzionale target steer (indice 0) (più leggera: 0.12)
-            targets[:, 0] = targets[:, 0] - 0.12 * delta_pos
+            # 3. Correzione proporzionale target steer (indice 0) (ottimizzata: 0.16 per un rientro più forte)
+            targets[:, 0] = targets[:, 0] - 0.16 * delta_pos
             targets[:, 0] = torch.clamp(targets[:, 0], -1.0, 1.0)
             
             # 4. Correzione parzializzazione throttle (indice 1) (più leggera: 15%)
@@ -339,16 +330,16 @@ class BehaviorCloningTrainer:
             targets[:, 1] = torch.clamp(targets[:, 1], 0.0, 1.0)
 
             # ── Data Augmentation: Speed Perturbation Augmentation ──
-            # Se la velocità attuale (speedX, indice 21) del frame più recente (frame 2) è significativa (> 100 km/h)
+            # Se la velocità attuale (speedX, indice 21) del frame più recente (frame 2) è significativa (> 90 km/h)
             # e c'è una curva (sterzo target significativo o sensore frontale decrescente),
             # aumentiamo fittiziamente la velocità in tutti e 3 i frame e aumentiamo il target del freno.
-            if torch.rand(1).item() < 0.4:
+            if torch.rand(1).item() < 0.5:
                 # Estraiamo speedX (indice 21) dall'ultimo frame (de-normalizzato)
                 speedX_latest = states[:, 2, 21] * 50.0
                 steer_target_abs = targets[:, 0].abs()
                 sensor_front_latest = states[:, 2, 10]  # track_s9 (indice 10, cioè 0 gradi)
 
-                is_speed_critical = (speedX_latest > 100.0) & ((steer_target_abs > 0.15) | (sensor_front_latest < 0.5))
+                is_speed_critical = (speedX_latest > 90.0) & ((steer_target_abs > 0.10) | (sensor_front_latest < 0.60))
 
                 if is_speed_critical.any():
                     # Genera un incremento del 10% - 30% per i campioni critici
@@ -454,10 +445,6 @@ def main():
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument(
-        "--stride_type", type=str, default="static", choices=["static", "dynamic"],
-        help="Tipo di stride temporale: static (passo k=6) o dynamic (passo v-dipendente)"
-    )
-    parser.add_argument(
         "--output", type=str, default="train_set/checkpoints/bc_policy.pth",
         help="Path di output per i pesi del modello"
     )
@@ -471,12 +458,12 @@ def main():
     if device == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    print(f"  Stride Type: {args.stride_type}")
+    print(f"  Stride Type: static (k=6, 0.24s)")
     print(f"{'=' * 64}\n")
 
     # ── Caricamento dataset ──
     print("  Caricamento dataset...")
-    dataset, total_samples = load_dataset(args.dataset, stride_type=args.stride_type)
+    dataset, total_samples = load_dataset(args.dataset)
 
     # ── Rileva dimensioni ──
     sample_state, sample_action = dataset[0]
