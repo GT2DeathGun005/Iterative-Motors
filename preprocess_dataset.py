@@ -4,9 +4,15 @@ Preprocessing Dataset HDF5 — TORCS Path Following
 Pipeline di trasformazione pre-training che:
   1. Crea un backup completo e protetto (read-only + lock) del dataset originale
   2. Esegue un audit delle feature per identificare sensori non informativi
-  3. Linearizza la feature distFromStart eliminando le discontinuità
-     del simulatore, producendo una metrica di distanza strettamente
-     monotona, continua e incrementale per l'intera durata della run.
+  3. Droppa la feature distFromStart (indice 29) riducendo il vettore da 30D a 29D
+
+Motivazione del drop di distFromStart:
+  - La correlazione con tutte le azioni è quasi-zero (|corr| < 0.05)
+  - La discontinuità nativa del simulatore (salto 3608→0 al traguardo) rende
+    qualsiasi trasformazione (linearizzazione) incompatibile con l'inference,
+    dove il sensore restituisce valori grezzi → train-test mismatch
+  - La feature induce la rete ad apprendere profili di velocità posizione-dipendenti
+    (rallenta a fine giro, accelera all'inizio) che sono spurii e dannosi
 
 Uso:
     python preprocess_dataset.py                       # default: train_set/laps
@@ -30,15 +36,13 @@ from datetime import datetime
 #  Costanti
 # ──────────────────────────────────────────────────────────────────────
 
-TRACK_LENGTH = 3608.0       # Lunghezza circuito in metri (CG Speedway 1)
 DIST_FEATURE_IDX = 29       # Indice di distFromStart nel vettore 30D
-DIST_NORM_FACTOR = 4000.0   # Fattore di normalizzazione usato in flatten_state
 BACKUP_DIR_NAME = "dataset_backup"
 LOCK_FILE_NAME = ".LOCKED"
-PREPROCESSING_VERSION = "1.0"
+PREPROCESSING_VERSION = "2.0"  # v2: drop distFromStart (v1 era linearizzazione)
 
-# Nomi feature (per il report di audit)
-FEATURE_NAMES = [
+# Nomi feature (per il report di audit — vettore originale 30D)
+FEATURE_NAMES_30D = [
     "angle",
     "track_s0 (-90°)", "track_s1 (-75°)", "track_s2 (-60°)", "track_s3 (-45°)",
     "track_s4 (-30°)", "track_s5 (-20°)", "track_s6 (-15°)", "track_s7 (-10°)",
@@ -84,16 +88,7 @@ def _sha256(filepath: str) -> str:
 def create_backup(laps_dir: str, project_root: str) -> str:
     """Copia il dataset originale in una directory protetta con verifica di integrità.
 
-    Args:
-        laps_dir: percorso della directory contenente i file .h5
-        project_root: radice del progetto (dove creare dataset_backup/)
-
-    Returns:
-        Percorso assoluto della directory di backup creata
-
-    Raises:
-        RuntimeError: se il backup esiste già (per evitare sovrascritture)
-        RuntimeError: se la verifica di integrità fallisce
+    Se il backup esiste già e il lock file è presente, salta la copia.
     """
     backup_root = os.path.join(project_root, BACKUP_DIR_NAME)
     backup_laps = os.path.join(backup_root, "laps")
@@ -163,17 +158,7 @@ def create_backup(laps_dir: str, project_root: str) -> str:
 # ──────────────────────────────────────────────────────────────────────
 
 def audit_features(laps_dir: str) -> dict:
-    """Analizza tutte le feature del dataset per identificare potenziali problemi.
-
-    Controlla:
-      - Varianza zero o quasi-zero (feature costanti / non informative)
-      - Range eccessivamente ristretto
-      - Correlazione con le azioni target
-      - Discontinuità nella distFromStart
-
-    Returns:
-        Dizionario con i risultati dell'audit, inclusa lista di feature problematiche
-    """
+    """Analizza tutte le feature del dataset per identificare potenziali problemi."""
     _assert_not_backup(laps_dir)
 
     h5_files = sorted(glob.glob(os.path.join(laps_dir, "lap_*.h5")))
@@ -192,6 +177,9 @@ def audit_features(laps_dir: str) -> dict:
     n_samples = states.shape[0]
     n_features = states.shape[1]
 
+    # Usa i nomi giusti in base alla dimensionalità
+    feature_names = FEATURE_NAMES_30D[:n_features] if n_features <= 30 else [f"feat_{i}" for i in range(n_features)]
+
     print(f"\n  📊 AUDIT FEATURE — {n_samples} campioni, {n_features} feature, {len(h5_files)} giri")
     print(f"  {'─' * 80}")
 
@@ -200,12 +188,11 @@ def audit_features(laps_dir: str) -> dict:
         'n_features': n_features,
         'n_laps': len(h5_files),
         'issues': [],
-        'per_feature': {},
     }
 
     LOW_VARIANCE_THRESHOLD = 1e-6
     LOW_RANGE_THRESHOLD = 0.001
-    NEAR_ZERO_PCT_THRESHOLD = 99.0  # se >99% dei valori sono quasi zero
+    NEAR_ZERO_PCT_THRESHOLD = 99.0
 
     print(f"\n  {'Feature':<26s} | {'std':>9s} | {'range':>10s} | {'corr(st)':>9s} | {'Status'}")
     print(f"  {'─' * 80}")
@@ -218,216 +205,69 @@ def audit_features(laps_dir: str) -> dict:
         near_zero_pct = 100.0 * np.mean(np.abs(col) < 1e-6)
 
         status = "OK"
-        issues_for_feature = []
-
         if std_val < LOW_VARIANCE_THRESHOLD:
             status = "⚠️  LOW VARIANCE"
-            issues_for_feature.append(f"varianza quasi-zero ({std_val:.2e})")
+            results['issues'].append({'index': i, 'name': feature_names[i], 'issue': f"varianza quasi-zero ({std_val:.2e})"})
         elif range_val < LOW_RANGE_THRESHOLD:
             status = "⚠️  LOW RANGE"
-            issues_for_feature.append(f"range ristretto ({range_val:.6f})")
+            results['issues'].append({'index': i, 'name': feature_names[i], 'issue': f"range ristretto ({range_val:.6f})"})
         elif near_zero_pct > NEAR_ZERO_PCT_THRESHOLD:
             status = "⚠️  NEAR CONSTANT"
-            issues_for_feature.append(f"{near_zero_pct:.1f}% quasi-zero")
+            results['issues'].append({'index': i, 'name': feature_names[i], 'issue': f"{near_zero_pct:.1f}% quasi-zero"})
 
-        if issues_for_feature:
-            results['issues'].append({
-                'index': i,
-                'name': FEATURE_NAMES[i],
-                'issues': issues_for_feature,
-            })
+        print(f"  [{i:2d}] {feature_names[i]:<22s} | {std_val:9.6f} | {range_val:10.6f} | {corr_steer:+9.4f} | {status}")
 
-        results['per_feature'][i] = {
-            'name': FEATURE_NAMES[i],
-            'std': float(std_val),
-            'range': float(range_val),
-            'corr_steer': float(corr_steer),
-        }
-
-        print(f"  [{i:2d}] {FEATURE_NAMES[i]:<22s} | {std_val:9.6f} | {range_val:10.6f} | {corr_steer:+9.4f} | {status}")
-
-    # Report finale
     if results['issues']:
         print(f"\n  ⚠️  Feature potenzialmente problematiche:")
         for issue in results['issues']:
-            print(f"     [{issue['index']:2d}] {issue['name']}: {', '.join(issue['issues'])}")
+            print(f"     [{issue['index']:2d}] {issue['name']}: {issue['issue']}")
     else:
         print(f"\n  ✅ Tutte le {n_features} feature hanno varianza, range e distribuzione adeguati.")
-        print(f"     Nessun sensore costante, statico o non informativo rilevato.")
 
-    # Nota su time e damage
-    print(f"\n  📝 NOTA: 'time' e 'damage' non sono presenti nel vettore di stato 30D.")
+    print(f"\n  📝 NOTA: 'time' e 'damage' non sono presenti nel vettore di stato.")
     print(f"     Sono filtrati a monte da flatten_state() durante la data collection.")
-    print(f"     Non è necessario alcun pruning per queste variabili.")
 
     return results
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  3. Adapter di Linearizzazione distFromStart
+#  3. Drop distFromStart + Ripristino da Backup
 # ──────────────────────────────────────────────────────────────────────
 
-def linearize_dist_from_start(dist_scaled: np.ndarray,
-                               track_length: float = TRACK_LENGTH) -> np.ndarray:
-    """Linearizza la feature distFromStart eliminando le discontinuità del simulatore.
+def restore_from_backup(backup_dir: str, laps_dir: str):
+    """Ripristina i file originali dal backup prima di applicare una nuova trasformazione.
 
-    Il sensore distFromStart di TORCS ha un comportamento discontinuo:
-      - Spawn pre-linea: valore alto (~3598m), cresce lentamente verso ~3608m
-      - Attraversamento start/finish: crolla istantaneamente a ~0
-      - Post-linea: cresce linearmente da 0 a ~3607m
+    Necessario quando una versione precedente del preprocessing ha modificato i file.
+    """
+    _assert_not_backup(laps_dir)  # laps_dir NON deve essere il backup
 
-    Questa funzione converte la serie in una metrica strettamente monotona,
-    continua e partente da 0, interpretando correttamente la distanza percorsa.
+    backup_laps = os.path.join(backup_dir, "laps")
+    backup_files = sorted(glob.glob(os.path.join(backup_laps, "lap_*.h5")))
 
-    Args:
-        dist_scaled: array 1D con distFromStart già diviso per 4000 (come nei .h5)
-        track_length: lunghezza del circuito in metri
+    if not backup_files:
+        raise FileNotFoundError(f"Nessun file di backup trovato in {backup_laps}")
+
+    print(f"  🔄 Ripristino {len(backup_files)} file dal backup...")
+
+    for src in backup_files:
+        dst = os.path.join(laps_dir, os.path.basename(src))
+        # Il backup è read-only, copiamo il contenuto
+        shutil.copy2(src, dst)
+        # Ripristina permessi di scrittura (il backup è read-only ma le copie devono essere scrivibili)
+        os.chmod(dst, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+
+    print(f"  ✅ Ripristino completato: {len(backup_files)} file ripristinati.")
+
+
+def drop_dist_from_start(laps_dir: str, dry_run: bool = False) -> tuple:
+    """Rimuove la colonna distFromStart (indice 29) da tutti i file .h5.
+
+    Riduce il vettore di stato da 30D a 29D.
 
     Returns:
-        Array 1D linearizzato e ri-normalizzato in [0, ~1]
+        (processed, skipped, errors)
     """
-    # Lavoriamo in metri per chiarezza
-    dist_m = dist_scaled * DIST_NORM_FACTOR
-
-    n = len(dist_m)
-    dist_linear = np.zeros(n, dtype=np.float64)
-
-    # ── Step 1: Identifica il punto di discontinuità (crossing della start/finish line)
-    diffs = np.diff(dist_m)
-    # La discontinuità principale è il salto negativo più grande (da ~3608 a ~0)
-    jump_idx = np.argmin(diffs)
-    jump_magnitude = abs(diffs[jump_idx])
-
-    # Verifica che sia una discontinuità reale (almeno 1000m di salto)
-    if jump_magnitude < 1000.0:
-        # Nessuna discontinuità significativa: la serie è già ragionevolmente lineare
-        # (potrebbe accadere se i dati sono già preprocessati)
-        dist_linear = dist_m - dist_m[0]
-        return (dist_linear / DIST_NORM_FACTOR).astype(np.float32)
-
-    # ── Step 2: Fase pre-linea (step 0 .. jump_idx)
-    # Lo spawn è a dist_m[0] ≈ 3598m. La linea è a dist ≈ track_length.
-    # La distanza percorsa dallo spawn alla linea è:
-    #   d_percorsa = (track_length - dist_m[0]) + crescita residua fino a jump_idx
-    # Ma più semplicemente: mappiamo ogni punto pre-linea come distanza dallo spawn:
-    #   dist_linear[i] = dist_m[i] - dist_m[0]  per i in [0, jump_idx]
-    # Questo dà 0 al punto di spawn e ~10m alla linea di partenza.
-
-    spawn_dist = dist_m[0]  # ≈3598m (posizione di spawn sulla pista)
-
-    for i in range(0, jump_idx + 1):
-        dist_linear[i] = dist_m[i] - spawn_dist
-
-    # Offset alla linea: la distanza cumulativa percorsa fino al crossing
-    offset_at_line = dist_linear[jump_idx]  # ≈10m
-
-    # ── Step 3: Fase post-linea (step jump_idx+1 .. end)
-    # Dopo il crossing, dist_m riparte da ~0 e cresce.
-    # La distanza cumulativa è: offset_at_line + dist_m[i]
-    for i in range(jump_idx + 1, n):
-        dist_linear[i] = offset_at_line + dist_m[i]
-
-    # ── Step 4: Enforce monotonia stretta (clamp micro-oscillazioni del simulatore)
-    # Il simulatore TORCS introduce rumore dell'ordine di ~3µm nella fase pre-linea.
-    # Running-max clamp: ogni valore deve essere >= il massimo precedente.
-    running_max = dist_linear[0]
-    for i in range(1, n):
-        if dist_linear[i] < running_max:
-            dist_linear[i] = running_max
-        else:
-            running_max = dist_linear[i]
-
-    # ── Step 5: Ri-normalizzazione
-    # Normalizziamo dividendo per la distanza totale percorsa, così il range è [0, ~1]
-    total_distance = dist_linear[-1]
-    if total_distance > 0:
-        dist_linear = dist_linear / total_distance
-
-    return dist_linear.astype(np.float32)
-
-
-def validate_linearization(dist_linear: np.ndarray, filename: str) -> bool:
-    """Valida che la serie linearizzata soddisfi i requisiti.
-
-    Verifica:
-      - Monotonia non-decrescente
-      - Continuità (nessun salto > soglia)
-      - Range approssimativo [0, 1]
-      - Assenza di NaN/Inf
-
-    Returns:
-        True se la validazione passa, False altrimenti
-    """
-    # NaN/Inf check
-    if np.any(np.isnan(dist_linear)):
-        print(f"  ❌ {filename}: NaN rilevati nella serie linearizzata")
-        return False
-    if np.any(np.isinf(dist_linear)):
-        print(f"  ❌ {filename}: Inf rilevati nella serie linearizzata")
-        return False
-
-    # Monotonia: tutti i diff devono essere >= 0 (con piccola tolleranza numerica)
-    diffs = np.diff(dist_linear.astype(np.float64))
-    n_negative = np.sum(diffs < -1e-6)
-    if n_negative > 0:
-        worst_drop = diffs.min()
-        worst_idx = np.argmin(diffs)
-        print(f"  ❌ {filename}: Monotonia violata! {n_negative} decrementi, "
-              f"peggiore: {worst_drop:.6f} all'indice {worst_idx}")
-        return False
-
-    # Continuità: nessun salto > 0.01 (in scala normalizzata)
-    max_jump = np.max(np.abs(diffs))
-    if max_jump > 0.01:
-        jump_idx = np.argmax(np.abs(diffs))
-        print(f"  ⚠️  {filename}: Salto di {max_jump:.6f} all'indice {jump_idx} "
-              f"(soglia: 0.01)")
-        # Questo è un warning, non un errore fatale
-
-    # Range
-    if abs(dist_linear[0]) > 0.01:
-        print(f"  ⚠️  {filename}: Valore iniziale = {dist_linear[0]:.6f} (atteso ~0.0)")
-    if abs(dist_linear[-1] - 1.0) > 0.15:
-        print(f"  ⚠️  {filename}: Valore finale = {dist_linear[-1]:.6f} (atteso ~1.0)")
-
-    return True
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  4. Pipeline Principale
-# ──────────────────────────────────────────────────────────────────────
-
-def process_dataset(laps_dir: str, project_root: str, dry_run: bool = False):
-    """Esegue l'intera pipeline di preprocessing.
-
-    Args:
-        laps_dir: directory contenente i file lap_*.h5
-        project_root: radice del progetto
-        dry_run: se True, analizza senza modificare i file
-    """
-    # Guard rail: verifica che non stiamo operando sul backup
     _assert_not_backup(laps_dir)
-
-    print(f"\n{'=' * 70}")
-    print(f"  🔧 PREPROCESSING DATASET — TORCS Path Following")
-    print(f"  Directory:  {laps_dir}")
-    print(f"  Modalità:   {'DRY-RUN (nessuna modifica)' if dry_run else 'ESECUZIONE'}")
-    print(f"  Timestamp:  {datetime.now().isoformat()}")
-    print(f"{'=' * 70}")
-
-    # ── Fase 1: Backup ──
-    print(f"\n  📦 FASE 1: BACKUP PROTETTO")
-    print(f"  {'─' * 60}")
-    backup_path = create_backup(laps_dir, project_root)
-
-    # ── Fase 2: Audit Feature ──
-    print(f"\n  📊 FASE 2: AUDIT FEATURE")
-    print(f"  {'─' * 60}")
-    audit_results = audit_features(laps_dir)
-
-    # ── Fase 3: Linearizzazione distFromStart ──
-    print(f"\n  🔄 FASE 3: LINEARIZZAZIONE distFromStart")
-    print(f"  {'─' * 60}")
 
     h5_files = sorted(glob.glob(os.path.join(laps_dir, "lap_*.h5")))
     processed = 0
@@ -436,63 +276,110 @@ def process_dataset(laps_dir: str, project_root: str, dry_run: bool = False):
 
     for filepath in h5_files:
         filename = os.path.basename(filepath)
-
-        # Guard rail esplicito
         _assert_not_backup(filepath)
 
-        with h5py.File(filepath, 'r') as h5f:
-            # Skip se già preprocessato
-            if h5f.attrs.get('preprocessing_version', None) == PREPROCESSING_VERSION:
+        try:
+            with h5py.File(filepath, 'r') as h5f:
+                # Skip se già processato con v2
+                pv = h5f.attrs.get('preprocessing_version', None)
+                if pv == PREPROCESSING_VERSION:
+                    skipped += 1
+                    continue
+
+                states = h5f['states'][:]
+                actions = h5f['actions'][:]
+                attrs = dict(h5f.attrs)
+
+            # Verifica che il vettore sia ancora 30D (non già troncato)
+            if states.shape[1] != 30:
+                print(f"  ⚠️  {filename}: dimensionalità inattesa ({states.shape[1]}D), skip")
                 skipped += 1
                 continue
 
-            states = h5f['states'][:]
-            actions = h5f['actions'][:]
-            # Preserva tutti gli attributi originali
-            attrs = dict(h5f.attrs)
+            # Drop colonna 29 (distFromStart)
+            states_29d = np.delete(states, DIST_FEATURE_IDX, axis=1)
 
-        # Estrai e linearizza distFromStart
-        dist_original = states[:, DIST_FEATURE_IDX].copy()
-        dist_linearized = linearize_dist_from_start(dist_original)
+            assert states_29d.shape[1] == 29, f"Shape dopo drop: {states_29d.shape}"
 
-        # Validazione
-        if not validate_linearization(dist_linearized, filename):
-            errors += 1
-            print(f"  ❌ {filename}: validazione fallita, file NON modificato")
-            continue
+            print(f"  ✅ {filename}: 30D → 29D (drop distFromStart[{DIST_FEATURE_IDX}]) | "
+                  f"{states.shape[0]} campioni")
 
-        # Report per questo file
-        dist_original_m = dist_original * DIST_NORM_FACTOR
-        dist_linear_m = dist_linearized * dist_linearized[-1] * DIST_NORM_FACTOR  # stima
+            if dry_run:
+                processed += 1
+                continue
 
-        diffs_orig = np.diff(dist_original_m)
-        jump_idx = np.argmin(diffs_orig)
+            # Scrivi file modificato
+            _assert_not_backup(filepath)
 
-        print(f"  ✅ {filename}: linearizzato | "
-              f"jump@{jump_idx} rimosso | "
-              f"range [{dist_linearized[0]:.4f}, {dist_linearized[-1]:.4f}] | "
-              f"monotono: {np.all(np.diff(dist_linearized) >= -1e-6)}")
+            with h5py.File(filepath, 'w') as h5f:
+                h5f.create_dataset('states', data=states_29d, compression="gzip")
+                h5f.create_dataset('actions', data=actions, compression="gzip")
+                for k, v in attrs.items():
+                    if k != 'preprocessing_version' and k != 'preprocessing_timestamp':
+                        h5f.attrs[k] = v
+                h5f.attrs['preprocessing_version'] = PREPROCESSING_VERSION
+                h5f.attrs['preprocessing_timestamp'] = datetime.now().isoformat()
+                h5f.attrs['dropped_features'] = "distFromStart (idx 29)"
 
-        if dry_run:
             processed += 1
-            continue
 
-        # Scrivi il file modificato (sovrascrivendo l'originale, il backup è protetto)
-        states[:, DIST_FEATURE_IDX] = dist_linearized
+        except Exception as e:
+            errors += 1
+            print(f"  ❌ {filename}: errore — {e}")
 
-        _assert_not_backup(filepath)  # Doppio check prima della scrittura
+    return processed, skipped, errors
 
-        with h5py.File(filepath, 'w') as h5f:
-            h5f.create_dataset('states', data=states, compression="gzip")
-            h5f.create_dataset('actions', data=actions, compression="gzip")
-            # Ripristina attributi originali
-            for k, v in attrs.items():
-                h5f.attrs[k] = v
-            # Aggiungi flag di preprocessing
-            h5f.attrs['preprocessing_version'] = PREPROCESSING_VERSION
-            h5f.attrs['preprocessing_timestamp'] = datetime.now().isoformat()
 
-        processed += 1
+# ──────────────────────────────────────────────────────────────────────
+#  4. Pipeline Principale
+# ──────────────────────────────────────────────────────────────────────
+
+def process_dataset(laps_dir: str, project_root: str, dry_run: bool = False):
+    """Esegue l'intera pipeline di preprocessing."""
+    _assert_not_backup(laps_dir)
+
+    print(f"\n{'=' * 70}")
+    print(f"  🔧 PREPROCESSING DATASET v2 — TORCS Path Following")
+    print(f"  Directory:  {laps_dir}")
+    print(f"  Modalità:   {'DRY-RUN (nessuna modifica)' if dry_run else 'ESECUZIONE'}")
+    print(f"  Operazione: Drop distFromStart (30D → 29D)")
+    print(f"  Timestamp:  {datetime.now().isoformat()}")
+    print(f"{'=' * 70}")
+
+    # ── Fase 1: Verifica/Crea Backup ──
+    print(f"\n  📦 FASE 1: BACKUP PROTETTO")
+    print(f"  {'─' * 60}")
+    backup_path = create_backup(laps_dir, project_root)
+
+    # ── Fase 2: Ripristino da Backup (se i file sono stati modificati da v1) ──
+    # Controlla se i file correnti sono stati toccati da una versione precedente
+    sample_file = sorted(glob.glob(os.path.join(laps_dir, "lap_*.h5")))[0]
+    with h5py.File(sample_file, 'r') as h5f:
+        current_dim = h5f['states'].shape[1]
+        current_version = h5f.attrs.get('preprocessing_version', None)
+
+    if current_version is not None and current_version != PREPROCESSING_VERSION:
+        print(f"\n  🔄 FASE 2: RIPRISTINO DA BACKUP")
+        print(f"  {'─' * 60}")
+        print(f"  Rilevata versione preprocessing precedente: v{current_version}")
+        print(f"  Ripristino dati originali dal backup prima di applicare v{PREPROCESSING_VERSION}...")
+        if not dry_run:
+            restore_from_backup(backup_path, laps_dir)
+    elif current_dim == 29:
+        print(f"\n  ℹ️  I file sono già a 29D — verifica versione...")
+
+    # ── Fase 3: Audit Feature (sui dati originali/ripristinati) ──
+    print(f"\n  📊 FASE 3: AUDIT FEATURE")
+    print(f"  {'─' * 60}")
+    audit_results = audit_features(laps_dir)
+
+    # ── Fase 4: Drop distFromStart ──
+    print(f"\n  ✂️  FASE 4: DROP distFromStart (30D → 29D)")
+    print(f"  {'─' * 60}")
+    print(f"  Motivazione: correlazione con azioni ≈ 0, causa train-test mismatch")
+    print(f"  La rete deve guidare solo con sensori + velocità, non con la posizione.\n")
+
+    processed, skipped, errors = drop_dist_from_start(laps_dir, dry_run=dry_run)
 
     # ── Report Finale ──
     print(f"\n  {'─' * 60}")
@@ -507,12 +394,10 @@ def process_dataset(laps_dir: str, project_root: str, dry_run: bool = False):
         print(f"     Esegui senza --dry-run per applicare le trasformazioni.")
 
     if errors > 0:
-        print(f"\n  ⚠️  Attenzione: {errors} file hanno fallito la validazione.")
-        print(f"     I file con errori NON sono stati modificati.")
-        print(f"     Controlla i log sopra per i dettagli.")
+        print(f"\n  ⚠️  Attenzione: {errors} file hanno fallito.")
 
     print(f"\n{'=' * 70}")
-    print(f"  Preprocessing completato.")
+    print(f"  Preprocessing v{PREPROCESSING_VERSION} completato.")
     print(f"{'=' * 70}\n")
 
     return processed, skipped, errors

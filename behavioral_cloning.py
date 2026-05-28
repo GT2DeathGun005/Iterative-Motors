@@ -15,7 +15,7 @@ NOTA: I dati HDF5 sono GIÀ normalizzati dal data_collection.flatten_state():
   - speedX/Y/Z: /50 (via gym_torcs.make_observaton, default_speed=50)
   - wheelSpinVel[4]: /100 (via data_collection.flatten_state)
   - rpm: /10000 (via data_collection.flatten_state)
-  - distFromStart: /4000 (via data_collection.flatten_state)
+  - distFromStart: RIMOSSA (correlazione ~0 con azioni, causa train-test mismatch)
   NON ri-normalizzare in TorcsHDF5Dataset!
 
 Mapping delle azioni (diretto, senza ri-mappatura):
@@ -71,7 +71,8 @@ class TorcsHDF5Dataset(Dataset):
             # I dati in HDF5 sono GIA' normalizzati da data_collection.flatten_state():
             #   track[1:20] → /200 (via gym_torcs.make_observaton)
             #   speedX/Y/Z[21:24] → /50 (via gym_torcs.make_observaton)
-            #   wheelSpinVel[24:28] → /100, rpm[28] → /10000, dist[29] → /4000
+            #   wheelSpinVel[24:28] → /100, rpm[28] → /10000
+            #   distFromStart: RIMOSSA (era indice 29)
 
             # ── Sanity check numerici ──
             if np.any(np.isnan(states_np)):
@@ -130,13 +131,16 @@ def load_dataset(path: str) -> Dataset:
         return ds, len(ds)
 class PolicyNetwork(nn.Module):
     """Rete Actor per Behavioral Cloning con architettura Multi-Head:
-    stato (30D) → testa continua (steer, accel, brake) & testa discreta (gear).
+    stato (29D) → testa continua (steer, accel, brake) & testa discreta (gear).
 
     Il backbone estrae feature condivise. Le due teste separate evitano
     le oscillazioni e i ritardi tipici della regressione sul cambio marcia.
+
+    NOTA: distFromStart è stata rimossa dal vettore di stato (30D → 29D)
+    perché ha correlazione ~0 con le azioni e causa train-test mismatch.
     """
 
-    def __init__(self, state_dim: int = 30, hidden_size: int = 512):
+    def __init__(self, state_dim: int = 29, hidden_size: int = 512):
         super(PolicyNetwork, self).__init__()
 
         self.backbone = nn.Sequential(

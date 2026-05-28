@@ -35,7 +35,7 @@ class PolicyNetwork(nn.Module):
     le oscillazioni e i ritardi tipici della regressione sul cambio marcia.
     """
 
-    def __init__(self, state_dim: int = 30, hidden_size: int = 512):
+    def __init__(self, state_dim: int = 29, hidden_size: int = 512):
         super(PolicyNetwork, self).__init__()
 
         self.backbone = nn.Sequential(
@@ -83,11 +83,14 @@ class PolicyNetwork(nn.Module):
 # ──────────────────────────────────────────────────────────────────────
 
 def flatten_state(state_dict: dict) -> np.ndarray:
-    """Appiattisce osservazione TORCS → vettore 30D.
+    """Appiattisce osservazione TORCS → vettore 29D.
 
     NOTA: Le osservazioni provengono da gym_torcs.make_observaton() che già
     normalizza track/200 e speed/default_speed(50). NON ri-dividere qui.
     Deve essere identica a data_collection.flatten_state() per coerenza.
+
+    distFromStart è stata rimossa: correlazione ~0 con le azioni e causa
+    train-test mismatch per le discontinuità del simulatore al traguardo.
     """
     def _s(key, default=0.0):
         v = state_dict.get(key, default)
@@ -111,10 +114,9 @@ def flatten_state(state_dict: dict) -> np.ndarray:
             [_s('speedZ')],               # già /50 da make_observaton
             _a('wheelSpinVel', 4) / 100.0,
             [_s('rpm') / 10000.0],
-            [_s('distFromStart') / 4000.0],
         ]).astype(np.float32)
     except Exception:
-        return np.zeros(30, dtype=np.float32)
+        return np.zeros(29, dtype=np.float32)
 
 
 def denormalize_action(cont_action: np.ndarray, gear: int) -> np.ndarray:
@@ -274,7 +276,9 @@ def main():
                 next_state = flatten_state(next_obs)
 
                 # Salva telemetria step
-                dist_m = float(next_state[29] * 4000.0)
+                dist_raw = next_obs.get('distFromStart', 0.0)
+                if isinstance(dist_raw, np.ndarray): dist_raw = float(dist_raw.flat[0])
+                dist_m = dist_raw
                 spd_kmh = float(next_state[21] * 50.0)
                 track_pos = float(np.array(next_obs.get('trackPos', 0.0)).flat[0])
                 angle = float(np.array(next_obs.get('angle', 0.0)).flat[0])

@@ -208,10 +208,13 @@ class KeyboardController:
 # ──────────────────────────────────────────────────────────────────────
 
 def flatten_state(state_dict: dict) -> np.ndarray:
-    """Appiattisce il dizionario di osservazione TORCS in un vettore 1D (30D).
+    """Appiattisce il dizionario di osservazione TORCS in un vettore 1D (29D).
 
     Ordine: [angle(1), track(19), trackPos(1), speedX(1), speedY(1), speedZ(1),
              wheelSpinVel(4)/100, rpm(1)/10000]
+
+    NOTA: distFromStart è stata rimossa (non informativa per il path following
+    e causa train-test mismatch per le discontinuità del simulatore).
 
     Usa .get() con default per evitare crash su chiavi mancanti.
     """
@@ -244,12 +247,11 @@ def flatten_state(state_dict: dict) -> np.ndarray:
             np.array([_scalar('speedZ')]),
             _array('wheelSpinVel', 4) / 100.0,
             np.array([_scalar('rpm') / 10000.0]),
-            np.array([_scalar('distFromStart') / 4000.0]),
         ])
         return state_vec.astype(np.float32)
     except Exception as e:
-        print(f"  [WARN] Errore in flatten_state: {e}. Ritorno vettore zero (30D).")
-        return np.zeros(30, dtype=np.float32)
+        print(f"  [WARN] Errore in flatten_state: {e}. Ritorno vettore zero (29D).")
+        return np.zeros(29, dtype=np.float32)
 
 
 # ──────────────────────────────────────────────────────────────────────
