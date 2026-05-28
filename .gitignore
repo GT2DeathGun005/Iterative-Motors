@@ -19,3 +19,5 @@ telemetry/**
 
 # Forza Git a tracciare i file .gitkeep al loro interno
 !telemetry/**/.gitkeep
+
+dataset_backup/**
