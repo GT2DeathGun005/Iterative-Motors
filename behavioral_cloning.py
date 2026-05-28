@@ -44,18 +44,23 @@ import math
 class TorcsHDF5Dataset(Dataset):
     """Dataset da un singolo file HDF5 con gruppi 'states' e 'actions'.
 
+    Esegue lo stacking temporale di 3 frame:
+      - 'static': passo costante k=6 (0.24s totali)
+      - 'dynamic': passo k = clamp(round(300 / speedX), 2, 25) per mantenere Δs ≈ 12 metri
+
     Esegue sanity check all'inizializzazione:
       - Verifica presenza dei gruppi richiesti
       - Verifica assenza di NaN e Inf
       - Clamp del gear a [0, 6] (esclude retromarcia)
     """
 
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, stride_type: str = "static"):
         super().__init__()
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File dataset non trovato: {file_path}")
 
         self.file_path = file_path
+        self.stride_type = stride_type
 
         with h5py.File(self.file_path, 'r') as h5f:
             # ── Verifica gruppi ──
@@ -66,13 +71,6 @@ class TorcsHDF5Dataset(Dataset):
 
             states_np = h5f['states'][:]
             actions_np = h5f['actions'][:]
-
-            # ── NOTA: NESSUNA ri-normalizzazione ──
-            # I dati in HDF5 sono GIA' normalizzati da data_collection.flatten_state():
-            #   track[1:20] → /200 (via gym_torcs.make_observaton)
-            #   speedX/Y/Z[21:24] → /50 (via gym_torcs.make_observaton)
-            #   wheelSpinVel[24:28] → /100, rpm[28] → /10000
-            #   distFromStart: RIMOSSA (era indice 29)
 
             # ── Sanity check numerici ──
             if np.any(np.isnan(states_np)):
@@ -96,10 +94,25 @@ class TorcsHDF5Dataset(Dataset):
         return self.length
 
     def __getitem__(self, idx: int):
-        return self.states[idx], self.actions[idx]
+        if self.stride_type == "static":
+            k = 6
+        else:
+            # Dynamic stride: C / speedX, clamped. speedX è all'indice 21 (normalizzato /50)
+            speed_x = float(self.states[idx, 21].item()) * 50.0
+            k = int(np.clip(np.round(300.0 / max(speed_x, 1.0)), 2, 25))
+
+        idx_t6 = max(0, idx - k)
+        idx_t12 = max(0, idx - 2 * k)
+
+        stacked = torch.cat([
+            self.states[idx_t12],
+            self.states[idx_t6],
+            self.states[idx]
+        ])
+        return stacked, self.actions[idx]
 
 
-def load_dataset(path: str) -> Dataset:
+def load_dataset(path: str, stride_type: str = "static") -> Dataset:
     """Carica e aggrega l'intero manifold di giri per migliorare la robustezza."""
     if os.path.isdir(path):
         h5_files = sorted(glob.glob(os.path.join(path, "**/lap_*.h5"), recursive=True))
@@ -115,7 +128,7 @@ def load_dataset(path: str) -> Dataset:
         
         for f in h5_files:
             try:
-                ds = TorcsHDF5Dataset(f)
+                ds = TorcsHDF5Dataset(f, stride_type=stride_type)
                 datasets.append(ds)
                 total_samples += len(ds)
             except Exception as e:
@@ -126,7 +139,7 @@ def load_dataset(path: str) -> Dataset:
         print(f"  📚 Dataset caricato: {len(datasets)} giri, {total_samples} campioni totali.")
         return ConcatDataset(datasets), total_samples
     else:
-        ds = TorcsHDF5Dataset(path)
+        ds = TorcsHDF5Dataset(path, stride_type=stride_type)
         print(f"  Caricato {os.path.basename(path)}: {len(ds)} campioni")
         return ds, len(ds)
 class PolicyNetwork(nn.Module):
@@ -140,7 +153,7 @@ class PolicyNetwork(nn.Module):
     perché ha correlazione ~0 con le azioni e causa train-test mismatch.
     """
 
-    def __init__(self, state_dim: int = 29, hidden_size: int = 512):
+    def __init__(self, state_dim: int = 87, hidden_size: int = 512):
         super(PolicyNetwork, self).__init__()
 
         self.backbone = nn.Sequential(
@@ -276,44 +289,47 @@ class BehaviorCloningTrainer:
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
-            # ── Data Augmentation: Bojarski-Style Synthetic Recovery (NVIDIA Autopilot) ──
-            # Insegna al modello come recuperare quando si sposta lateralmente (covariate shift).
-            # Perturbiamo coerentemente trackPos, track sensors e correggiamo il target di sterzo.
-            # Riduciamo leggermente anche il target di accel se fuori asse per insegnare a parzializzare.
-            
+            # Reshape temporaneo per applicare l'augmentation su ciascuno dei 3 frame in modo coerente
+            batch_size = states.size(0)
+            states = states.view(batch_size, 3, 29)
+
+            # ── Data Augmentation: Bojarski-Style Synthetic Recovery ──
             # Genera offset laterale in trackPos (più leggero: ±0.15)
-            delta_pos = torch.randn(states.size(0), device=states.device) * 0.08
+            delta_pos = torch.randn(batch_size, device=states.device) * 0.08
             delta_pos = torch.clamp(delta_pos, -0.15, 0.15)
-            
-            # Estrarre angle (indice 0) e sensori di pista grezzi
-            angle = states[:, 0]
-            L_0 = states[:, 1] * 200.0   # Sensore -45 gradi
-            L_18 = states[:, 19] * 200.0  # Sensore 45 gradi
-            
-            # Calcolo geometrico dinamico della semi-larghezza della pista
-            W_L = L_18 * torch.sin(angle + 0.785398) # 45 gradi = 0.785398 rad
-            W_R = L_0 * torch.sin(0.785398 - angle)
-            W_half = torch.clamp((W_L + W_R) / 2.0, 4.0, 10.0) # clamping tra 4m e 10m
-            
-            # Spostamento laterale fisico in metri (scalato del 50% per correzione più leggera)
-            dy = delta_pos * W_half * 0.5
-            
-            # 1. Perturbazione trackPos (indice 20)
-            states[:, 20] = states[:, 20] + delta_pos
-            
-            # 2. Perturbazione geometricamente coerente dei 19 sensori track (indici 1:20)
-            alpha = torch.tensor([
-                -45.0, -19.0, -12.0, -7.0, -4.0, -2.5, -1.7, -1.0, -0.5, 0.0, 
-                0.5, 1.0, 1.7, 2.5, 4.0, 7.0, 12.0, 19.0, 45.0
-            ], device=states.device) * 3.14159265 / 180.0
-            
-            # Angolo assoluto di ciascun raggio rispetto alla linea mediana
-            beta = angle.unsqueeze(1) + alpha.unsqueeze(0)
-            
-            # Perturbazione lineare sui 19 raggi
-            dL = - dy.unsqueeze(1) * torch.sin(beta)
-            states[:, 1:20] = torch.clamp(states[:, 1:20] + dL / 200.0, 0.0, 1.0)
-            
+
+            for f_idx in range(3):
+                frame_states = states[:, f_idx, :]
+                
+                # Estrarre angle (indice 0) e sensori di pista grezzi
+                angle = frame_states[:, 0]
+                L_0 = frame_states[:, 1] * 200.0   # Sensore -45 gradi
+                L_18 = frame_states[:, 19] * 200.0  # Sensore 45 gradi
+                
+                # Calcolo geometrico dinamico della semi-larghezza della pista
+                W_L = L_18 * torch.sin(angle + 0.785398) # 45 gradi = 0.785398 rad
+                W_R = L_0 * torch.sin(0.785398 - angle)
+                W_half = torch.clamp((W_L + W_R) / 2.0, 4.0, 10.0) # clamping tra 4m e 10m
+                
+                # Spostamento laterale fisico in metri (scalato del 50% per correzione più leggera)
+                dy = delta_pos * W_half * 0.5
+                
+                # 1. Perturbazione trackPos (indice 20)
+                frame_states[:, 20] = frame_states[:, 20] + delta_pos
+                
+                # 2. Perturbazione geometricamente coerente dei 19 sensori track (indici 1:20)
+                alpha = torch.tensor([
+                    -45.0, -19.0, -12.0, -7.0, -4.0, -2.5, -1.7, -1.0, -0.5, 0.0, 
+                    0.5, 1.0, 1.7, 2.5, 4.0, 7.0, 12.0, 19.0, 45.0
+                ], device=states.device) * 3.14159265 / 180.0
+                
+                # Angolo assoluto di ciascun raggio rispetto alla linea mediana
+                beta = angle.unsqueeze(1) + alpha.unsqueeze(0)
+                
+                # Perturbazione lineare sui 19 raggi
+                dL = - dy.unsqueeze(1) * torch.sin(beta)
+                frame_states[:, 1:20] = torch.clamp(frame_states[:, 1:20] + dL / 200.0, 0.0, 1.0)
+                
             # 3. Correzione proporzionale target steer (indice 0) (più leggera: 0.12)
             targets[:, 0] = targets[:, 0] - 0.12 * delta_pos
             targets[:, 0] = torch.clamp(targets[:, 0], -1.0, 1.0)
@@ -321,6 +337,38 @@ class BehaviorCloningTrainer:
             # 4. Correzione parzializzazione throttle (indice 1) (più leggera: 15%)
             targets[:, 1] = targets[:, 1] * (1.0 - 0.15 * delta_pos.abs())
             targets[:, 1] = torch.clamp(targets[:, 1], 0.0, 1.0)
+
+            # ── Data Augmentation: Speed Perturbation Augmentation ──
+            # Se la velocità attuale (speedX, indice 21) del frame più recente (frame 2) è significativa (> 100 km/h)
+            # e c'è una curva (sterzo target significativo o sensore frontale decrescente),
+            # aumentiamo fittiziamente la velocità in tutti e 3 i frame e aumentiamo il target del freno.
+            if torch.rand(1).item() < 0.4:
+                # Estraiamo speedX (indice 21) dall'ultimo frame (de-normalizzato)
+                speedX_latest = states[:, 2, 21] * 50.0
+                steer_target_abs = targets[:, 0].abs()
+                sensor_front_latest = states[:, 2, 10]  # track_s9 (indice 10, cioè 0 gradi)
+
+                is_speed_critical = (speedX_latest > 100.0) & ((steer_target_abs > 0.15) | (sensor_front_latest < 0.5))
+
+                if is_speed_critical.any():
+                    # Genera un incremento del 10% - 30% per i campioni critici
+                    speed_factor = 0.10 + 0.20 * torch.rand(batch_size, device=states.device)
+                    speed_factor = speed_factor * is_speed_critical.float()
+
+                    # 1. Aumentiamo speedX in tutti e 3 i frame
+                    for f_idx in range(3):
+                        states[:, f_idx, 21] = states[:, f_idx, 21] * (1.0 + speed_factor)
+
+                    # 2. Riduciamo l'accelerazione target
+                    targets[:, 1] = targets[:, 1] * (1.0 - 0.7 * speed_factor)
+                    targets[:, 1] = torch.clamp(targets[:, 1], 0.0, 1.0)
+
+                    # 3. Aumentiamo il freno target (insegniamo a frenare correttivamente)
+                    targets[:, 2] = targets[:, 2] + 0.8 * speed_factor
+                    targets[:, 2] = torch.clamp(targets[:, 2], 0.0, 1.0)
+
+            # Ri-appiattiamo in 87D prima di passarlo alla rete
+            states = states.view(batch_size, 87)
 
             self.optimizer.zero_grad()
             pred_cont, pred_gear = self.model(states)
@@ -406,6 +454,10 @@ def main():
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument(
+        "--stride_type", type=str, default="static", choices=["static", "dynamic"],
+        help="Tipo di stride temporale: static (passo k=6) o dynamic (passo v-dipendente)"
+    )
+    parser.add_argument(
         "--output", type=str, default="train_set/checkpoints/bc_policy.pth",
         help="Path di output per i pesi del modello"
     )
@@ -419,11 +471,12 @@ def main():
     if device == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    print(f"  Stride Type: {args.stride_type}")
     print(f"{'=' * 64}\n")
 
     # ── Caricamento dataset ──
     print("  Caricamento dataset...")
-    dataset, total_samples = load_dataset(args.dataset)
+    dataset, total_samples = load_dataset(args.dataset, stride_type=args.stride_type)
 
     # ── Rileva dimensioni ──
     sample_state, sample_action = dataset[0]

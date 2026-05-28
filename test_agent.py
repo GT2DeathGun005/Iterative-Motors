@@ -17,6 +17,7 @@ import csv
 import numpy as np
 import torch
 import torch.nn as nn
+from collections import deque
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'gym_torcs')))
 
@@ -35,7 +36,7 @@ class PolicyNetwork(nn.Module):
     le oscillazioni e i ritardi tipici della regressione sul cambio marcia.
     """
 
-    def __init__(self, state_dim: int = 29, hidden_size: int = 512):
+    def __init__(self, state_dim: int = 87, hidden_size: int = 512):
         super(PolicyNetwork, self).__init__()
 
         self.backbone = nn.Sequential(
@@ -201,6 +202,10 @@ def main():
                         help="Numero di giri da completare")
     parser.add_argument("--max_steps", type=int, default=15000,
                         help="Max step per giro (timeout)")
+    parser.add_argument(
+        "--stride_type", type=str, default="static", choices=["static", "dynamic"],
+        help="Tipo di stride temporale: static (passo k=6) o dynamic (passo v-dipendente)"
+    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -209,6 +214,7 @@ def main():
     print(f"  🏁 TEST AGENTE AUTONOMO (BC) — TORCS")
     print(f"  Device: {device}")
     print(f"  Pesi: {args.weights}")
+    print(f"  Stride Type: {args.stride_type}")
     print(f"  🎯 Modalità: DETERMINISTICA (Zero Noise)")
     print(f"{'=' * 64}\n")
 
@@ -241,7 +247,12 @@ def main():
             
             # Reset ambiente con relaunch forzato ad ogni tentativo per garantire uno stato fisico iniziale pulito ed identico
             obs = env.reset(relaunch=True)
-            state = flatten_state(obs)
+            initial_state = flatten_state(obs)
+
+            # Inizializza buffer storico per State Stacking (max 51 elementi per coprire k_max=25, i.e. 2*k_max=50)
+            state_buffer = deque(maxlen=51)
+            for _ in range(51):
+                state_buffer.append(initial_state)
 
             # Lap tracking
             raw = env.client.S.d
@@ -256,9 +267,25 @@ def main():
             print(f"  🏁 Tentativo #{total_attempts} (giri completati: {len(lap_times)}/{args.laps})")
 
             for step in range(1, args.max_steps + 1):
+                # Determina il passo temporale k
+                if args.stride_type == "static":
+                    k = 6
+                else:
+                    # Dynamic stride: clamp(round(300 / speedX), 2, 25)
+                    # speedX è all'indice 21 dell'ultimo stato (normalizzato /50)
+                    speed_x = float(state_buffer[-1][21]) * 50.0
+                    k = int(np.clip(np.round(300.0 / max(speed_x, 1.0)), 2, 25))
+
+                # Costruisce il vettore di stato 87D concatenando t-2k, t-k, t
+                stacked_state = np.concatenate([
+                    state_buffer[-(1 + 2 * k)],
+                    state_buffer[-(1 + k)],
+                    state_buffer[-1]
+                ])
+
                 # ── Inferenza DETERMINISTICA (Pure BC, sterzata/acceleratore/freno + marcia dal modello) ──
                 with torch.no_grad():
-                    state_t = torch.FloatTensor(state).to(device).unsqueeze(0)
+                    state_t = torch.FloatTensor(stacked_state).to(device).unsqueeze(0)
                     pred_cont, gear_logits = model(state_t)
                     cont_action = pred_cont.cpu().numpy()[0]          # [steer, accel, brake]
                     gear = int(gear_logits.argmax(dim=1).item())
@@ -316,7 +343,7 @@ def main():
                     lap_time = current_last_lap
                     break
 
-                state = next_state
+                state_buffer.append(next_state)
                 obs = next_obs
                 if env_done: break
 
