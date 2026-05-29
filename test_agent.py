@@ -295,7 +295,6 @@ def main():
             telemetry_data = []
 
             # Stato per i filtri di stabilizzazione runtime
-            prev_steer = 0.0           # EMA steering smoother
             current_gear = 1           # Gear hysteresis: marcia corrente
             gear_counter = 0           # Gear hysteresis: contatore conferma
             gear_candidate = 1         # Gear hysteresis: candidato in attesa
@@ -318,24 +317,20 @@ def main():
                     cont_action = pred_cont.cpu().numpy()[0]          # [steer, accel, brake]
                     raw_gear = int(gear_logits.argmax(dim=1).item())
 
-                # ── Gear Hysteresis Filter (neurale + vincolo sequenziale ±1 + conferma 3 step) ──
-                current_gear, gear_counter, gear_candidate = apply_gear_hysteresis(
-                    raw_gear, current_gear, gear_counter, gear_candidate, confirm_steps=3
-                )
-
-                # ── EMA Steering Smoother (alpha=0.4: 40% frame corrente, 60% inerzia) ──
-                alpha = 0.4
-                cont_action[0] = alpha * cont_action[0] + (1.0 - alpha) * prev_steer
-                prev_steer = cont_action[0]
+                # ── Gear Filter (solo vincolo sequenziale ±1, nessuna latenza) ──
+                predicted_gear = raw_gear
+                if predicted_gear > current_gear + 1:
+                    predicted_gear = current_gear + 1
+                elif predicted_gear < current_gear - 1:
+                    predicted_gear = current_gear - 1
+                current_gear = max(1, predicted_gear)
 
                 # ── Mutual exclusion accel/brake (come l'esperto umano) ──
                 if cont_action[2] > 0.05:
                     cont_action[1] = 0.0  # Se freno, niente gas
 
-                # ── Step nell'ambiente (azione pura dal modello + TCS + ESP) ──
+                # ── Step nell'ambiente (azione pura dal modello, zero filtri artificiali) ──
                 env_action = denormalize_action(cont_action, current_gear)
-                env_action = apply_tcs(env_action, obs)
-                env_action = apply_esp(env_action, obs, step)
                 next_obs, _, env_done, _ = env.step(env_action)
                 next_state = flatten_state(next_obs)
 

@@ -33,14 +33,14 @@ class TorcsEnv:
 
         ##print("launch torcs")
         os.system('pkill -9 -f torcs')
-        time.sleep(0.5)
+        time.sleep(1.5)
         if self.vision is True:
             os.system('torcs -nofuel -nodamage -vision > /dev/null 2>&1 &')
         else:
             os.system('torcs -nofuel -nodamage > /dev/null 2>&1 &')
-        time.sleep(0.5)
+        time.sleep(1.5)
         os.system(f'sh {_AUTOSTART_SH}')
-        time.sleep(0.5)
+        time.sleep(1.0)
 
         """
         # Modify here if you use multiple tracks in the environment

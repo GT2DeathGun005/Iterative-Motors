@@ -147,9 +147,6 @@ python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 1
 | Sistema | Descrizione | Parametri Chiave |
 |---------|-------------|------------------|
 | **Gear Hysteresis Filter** | La predizione neurale della marcia passa per un filtro di isteresi che impone due vincoli fisici: (1) vincolo sequenziale ±1 (impedisce salti come G1→G4), (2) conferma temporale di 3 step consecutivi prima di adottare un cambio. Questo elimina le oscillazioni ad alta frequenza mantenendo la marcia 100% neurale. | `confirm_steps=3`, `±1 sequential` |
-| **EMA Steering Smoother** | Filtro a media mobile esponenziale (EMA) sullo sterzo predetto dalla rete. Elimina le micro-oscillazioni frame-to-frame che accumulano errore laterale, senza introdurre latenza significativa. | `α=0.4` (40% frame corrente, 60% inerzia) |
-| **Active Safety Envelope (ESP)** | Modulo di sicurezza a runtime con profilo quadratico che interviene a partire da `|trackPos| > 0.95`. Il gain cresce con il quadrato dell'eccesso, rendendo l'intervento dolce al centro e decisivo al limite. Sopra `|trackPos| > 1.10` aggiunge parzializzazione del gas e frenata stabilizzante. | Soglia: `0.95`, Gain base: `0.40`, Frenata max: `0.15` |
-| **Traction Control System (TCS)** | Riduce l'acceleratore quando lo slip tra ruote posteriori e anteriori supera la soglia, prevenendo sovrasterzo da trazione. | `slip_threshold=5.0` |
 
 ### Script di Supporto
 
@@ -288,8 +285,7 @@ TORCS non possiede un sistema ABS attivo per impostazione predefinita sulla vett
 
 **Soluzioni Applicate (Runtime-Only — nessuna modifica al training):**
 1. **Gear Hysteresis Filter**: Aggiunto filtro di isteresi sulla predizione neurale del gear con vincolo sequenziale ±1 (impedisce salti G1→G4) e conferma temporale di 3 step consecutivi. La marcia resta 100% neurale, ma fisicamente plausibile.
-2. **EMA Steering Smoother**: Filtro a media mobile esponenziale ($\alpha=0.4$) sullo sterzo predetto dalla rete. Elimina le oscillazioni ad alta frequenza mantenendo la reattività in curva.
-3. **ESP Progressivo Quadratico**: Soglia abbassata da 1.15 a **0.95**, gain base aumentato da 0.15 a **0.40** con profilo quadratico (`gain * excess * (1 + 2*excess)`). Frenata stabilizzante attiva sopra `|tp| > 1.10` con max 0.15 (era 0.05). L'ESP ora interviene ~20 step prima e con forza proporzionale al pericolo.
+2. **Pure Neural Control**: Rimosso qualsiasi filtro artificiale sullo sterzo, ESP e TCS. Il modello guida in purezza (Direct Control) per massimizzare la fedeltà (Behavioral Cloning) ai dati originali. Rimane attivo solo il filtro antidisturbo neurale sulle marce.
 
 ---
 
