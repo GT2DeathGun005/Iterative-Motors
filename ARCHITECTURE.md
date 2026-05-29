@@ -20,17 +20,17 @@ Il Critic ha il compito di stimare il valore (Q-value) della coppia (Stato, Azio
 ## 3. Parametri SAC e Il Sistema di Reward (Anti-Hacking)
 Il sistema di ricompensa (Reward Function) è il cuore dell'apprendimento. È stato progettato meticolosamente per evitare il *"Reward Hacking"* (andare troppo piano o fare zig-zag) e per mantenere i gradienti stabili.
 
-### A. Reward per Singolo Step (Dense Reward)
+### A. Reward per Singolo Step (Dense Reward & Soft Shaping)
 A ogni istante `t`, l'agente riceve una ricompensa così calcolata:
-`Reward = Progress + Time_Penalty + Steer_Smoothness`
+`Reward = (Progress * 1.5) + Pos_Penalty - Steer_Smoothness`
 
-- **Progress = (speedX / 50.0) * cos(angle)**:
-  - Incoraggia la velocità (`speedX`): 50 m/s (180 km/h) generano un valore base di `+1.0`.
+- **Progress = (speedX / 50.0) * cos(angle) * 1.5**:
+  - Incoraggia la velocità (`speedX`): scalato per compensare la presenza continua della penalità di posizione.
   - Penalizza le sbandate (`cos(angle)`): Se la macchina non è perfettamente allineata all'asse della pista, il coseno (es. `cos(60°) = 0.5`) taglia drasticamente il punteggio.
-- **Time Penalty = -0.1**: 
-  - Una costante negativa applicata ad ogni step. Costringe l'agente a correre: se la velocità scende sotto i 5 m/s (18 km/h), il `Progress` diventa inferiore a `0.1` e il reward totale per quello step diventa **negativo**. Questo impedisce all'agente di rallentare appositamente per sopravvivere più a lungo in sicurezza.
-- **Steer Smoothness = -0.1 * abs(steer - last_steer)**:
-  - Penalizza le variazioni brusche di sterzo, impedendo comportamenti a "zig-zag".
+- **Pos_Penalty = -1.0 * (trackPos ** 2)**: 
+  - **Soft Constrained**: Una penalità quadratica sulla distanza dal centro. Quando l'auto è al centro (`trackPos ~ 0.1`), la penalità è irrisoria (`-0.01`), fungendo da "deadzone" naturale per le lievi sbandate apprese dal BC. Man mano che l'auto scivola verso l'erba (`trackPos = 0.8`), la penalità cresce esponenzialmente (`-0.64`), fungendo da "muro repulsivo" molto prima del crash. Questo previene il *Reward Hacking* dove l'agente preferiva sbattere piuttosto che sterzare.
+- **Steer Smoothness = -0.05 * abs(steer - last_steer)**:
+  - Penalizza le variazioni brusche di sterzo, impedendo comportamenti a "zig-zag". Il peso ridotto (`0.05`) incoraggia l'agente a usare lo sterzo per tornare verso il centro della pista senza temere eccessive perdite di punti.
 
 ### B. Penalità Terminali (Crash e Fuoripista)
 Se l'auto esce di pista (`|trackPos| > 1.5`), si schianta, o va in stallo, l'episodio termina (`done=True`) e riceve un **`-10.0`**.

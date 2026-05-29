@@ -140,11 +140,14 @@ class TorcsEnv:
         if not hasattr(self, 'last_steer'):
             self.last_steer = 0.0
             
-        steer_smoothness = -0.1 * abs(this_action['steer'] - self.last_steer)
+        steer_change = this_action['steer'] - self.last_steer
         self.last_steer = this_action['steer']
 
-        time_penalty = -0.1
-        reward = progress + time_penalty + steer_smoothness
+        # Penalità quadratica per mantenere il centro (deadzone naturale per il BC)
+        pos_penalty = -1.0 * (obs['trackPos'] ** 2)
+
+        # Reward finale scalata e bilanciata
+        reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
         
         # info dict comunicherà al Replay Buffer se il done è un vero "crash"
         info = {'crash': False}
