@@ -6,12 +6,17 @@ Architettura Ibrida BC-RL per TORCS:
   - Il SAC aggiorna SOLO continuous_head e log_std_head
   - Il Critic (Twin Q-Network) è addestrato da zero
   - Critic Warm-Up: i primi 5000 step aggiornano solo il Critic
+  - Fine-Tuning Conservativo: L'Actor usa un Learning Rate di 1e-6.
+  - Entropia (Alpha): Si usa un Alpha fisso e sicuro (0.005) invece dell'Adaptive Alpha per evitare instabilità su policy "hard-clipped".
+  - Tanh Explosion Prevention: Il `log_prob` è clippato matematicamente in [-20.0, 10.0] per evitare gradienti infiniti ai bordi della tanh.
+
+Memory Safety (Gestione Memory Leak di TORCS):
+  - Il noto memory leak del motore C++ di TORCS è bypassato forzando il kill/riavvio completo del processo server (`relaunch=True`) a ogni reset dell'episodio. La porta UDP viene chiusa e ricollegata per prevenire leak di rete.
 
 Reward Reshaping (SAC-Compatible):
-  - progress = speedX * cos(angle) * 10.0  (scalato per bilanciare α·log(π))
-  - Dense Time Penalty: -1.0 per step
-  - Tutte le penalità terminali: cappate a -50.0
-  - Nessuna sparse reward a fine episodio
+  - progress = (speedX/50.0) * cos(angle)
+  - Dense Time Penalty e Steer Smoothness penalty per stabilizzare il veicolo
+  - Tutte le penalità terminali (schianto, stallo, fuoripista) valgono -10.0
 
 Replay Buffer:
   - Salvataggio su disco con np.savez_compressed (separato dal checkpoint PyTorch)
