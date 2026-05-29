@@ -214,7 +214,7 @@ class SACAgent:
             cont_action, _, gear_idx = self.actor.sample(state_t, evaluate=evaluate)
         return cont_action.cpu().numpy()[0], gear_idx.cpu().item()
 
-    def update(self, memory, batch_size):
+    def update(self, memory, batch_size, global_step):
         state_b, action_b, reward_b, next_state_b, mask_b = memory.sample(batch_size)
         
         state_b = torch.FloatTensor(state_b).to(self.device)
@@ -237,21 +237,26 @@ class SACAgent:
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        # Actor Update
-        pi, log_pi, _ = self.actor.sample(state_b)
-        q1_pi, q2_pi = self.critic(state_b, pi)
-        min_q_pi = torch.min(q1_pi, q2_pi)
-        actor_loss = (self.alpha * log_pi - min_q_pi).mean()
+        actor_loss_val = 0.0
+        # Critic Warm-Up: Non aggiornare l'Actor per i primi 5000 step
+        # Questo protegge i pesi pre-addestrati del BC dai gradienti randomici del Critic non addestrato
+        if global_step >= 5000:
+            # Actor Update
+            pi, log_pi, _ = self.actor.sample(state_b)
+            q1_pi, q2_pi = self.critic(state_b, pi)
+            min_q_pi = torch.min(q1_pi, q2_pi)
+            actor_loss = (self.alpha * log_pi - min_q_pi).mean()
 
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+            actor_loss_val = actor_loss.item()
 
         # Target Soft Update
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
             tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
 
-        return critic_loss.item(), actor_loss.item()
+        return critic_loss.item(), actor_loss_val
 
 # ──────────────────────────────────────────────────────────────────────
 #  Reward Function e Loop
@@ -296,7 +301,7 @@ def train():
     set_seed(args.seed)
     
     # State Stacking (k=6, t-12, t-6, t) = 3x29 = 87
-    env = TorcsEnv(vision=False, throttle=True, gear_change=False)
+    env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=False)
     agent = SACAgent()
     agent.actor.load_bc_weights(args.bc_weights)
     memory = ReplayBuffer(capacity=100000)
@@ -325,6 +330,7 @@ def train():
         prev_steer = 0.0
         prev_damage = 0.0
         prev_dist = 0.0
+        current_gear = 1
         critic_loss_val = 0.0
         actor_loss_val = 0.0
 
@@ -332,10 +338,18 @@ def train():
             # L'Actor DEVE essere in eval() durante l'inferenza anche in fase di esplorazione SAC
             # per disattivare eventuali dropout o BN (anche se non ci sono, è best practice).
             agent.actor.eval()
-            cont_action, gear_idx = agent.select_action(stacked_state, evaluate=False)
+            cont_action, raw_gear = agent.select_action(stacked_state, evaluate=False)
+            
+            # Gear Hysteresis (Sequential Filter)
+            if raw_gear > current_gear + 1:
+                raw_gear = current_gear + 1
+            elif raw_gear < current_gear - 1:
+                raw_gear = current_gear - 1
+            current_gear = max(1, raw_gear)
+            
             agent.actor.train() # Riattiva train per i gradienti (su log_std_head e continuous_head)
 
-            env_action = action_to_env(cont_action, gear_idx)
+            env_action = action_to_env(cont_action, current_gear)
             next_ob, _, env_done, _ = env.step(env_action)
             
             reward, done, current_damage = compute_reward(next_ob, prev_steer, cont_action, prev_damage)
@@ -374,7 +388,7 @@ def train():
             global_step += 1
 
             if len(memory) > batch_size:
-                critic_loss_val, actor_loss_val = agent.update(memory, batch_size)
+                critic_loss_val, actor_loss_val = agent.update(memory, batch_size, global_step)
 
             if done or env_done or step >= 3000:
                 break

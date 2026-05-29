@@ -17,4 +17,8 @@ pkill -f "sac_rl.py" || echo "Nessun processo sac_rl.py attivo."
 # Ferma agenti di inferenza
 pkill -f "test_agent.py" || echo "Nessun processo test_agent.py attivo."
 
+# Ferma TORCS
+pkill -f "torcs" || echo "Nessun processo torcs attivo."
+pkill -f "gym_torcs" || echo "Nessun processo gym_torcs attivo."
+
 echo "✅ Tutti i processi sono stati fermati con successo."
