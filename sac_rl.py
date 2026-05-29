@@ -452,11 +452,6 @@ def train():
     print("  Inizializzazione Replay Buffer...")
     memory = ReplayBuffer(100000)
 
-    # ── Expert Buffer Injection ──
-    # Se vuoi ricaricare l'offline dataset per forzare il Critic a rivalutare i pesi
-    # scommenta la riga sottostante.
-    # memory.load_expert_data("train_set/laps")
-
     agent = SACAgent()
     checkpoint_path = 'train_set/checkpoints/sac_checkpoint.pth'
     start_episode, global_step = agent.load_checkpoint(checkpoint_path, memory)
