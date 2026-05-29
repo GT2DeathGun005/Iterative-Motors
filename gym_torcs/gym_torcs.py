@@ -24,6 +24,10 @@ class TorcsEnv:
 
     def __init__(self, vision=False, throttle=False, gear_change=False, early_termination=True):
        #print("Init")
+        import shutil
+        if shutil.which('xvfb-run') is None:
+            raise EnvironmentError("xvfb-run non trovato. Installa il pacchetto 'xvfb' per l'esecuzione headless isolata di TORCS.")
+            
         self.vision = vision
         self.throttle = throttle
         self.gear_change = gear_change
@@ -34,13 +38,15 @@ class TorcsEnv:
         ##print("launch torcs")
         os.system('pkill -9 -f torcs')
         time.sleep(1.5)
-        if self.vision is True:
-            os.system('torcs -nofuel -nodamage -vision > /dev/null 2>&1 &')
-        else:
-            os.system('torcs -nofuel -nodamage > /dev/null 2>&1 &')
-        time.sleep(1.5)
-        os.system(f'sh {_AUTOSTART_SH}')
-        time.sleep(1.0)
+        
+        # Costruisce il comando torcs base
+        torcs_cmd = 'torcs -nofuel -nodamage -vision' if self.vision else 'torcs -nofuel -nodamage'
+        
+        # Encapsula torcs e autostart.sh nello stesso ambiente xvfb-run per condividere il DISPLAY virtuale
+        xvfb_cmd = f'xvfb-run -a -s "-screen 0 640x480x24" sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1"'
+        os.system(f"{xvfb_cmd} &")
+        
+        time.sleep(3.0) # Attendi l'inizializzazione del server X virtuale, torcs e della macro
 
         """
         # Modify here if you use multiple tracks in the environment
@@ -123,54 +129,52 @@ class TorcsEnv:
         # Make an obsevation from a raw observation vector from TORCS
         self.observation = self.make_observaton(obs)
 
-        # ─── Reward Consolidation (Scaled for Auto-Entropy SAC) ───────────────────────
-        # Progress: usiamo la velocità normalizzata per mantenere reward tra [0, ~5.0]
-        sp_norm = obs['speedX'] / self.default_speed
-        angle = obs['angle']
-        track_pos = obs['trackPos']
+        # ─── Reward Reshaping Unificato (SAC-Compatible) ───────────────────────
+        sp_norm = obs['speedX'] / 50.0  # Range ~[0, 6]
+        progress = sp_norm * np.cos(obs['angle'])
         
-        progress = sp_norm * np.cos(angle)
-        
-        # Penalità di posizione: quadratica rispetto al centro pista
-        track_pos_penalty = - (track_pos / 1.25) ** 2
-        
-        # Penalità fluidità sterzo
-        current_steer = this_action['steer']
-        steer_smoothness = -0.1 * abs(current_steer - getattr(self, 'last_steer', current_steer))
-        self.last_steer = current_steer
-        
-        # Time penalty debole per incentivare velocità
-        time_penalty = -0.1
-        
-        reward = progress + track_pos_penalty + steer_smoothness + time_penalty
-        
-        info = {'crash': False, 'off_track': False, 'stall': False, 'spin': False}
+        # Inizializza last_steer se non esiste
+        if not hasattr(self, 'last_steer'):
+            self.last_steer = 0.0
+            
+        steer_smoothness = -0.1 * abs(this_action['steer'] - self.last_steer)
+        self.last_steer = this_action['steer']
 
-        # Collision Penalty (cappata a -10.0 per limitare TD-error, imposta crash)
+        time_penalty = -0.1
+        reward = progress + time_penalty + steer_smoothness
+        
+        # info dict comunicherà al Replay Buffer se il done è un vero "crash"
+        info = {'crash': False}
+
+        # ─── Termination Conditions ──────────────────────────────────
+        episode_terminate = False
+        
+        # Danno / Muro
         if obs['damage'] - obs_pre['damage'] > 0:
             reward = -10.0
             info['crash'] = True
-            client.R.d['meta'] = True
 
-        # ─── Termination Conditions ──────────────────────────────────
         if self.early_termination:
-            # Fuoripista (|trackPos| > 1.25) per combaciare con la data collection
-            if abs(track_pos) > 1.25:
+            # Fuoripista (|trackPos| > 1.5)
+            if abs(obs['trackPos']) > 1.5:
                 reward = -10.0
-                info['off_track'] = True
+                info['crash'] = True
+                episode_terminate = True
                 client.R.d['meta'] = True
 
-            # Stallo (velocità troppo bassa dopo warm-up iniziale)
+            # Stallo
             if self.terminal_judge_start < self.time_step:
-                if (obs['speedX'] * np.cos(angle)) < self.termination_limit_progress:
+                if progress < (self.termination_limit_progress / 50.0):
                     reward = -10.0
-                    info['stall'] = True
+                    info['crash'] = True
+                    episode_terminate = True
                     client.R.d['meta'] = True
 
-            # Spin (l'agente sta andando in retromarcia)
-            if np.cos(angle) < 0:
+            # Spin (Retromarcia)
+            if np.cos(obs['angle']) < 0:
                 reward = -10.0
-                info['spin'] = True
+                info['crash'] = True
+                episode_terminate = True
                 client.R.d['meta'] = True
 
         if client.R.d['meta'] is True: # Send a reset signal
@@ -226,14 +230,13 @@ class TorcsEnv:
     def reset_torcs(self):
        #print("relaunch torcs")
         os.system('pkill -9 -f torcs')
-        time.sleep(1.5)  # Aumentato da 0.5 a 1.5 per garantire che il sistema operativo e X11 chiudano pulitamente il processo e liberino la porta UDP
-        if self.vision is True:
-            os.system('torcs -nofuel -nodamage -vision &')
-        else:
-            os.system('torcs -nofuel -nodamage &')
-        time.sleep(1.5)  # Aumentato da 0.5 a 1.5 per dare tempo all'istanza di avviarsi e allocare la porta UDP
-        os.system(f'sh {_AUTOSTART_SH}')
-        time.sleep(1.0)  # Aumentato da 0.5 a 1.0 per dare tempo ad autostart.sh di completare la navigazione dei menu
+        time.sleep(1.5)  # Garantisce che il sistema operativo liberi la porta UDP
+        
+        torcs_cmd = 'torcs -nofuel -nodamage -vision' if self.vision else 'torcs -nofuel -nodamage'
+        xvfb_cmd = f'xvfb-run -a -s "-screen 0 640x480x24" sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1"'
+        os.system(f"{xvfb_cmd} &")
+        
+        time.sleep(3.0)  # Tempo combinato per avvio e macro
 
     def agent_to_torcs(self, u):
         torcs_action = {'steer': u[0]}

@@ -451,33 +451,35 @@ def train():
             agent.actor.train()
 
             env_action = action_to_env(cont_action, current_gear)
+            
+            # Affidiamoci alla reward di gym_torcs e al dict "info"
             next_ob, reward, env_done, info = env.step(env_action)
             
-            is_failure = info.get('crash') or info.get('off_track') or info.get('stall') or info.get('spin')
-            if is_failure:
-                if info.get('stall'):
-                    print(f"    ⚠️ Anti-Stall attivato allo step {step}!")
-                elif info.get('off_track'):
-                    print(f"    ⚠️ Fuori pista allo step {step}!")
-                elif info.get('spin'):
-                    print(f"    ⚠️ Spin allo step {step}!")
-                elif info.get('crash'):
-                    print(f"    ⚠️ Schianto/Danno allo step {step}!")
-                    
-            done = env_done or is_failure
-            prev_steer = cont_action[0]
-
             next_f_state = flatten_state(next_ob)
             state_stack.append(next_f_state)
 
             current_dist = float(np.array(next_ob.get('distRaced', 0.0)).flat[0])
+            last_lap_time = float(np.array(next_ob.get('lastLapTime', 0.0)).flat[0])
             max_dist = current_dist
 
+            done = False
+            # Check completamento giro
+            if last_lap_time > 0.0 and step > 500:
+                done = True  # L'episodio finisce perché hai vinto
+                print(f"  🏎️  Giro completato: {last_lap_time:.2f}s!")
+                
+            # Anche uno schianto finisce l'episodio
+            if info.get('crash', False):
+                done = True
+
+            prev_dist = current_dist
             next_stacked_state = np.concatenate([state_stack[0], state_stack[6], state_stack[12]])
 
-            # ── Done Masking (Cruciale per SAC) ──
+            # ── Done Masking Fix ──
+            # mask=0.0 SOLO se ci siamo schiantati. Se scade il tempo o completiamo il giro, mask=1.0!
+            mask = 0.0 if info.get('crash', False) else 1.0
+            
             time_limit_reached = (step >= args.max_steps)
-            mask = 0.0 if is_failure else 1.0
             memory.push(stacked_state, cont_action, reward, next_stacked_state, mask)
 
             stacked_state = next_stacked_state
