@@ -6,21 +6,16 @@ Questo repository implementa una pipeline end-to-end per addestrare un agente di
 
 ---
 
-## 🧠 Filosofia del Progetto: Pure Behavioral Cloning
+## 🧠 Filosofia del Progetto: Architettura Ibrida BC-RL
 
-A differenza degli approcci ibridi, questo progetto punta sulla **massima fedeltà ai dati esperti**. Invece di esplorare traiettorie casuali tramite RL, l'agente utilizza una **Deep Policy Network Multi-Head** con **State Stacking Temporale Statico** per fittare l'orizzonte cinematico ideale.
+Questo progetto supera il classico Behavioral Cloning tramite un'architettura **Ibrida BC-RL**. L'agente parte con una **Deep Policy Network Multi-Head** addestrata offline per imitare l'esperto umano. Per sconfiggere il temuto *Covariate Shift* (che fa deragliare l'agente non appena si discosta millimetricamente dalla traiettoria ottimale), la pipeline prosegue con un **Soft Actor-Critic (SAC) Fine-Tuning**.
 
-L'agente utilizza un input di **87D** composto dalla concatenazione di 3 frame temporali con **passo di stride statico $k = 6$ ($0.24\text{ secondi}$ totali)**:
-- $t - 12$ (passato)
-- $t - 6$ (passato recente)
-- $t$ (presente)
+Questa fase RL sfrutta la tecnica del **Warm-Start** e il **Gradient Freezing**: il backbone estratto dal BC viene congelato (per prevenire il *Latent Shift*), mentre il SAC esplora l'ambiente penalizzando duramente gli errori di traiettoria e massimizzando la velocità longitudinale.
 
-Questo orizzonte consente alla rete di calcolare in modo stabile i trend macroscopici e la derivata di avvicinamento ai bordi della pista.
-
-### Punti di forza della pipeline BC:
-1. **Stabilità Assoluta**: Nessun rischio di *catastrophic forgetting* o divergenza tipica del RL.
-2. **Determinismo**: A parità di stato iniziale, l'agente produrrà sempre la stessa traiettoria ideale.
-3. **Reattività Dinamica**: Lo stacking temporale mitiga la latenza fisica, mentre l'orizzonte a $0.24\text{s}$ rappresenta il perfetto punto di equilibrio cinematico (un orizzonte superiore come $0.40\text{s}$ introduce latenza di controllo, mentre uno consecutivo fallisce a percepire le variazioni dei sensori).
+### Punti di forza della pipeline Ibrida BC-RL:
+1. **Sample Efficiency**: Il BC fornisce un ottimo punto di partenza, abbattendo drasticamente i tempi di esplorazione del RL.
+2. **Prevenzione del Latent Shift**: Il backbone e il cambio marce rimangono quelli perfetti del BC. Il RL affina unicamente sterzo, acceleratore e freno.
+3. **Determinismo Assoluto**: La policy finale, e l'inferenza, godono di seed statici e reset fisici per una riproducibilità matematica esatta.
 
 ---
 
@@ -29,25 +24,24 @@ Questo orizzonte consente alla rete di calcolare in modo stabile i trend macrosc
 La pipeline si compone di tre fasi sequenziali:
 
 ```
-┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
-│  Fase 1              │     │  Fase 2              │     │  Fase 3              │
-│  DATA COLLECTION     │────▶│  BC TRAINING         │────▶│  TEST / INFERENCE    │
-│                      │     │                      │     │                      │
-│  🎮 PS5 / Tastiera   │     │  behavioral_cloning  │     │  test_agent.py       │
-│  data_collection.py  │     │  .py                 │     │  Zero-Noise          │
-│                      │     │                      │     │  Deterministico      │
-│  Output:             │     │  Output:             │     │                      │
-│  train_set/laps/     │     │  train_set/          │     │  Valutazione live    │
-│  lap_001.h5 ...      │     │  checkpoints/        │     │  su TORCS            │
-│                      │     │  bc_policy.pth       │     │                      │
-└──────────────────────┘     └──────────────────────┘     └──────────────────────┘
+┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
+│  Fase 1              │     │  Fase 2              │     │  Fase 3              │     │  Fase 4              │
+│  DATA COLLECTION     │────▶│  BC TRAINING         │────▶│  SAC RL FINE-TUNING  │────▶│  TEST / INFERENCE    │
+│                      │     │                      │     │                      │     │                      │
+│  🎮 PS5 / Tastiera   │     │  behavioral_cloning  │     │  sac_rl.py           │     │  test_agent.py       │
+│  data_collection.py  │     │  .py                 │     │  (Warm-Start)        │     │  Deterministico      │
+│                      │     │                      │     │                      │     │                      │
+│  Output:             │     │  Output:             │     │  Output:             │     │  Valutazione live    │
+│  train_set/laps/     │     │  bc_policy.pth       │     │  sac_policy.pth      │     │  su TORCS            │
+└──────────────────────┘     └──────────────────────┘     └──────────────────────┘     └──────────────────────┘
 ```
 
 | Fase | Script | Descrizione |
 |------|--------|-------------|
 | 1. Data Collection | `data_collection.py` | Raccolta di giri guidati da umano (esperto) con controller PS5 DualSense o tastiera WASD. Solo i giri completati senza uscite di pista vengono salvati. |
-| 2. BC Training | `behavioral_cloning.py` | Addestramento della PolicyNetwork sui dati esperti, con validation split 80/20 e early stopping. |
-| 3. Test & Eval | `test_agent.py` | Esecuzione deterministica del modello BC su TORCS per valutare la capacità di completare giri autonomi. |
+| 2. BC Training | `behavioral_cloning.py` | Addestramento della PolicyNetwork sui dati esperti. Produce una policy che imita l'esperto ma che potrebbe soffrire di Covariate Shift. |
+| 3. SAC RL | `sac_rl.py` | Fine-tuning del modello tramite Reinforcement Learning (Soft Actor-Critic) con Warm-Start. Massimizza la velocità penalizzando attivamente le derive laterali. |
+| 4. Test & Eval | `test_agent.py` | Esecuzione deterministica del modello finale su TORCS per valutare la capacità di completare giri autonomi. |
 
 ---
 

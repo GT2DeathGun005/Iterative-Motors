@@ -89,5 +89,31 @@ else
 fi
 
 echo ""
+
+# ═══════════════════════════════════════════════════════════════════════
+#  SAC Reinforcement Learning (Warm-Start)
+# ═══════════════════════════════════════════════════════════════════════
+log_phase "🧠  Training: SAC Fine-Tuning"
+log_info "Warm-Start da: $BC_WEIGHTS"
+SAC_WEIGHTS="train_set/checkpoints/sac_policy.pth"
+
+python -u sac_rl.py \
+    --bc_weights "$BC_WEIGHTS" \
+    --episodes 100 \
+    --seed 42
+
+if [[ $? -eq 0 ]] && [[ -f "$SAC_WEIGHTS" ]]; then
+    SAC_SIZE=$(du -h "$SAC_WEIGHTS" | cut -f1)
+    log_ok "SAC completato con successo!"
+    log_info "Pesi salvati in: $SAC_WEIGHTS ($SAC_SIZE)"
+    log_info ""
+    log_info "Per testare l'agente esegui:"
+    log_info "${BOLD}python test_agent.py --weights $SAC_WEIGHTS${NC}"
+else
+    log_error "SAC Training fallito!"
+    exit 1
+fi
+
+echo ""
 log_ok "${BOLD}Pipeline completata!${NC}"
 
