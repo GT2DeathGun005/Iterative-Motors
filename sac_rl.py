@@ -345,7 +345,8 @@ class SACAgent:
         # Entropy Auto-Tuning (Alpha)
         self.target_entropy = -3.0
         self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
+        # LR abbassato per pareggiare la velocità dell'Actor
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=1e-6)
 
     @property
     def alpha(self):
@@ -407,6 +408,10 @@ class SACAgent:
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
             self.alpha_optimizer.step()
+
+            # Evita che Alpha esploda: log_alpha <= 0 significa Alpha <= 1.0
+            with torch.no_grad():
+                self.log_alpha.clamp_(max=0.0)
 
         # Target Soft Update
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
