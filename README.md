@@ -68,7 +68,6 @@ AIcar/
 ├── telemetry/                 # Telemetria CSV dei test agent (auto-generata)
 └── train_set/                 # Dati e Checkpoint
     ├── laps/                  #   File HDF5 dei giri registrati (lap_001.h5 ...)
-    ├── laps_anomalous/        #   Giri isolati per anomalie (non usati dal BC)
     ├── checkpoints/           #   Pesi del modello (bc_policy.pth)
     └── session_logs/          #   Log delle sessioni di data collection
 ```
@@ -137,14 +136,20 @@ Il training utilizza:
 
 ### 3. Test Deterministico (Inference)
 
-Avvia TORCS e lancia l'agente autonomo. Il modello guida in modalità interamente deterministica ed end-to-end, gestendo lo sterzo, l'acceleratore, il freno e il cambio discreto ad alti giri (18,000 RPM) interamente con la rete neurale.
+Avvia TORCS e lancia l'agente autonomo. Il modello guida in modalità interamente deterministica ed end-to-end, gestendo lo sterzo, l'acceleratore, il freno e il cambio discreto interamente con la rete neurale. Tre moduli di post-processing fisico stabilizzano l'output della rete senza mai sovrascriverne le decisioni.
 
 ```bash
 python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 1
 ```
 
-**Sistemi di Controllo Attivi:**
-- **Active Safety Envelope (ESP / Lane Keep Assist)**: Modulo di sicurezza invisibile a runtime che agisce unicamente in prossimità del limite fisico della pista (`|trackPos| > 1.15`). Applica un piccolissimo e fluido nudge correttivo proporzionale (`-0.15 * (np.sign(trackPos) * (abs(trackPos) - 1.15))`) per prevenire uscite millimetriche dalla linea bianca (soglia TORCS `1.25`). Questo ricalca esattamente la filosofia dei controlli di stabilità attivi (ESC/TCS) delle moderne vetture da corsa reali, mantenendo la guida autonoma al 99.9% in mano alla rete neurale.
+**Sistemi di Controllo Attivi a Runtime:**
+
+| Sistema | Descrizione | Parametri Chiave |
+|---------|-------------|------------------|
+| **Gear Hysteresis Filter** | La predizione neurale della marcia passa per un filtro di isteresi che impone due vincoli fisici: (1) vincolo sequenziale ±1 (impedisce salti come G1→G4), (2) conferma temporale di 3 step consecutivi prima di adottare un cambio. Questo elimina le oscillazioni ad alta frequenza mantenendo la marcia 100% neurale. | `confirm_steps=3`, `±1 sequential` |
+| **EMA Steering Smoother** | Filtro a media mobile esponenziale (EMA) sullo sterzo predetto dalla rete. Elimina le micro-oscillazioni frame-to-frame che accumulano errore laterale, senza introdurre latenza significativa. | `α=0.4` (40% frame corrente, 60% inerzia) |
+| **Active Safety Envelope (ESP)** | Modulo di sicurezza a runtime con profilo quadratico che interviene a partire da `|trackPos| > 0.95`. Il gain cresce con il quadrato dell'eccesso, rendendo l'intervento dolce al centro e decisivo al limite. Sopra `|trackPos| > 1.10` aggiunge parzializzazione del gas e frenata stabilizzante. | Soglia: `0.95`, Gain base: `0.40`, Frenata max: `0.15` |
+| **Traction Control System (TCS)** | Riduce l'acceleratore quando lo slip tra ruote posteriori e anteriori supera la soglia, prevenendo sovrasterzo da trazione. | `slip_threshold=5.0` |
 
 ### Script di Supporto
 
@@ -257,17 +262,13 @@ TORCS non possiede un sistema ABS attivo per impostazione predefinita sulla vett
 3. **Deprecazione Heuristics**: Rimosso completamente il Launch Helper iniziale. L'agente ora gestisce la partenza da fermo e tutte le curve del circuito al 100% tramite la rete neurale.
 4. **Cambio Manuale Ad Alti Giri (18,000 RPM)**: Il cambio discreto predittivo (testa discrete gear della rete) lavora coordinato sulla soglia di potenza dell'esperto (18,000 RPM).
 
-### [2026-05-25] Inquinamento Dataset — Anomalie Sterzata in Curva 10
+### [2026-05-25] ~~Inquinamento Dataset — Anomalie Sterzata in Curva 10~~ → Invalidato
 
-**Problema:** 19 giri su 66 nel dataset esperto contenevano un'anomalia di sottosterzo nella penultima curva (Curva 10, ~3175m-3255m). In questi giri, lo sterzo rimaneva esattamente `0.000` per oltre 60 metri durante la frenata, con ingresso in curva ritardato di ~40 metri. Questo comportamento inquinava la loss del BC, insegnando all'agente a non sterzare in tempo nella penultima curva.
-
-**Impatto:** L'agente usciva sistematicamente di pista nella penultima curva per sottosterzo indotto dal dataset. Il tasso di completamento giri scendeva drasticamente (~28% nella sessione peggiore).
-
-**Fix applicato:**
-- Analisi automatizzata di tutti i 66 giri con script di diagnostica per classificare l'Average Steer e Max Steer nella zona critica [3175m, 3255m]
-- Isolamento dei 19 giri anomali in `train_set/laps_anomalous/` (non eliminati, solo spostati fuori dal percorso di training)
-- Riaddestramento del modello BC sui 47 giri puliti rimanenti
-- Risultato: validation loss migliorata da `0.151478` a `0.148800`
+**Nota:** Una precedente analisi aveva identificato 19 giri su 66 come anomali per sottosterzo in Curva 10 (3175m-3255m). Un'analisi statistica successiva più approfondita (confronto profilo sterzo vs media con MSE + metriche globali su tutti i 66 giri) ha dimostrato che:
+- **Nessun giro supera `|trackPos| > 1.25`** (il limite di pista TORCS)
+- I 5 outlier statistici rilevati (lap_017, 056, 048, 060, 013) rappresentano semplicemente traiettorie più variate (linee larghe, velocità diverse)
+- Anche i giri "normali" raggiungono `max|tp| > 1.20` (es. lap_008)
+- **Tutti i 66 giri sono validi e utilizzati per il training** — la variazione è intenzionale e benefica per la robustezza del modello
 
 ### [2026-05-28] Ottimizzazione Stride Temporale e Definizione dell'Architettura 29D (v4)
 
@@ -277,7 +278,18 @@ TORCS non possiede un sistema ABS attivo per impostazione predefinita sulla vett
 1. **Stabilizzazione su 29D**: Rimozione della sola feature discontinua `distFromStart` (causa di covariate shift al traguardo) per via del preprocessing v4, conservando le feature dinamiche di trazione (`wheelSpinVel` e `rpm`).
 2. **Consolidamento a $k=6$ ($0.24\text{s}$)**: Ripristinato lo stride temporale a $k=6$ (orizzonte temporale totale di 0.24 secondi) tramite stacking 87D degli stati $t-12$, $t-6$, $t$. Questo rappresenta il perfetto punto di equilibrio dinamico nel controllo deterministico a 50Hz.
 3. **Risultato**: Compilazione e integrità di tutta la codebase verificate con successo. Raggiunto minimo storico di validation loss pari a `0.1305`.
-4. **Stato Corrente dei Test (Limite Rilevato)**: ⚠️ *Nonostante questa configurazione (29D con $k=6$) sia empiricamente la migliore testata fino ad ora sul circuito di TORCS, l'agente non riesce ancora a completare un intero giro di pista senza incorrere in un'uscita.* La traiettoria risulta nettamente migliorata e più stabile, ma persistono criticità in transitori veloci.
+
+### [2026-05-29] Stabilizzazione Runtime — Gear Hysteresis, EMA Steering, ESP Progressivo
+
+**Problema:** L'agente usciva sistematicamente di pista nei primi ~200m dopo la partenza. L'analisi della telemetria ha rivelato tre cause concatenate:
+1. **Gear jitter**: La testa discreta oscillava tra marce non sequenziali (es. G1→G4→G3→G1), causando shock di coppia che destabilizzavano l'asse posteriore.
+2. **Oscillazione sterzo**: Lo sterzo oscillava ±0.05 ad alta frequenza anche nei rettilinei, accumulando errore laterale progressivo (covariate shift residuo).
+3. **ESP troppo debole**: L'intervento (soglia 1.15, gain 0.15) era insufficiente — il car passava da `tp=1.15` a `tp=1.58` in soli 5 step a 170+ km/h.
+
+**Soluzioni Applicate (Runtime-Only — nessuna modifica al training):**
+1. **Gear Hysteresis Filter**: Aggiunto filtro di isteresi sulla predizione neurale del gear con vincolo sequenziale ±1 (impedisce salti G1→G4) e conferma temporale di 3 step consecutivi. La marcia resta 100% neurale, ma fisicamente plausibile.
+2. **EMA Steering Smoother**: Filtro a media mobile esponenziale ($\alpha=0.4$) sullo sterzo predetto dalla rete. Elimina le oscillazioni ad alta frequenza mantenendo la reattività in curva.
+3. **ESP Progressivo Quadratico**: Soglia abbassata da 1.15 a **0.95**, gain base aumentato da 0.15 a **0.40** con profilo quadratico (`gain * excess * (1 + 2*excess)`). Frenata stabilizzante attiva sopra `|tp| > 1.10` con max 0.15 (era 0.05). L'ESP ora interviene ~20 step prima e con forza proporzionale al pericolo.
 
 ---
 

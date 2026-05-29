@@ -152,9 +152,11 @@ def apply_tcs(action: np.ndarray, obs: dict, slip_threshold: float = 5.0) -> np.
 
 def apply_esp(action, obs, step=0):
     """
-    Active Safety Envelope (ESP / Lane Keep Assist) - Versione Leggera
-    Agisce come fail-safe morbido solo in prossimità del limite estremo di pista (1.15).
-    Evita interventi bruschi per non destabilizzare la fisica dell'auto.
+    Active Safety Envelope (ESP / Lane Keep Assist) — Versione Progressiva
+    Interviene a partire da |trackPos| > 0.95 con un profilo quadratico
+    per correggere la traiettoria prima che diventi irrecuperabile.
+    Il gain cresce con il quadrato dell'eccesso, rendendo l'intervento
+    dolce vicino al centro e deciso vicino al limite.
     """
     track_pos = obs.get('trackPos', 0.0)
     if isinstance(track_pos, np.ndarray):
@@ -162,27 +164,65 @@ def apply_esp(action, obs, step=0):
 
     action = action.copy()
 
-    # Intervento sterzo molto leggero sopra 1.15
-    if abs(track_pos) > 1.15:
-        # Nudge proporzionale molto dolce
-        steer_nudge = -0.15 * (np.sign(track_pos) * (abs(track_pos) - 1.15))
+    # Intervento sterzo progressivo a partire da |trackPos| > 0.95
+    if abs(track_pos) > 0.95:
+        excess = abs(track_pos) - 0.95
+        # Gain quadratico: dolce vicino a 0.95, forte vicino a 1.30+
+        steer_nudge = -np.sign(track_pos) * 0.40 * excess * (1.0 + 2.0 * excess)
         action[0] = np.clip(action[0] + steer_nudge, -1.0, 1.0)
-        
-        # Parzializzazione gas e freno leggerissimi solo sopra 1.25 (vicino all'offtrack 1.50)
-        if abs(track_pos) > 1.25:
-            # Parzializzazione del gas (riduzione max del 30% per non tagliare bruscamente)
-            throttle_scale = max(0.70, 1.0 - 1.2 * (abs(track_pos) - 1.25))
+
+        # Parzializzazione gas e frenata stabilizzante sopra 1.10
+        if abs(track_pos) > 1.10:
+            throttle_scale = max(0.50, 1.0 - 2.0 * (abs(track_pos) - 1.10))
             action[1] *= throttle_scale
-            
-            # Frenata stabilizzante minima (max 0.05) per stabilizzare il retrotreno
-            brake_nudge = 0.20 * (abs(track_pos) - 1.25)
+
+            brake_nudge = 0.30 * (abs(track_pos) - 1.10)
             if brake_nudge > 0.01:
-                action[2] = max(action[2], min(0.05, brake_nudge))
-            
+                action[2] = max(action[2], min(0.15, brake_nudge))
+
             if step % 20 == 0:
-                print(f"    [ESP Soft] tp={track_pos:+.3f} | nudge={steer_nudge:+.3f} | scale={throttle_scale:.2f} | brake={action[2]:.2f}")
+                print(f"    [ESP] tp={track_pos:+.3f} | nudge={steer_nudge:+.3f} | throttle={throttle_scale:.2f} | brake={action[2]:.2f}")
 
     return action
+
+
+def apply_gear_hysteresis(predicted_gear, current_gear, gear_counter, gear_candidate,
+                          confirm_steps=3):
+    """Filtro di isteresi per la marcia predetta dalla rete neurale.
+
+    La rete predice la marcia frame-by-frame, ma nella realtà fisica un cambio
+    marcia richiede continuità. Questo filtro:
+      1. Vincolo sequenziale: permette solo ±1 per step (no salti 1→4).
+      2. Conferma temporale: un nuovo gear deve essere predetto per `confirm_steps`
+         step consecutivi prima di essere adottato.
+
+    Returns:
+        (gear_to_use, updated_counter, updated_candidate)
+    """
+    # Vincolo sequenziale: clamp a ±1 dal gear corrente
+    if predicted_gear > current_gear + 1:
+        predicted_gear = current_gear + 1
+    elif predicted_gear < current_gear - 1:
+        predicted_gear = current_gear - 1
+
+    # Safety: mai sotto gear 1 a runtime
+    predicted_gear = max(1, predicted_gear)
+
+    # Isteresi: conferma il cambio solo dopo N step consecutivi
+    if predicted_gear != current_gear:
+        if predicted_gear == gear_candidate:
+            gear_counter += 1
+        else:
+            gear_candidate = predicted_gear
+            gear_counter = 1
+
+        if gear_counter >= confirm_steps:
+            return predicted_gear, 0, predicted_gear
+        else:
+            return current_gear, gear_counter, gear_candidate
+    else:
+        # Se la rete predice il gear corrente, resetta il contatore
+        return current_gear, 0, current_gear
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -254,6 +294,12 @@ def main():
             lap_time = 0.0
             telemetry_data = []
 
+            # Stato per i filtri di stabilizzazione runtime
+            prev_steer = 0.0           # EMA steering smoother
+            current_gear = 1           # Gear hysteresis: marcia corrente
+            gear_counter = 0           # Gear hysteresis: contatore conferma
+            gear_candidate = 1         # Gear hysteresis: candidato in attesa
+
             print(f"\n  {'─' * 50}")
             print(f"  🏁 Tentativo #{total_attempts} (giri completati: {len(lap_times)}/{args.laps})")
 
@@ -270,15 +316,24 @@ def main():
                     state_t = torch.FloatTensor(stacked_state).to(device).unsqueeze(0)
                     pred_cont, gear_logits = model(state_t)
                     cont_action = pred_cont.cpu().numpy()[0]          # [steer, accel, brake]
-                    gear = int(gear_logits.argmax(dim=1).item())
-                    if gear < 1: gear = 1  # Safety: no retromarcia/folle
+                    raw_gear = int(gear_logits.argmax(dim=1).item())
+
+                # ── Gear Hysteresis Filter (neurale + vincolo sequenziale ±1 + conferma 3 step) ──
+                current_gear, gear_counter, gear_candidate = apply_gear_hysteresis(
+                    raw_gear, current_gear, gear_counter, gear_candidate, confirm_steps=3
+                )
+
+                # ── EMA Steering Smoother (alpha=0.4: 40% frame corrente, 60% inerzia) ──
+                alpha = 0.4
+                cont_action[0] = alpha * cont_action[0] + (1.0 - alpha) * prev_steer
+                prev_steer = cont_action[0]
 
                 # ── Mutual exclusion accel/brake (come l'esperto umano) ──
                 if cont_action[2] > 0.05:
                     cont_action[1] = 0.0  # Se freno, niente gas
 
                 # ── Step nell'ambiente (azione pura dal modello + TCS + ESP) ──
-                env_action = denormalize_action(cont_action, gear)
+                env_action = denormalize_action(cont_action, current_gear)
                 env_action = apply_tcs(env_action, obs)
                 env_action = apply_esp(env_action, obs, step)
                 next_obs, _, env_done, _ = env.step(env_action)
