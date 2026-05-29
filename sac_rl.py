@@ -7,7 +7,7 @@ Architettura Ibrida BC-RL per TORCS:
   - Il Critic (Twin Q-Network) è addestrato da zero
   - Critic Warm-Up: i primi 5000 step aggiornano solo il Critic
   - Fine-Tuning Conservativo: L'Actor usa un Learning Rate di 1e-6.
-  - Entropia (Alpha): Si usa un Alpha fisso e sicuro (0.005) invece dell'Adaptive Alpha per evitare instabilità su policy "hard-clipped".
+  - Entropia (Alpha): Si usa un Alpha fisso di 0.02 (innalzato per prevenire l'exploration dip). Rimosso l'Adaptive Alpha.
   - Tanh Explosion Prevention: Il `log_prob` è clippato matematicamente in [-20.0, 10.0] per evitare gradienti infiniti ai bordi della tanh.
 
 Memory Safety (Gestione Memory Leak di TORCS):
