@@ -79,12 +79,31 @@ def flatten_state(state_dict: dict) -> np.ndarray:
         return np.zeros(29, dtype=np.float32)
 
 def action_to_env(cont_action, gear_idx):
-    """Converte l'output dell'Actor (Tanh [-1, 1] e Gear Idx [0-6]) nel formato TORCS."""
+    """Converte l'output dell'Actor (Tanh [-1, 1] e Gear Idx [0-6]) nel formato TORCS.
+    
+    Ricostruisce ESATTAMENTE l'attivazione Sigmoid che il backbone BC si aspetta.
+    """
     env_action = np.zeros(4, dtype=np.float32)
     env_action[0] = np.clip(cont_action[0], -1.0, 1.0)               # steer
-    env_action[1] = np.clip((cont_action[1] + 1.0) / 2.0, 0.0, 1.0)  # accel
-    env_action[2] = np.clip((cont_action[2] + 1.0) / 2.0, 0.0, 1.0)  # brake
-    env_action[3] = float(gear_idx)                                  # gear
+    
+    # Inverte il Tanh dell'Actor SAC per recuperare i raw logits
+    u_accel = np.clip(cont_action[1], -0.9999, 0.9999)
+    u_brake = np.clip(cont_action[2], -0.9999, 0.9999)
+    
+    x_accel = np.arctanh(u_accel)
+    x_brake = np.arctanh(u_brake)
+    
+    # Applica il Sigmoid per un matching 1:1 con il BC
+    accel = 1.0 / (1.0 + np.exp(-x_accel))
+    brake = 1.0 / (1.0 + np.exp(-x_brake))
+    
+    # Mutual exclusion (come l'esperto umano e il test_agent)
+    if brake > 0.05:
+        accel = 0.0
+        
+    env_action[1] = np.clip(accel, 0.0, 1.0)
+    env_action[2] = np.clip(brake, 0.0, 1.0)
+    env_action[3] = float(max(1, min(6, gear_idx)))
     return env_action
 
 # ──────────────────────────────────────────────────────────────────────
@@ -320,10 +339,10 @@ def train():
         # Relaunch=True garantisce azzeramento residui fisici
         ob = env.reset(relaunch=True)
         
-        # Inizializza stack
+        # Inizializza stack con maxlen=13 per replicare k=6 (t-12, t-6, t)
         f_state = flatten_state(ob)
-        state_stack = deque([f_state]*3, maxlen=3)
-        stacked_state = np.concatenate(list(state_stack))
+        state_stack = deque([f_state]*13, maxlen=13)
+        stacked_state = np.concatenate([state_stack[0], state_stack[6], state_stack[12]])
         
         episode_reward = 0
         step = 0
@@ -376,7 +395,7 @@ def train():
                     done = True
                     
             prev_dist = current_dist
-            next_stacked_state = np.concatenate(list(state_stack))
+            next_stacked_state = np.concatenate([state_stack[0], state_stack[6], state_stack[12]])
 
             # Ignora la termination artificiale se non è causata dal muro
             mask = 0.0 if done else 1.0
