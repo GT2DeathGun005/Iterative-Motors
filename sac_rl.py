@@ -254,6 +254,7 @@ class SACAgent:
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.critic_optimizer.step()
 
         actor_loss_val = 0.0
@@ -268,6 +269,7 @@ class SACAgent:
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_optimizer.step()
             actor_loss_val = actor_loss.item()
 
@@ -276,6 +278,34 @@ class SACAgent:
             tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
 
         return critic_loss.item(), actor_loss_val
+
+    def save_checkpoint(self, filepath, episode, global_step, memory):
+        checkpoint = {
+            'actor': self.actor.state_dict(),
+            'critic': self.critic.state_dict(),
+            'critic_target': self.critic_target.state_dict(),
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic_optimizer': self.critic_optimizer.state_dict(),
+            'episode': episode,
+            'global_step': global_step,
+            'memory_buffer': memory.buffer
+        }
+        torch.save(checkpoint, filepath)
+        
+    def load_checkpoint(self, filepath, memory):
+        if not os.path.exists(filepath):
+            return 0, 0
+            
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.actor.load_state_dict(checkpoint['actor'])
+        self.critic.load_state_dict(checkpoint['critic'])
+        self.critic_target.load_state_dict(checkpoint['critic_target'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+        memory.buffer = checkpoint['memory_buffer']
+        
+        print(f"✅ Checkpoint integrale caricato: ripresa dall'Episodio {checkpoint['episode']} (Step {checkpoint['global_step']}). Buffer size: {len(memory)}")
+        return checkpoint['episode'], checkpoint['global_step']
 
 # ──────────────────────────────────────────────────────────────────────
 #  Reward Function e Loop
@@ -295,12 +325,15 @@ def compute_reward(obs, prev_steer, cont_action, prev_damage):
     # Penalità regolarizzante sullo sterzo (fluidità)
     steer_smoothness = -0.5 * abs(steer - prev_steer)
     
+    # Time Penalty (Dense Reward Shaping per massimizzare la velocità)
+    time_penalty = -0.1
+    
     # Penalità per collisione col muro o danno
     damage_penalty = 0.0
     if damage > prev_damage:
         damage_penalty = -50.0  # Punizione per impatto col muro
 
-    reward = progress + angle_penalty + track_pos_penalty + steer_smoothness + damage_penalty
+    reward = progress + angle_penalty + track_pos_penalty + steer_smoothness + damage_penalty + time_penalty
     
     done = False
     # Fuoripista critico / taglio curva estremo
@@ -322,8 +355,14 @@ def train():
     # State Stacking (k=6, t-12, t-6, t) = 3x29 = 87
     env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=False)
     agent = SACAgent()
-    agent.actor.load_bc_weights(args.bc_weights)
     memory = ReplayBuffer(capacity=100000)
+    
+    # Gestione Resumable Checkpoint
+    checkpoint_path = 'train_set/checkpoints/sac_checkpoint.pth'
+    start_episode, global_step = agent.load_checkpoint(checkpoint_path, memory)
+    
+    if start_episode == 0:
+        agent.actor.load_bc_weights(args.bc_weights)
 
     # Crea la directory di output
     os.makedirs('train_set/checkpoints', exist_ok=True)
@@ -331,11 +370,12 @@ def train():
     log_file = 'train_set/session_logs/sac_training.log'
 
     batch_size = 256
-    global_step = 0
+    if start_episode == 0:
+        global_step = 0
 
-    print("🚀 Avvio training SAC (Warm-Start)...")
+    print("🚀 Avvio training SAC (Warm-Start)..." if start_episode == 0 else "🚀 Ripresa training SAC...")
     
-    for episode in range(args.episodes):
+    for episode in range(start_episode, args.episodes):
         # Relaunch=True garantisce azzeramento residui fisici
         ob = env.reset(relaunch=True)
         
@@ -436,7 +476,8 @@ def train():
         with open(log_file, 'a', encoding='utf-8') as f:
             f.write(log_msg + "\n")
 
-        # Salva i pesi aggiornati
+        # Salva i pesi aggiornati e il checkpoint integrale
+        agent.save_checkpoint(checkpoint_path, episode + 1, global_step, memory)
         torch.save(agent.actor.state_dict(), 'train_set/checkpoints/sac_policy.pth')
 
     env.end()
