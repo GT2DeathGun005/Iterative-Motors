@@ -342,8 +342,14 @@ class SACAgent:
 
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
 
-        # Fixed Safe Alpha
-        self.alpha = 0.02
+        # Entropy Auto-Tuning (Alpha)
+        self.target_entropy = -3.0
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
+
+    @property
+    def alpha(self):
+        return self.log_alpha.exp().item()
 
     def select_action(self, state, evaluate=False):
         state_t = torch.FloatTensor(state).to(self.device).unsqueeze(0)
@@ -396,6 +402,12 @@ class SACAgent:
             self.actor_optimizer.step()
             actor_loss_val = actor_loss.item()
 
+            # Alpha (Entropy) Update
+            alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+
         # Target Soft Update
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
             tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
@@ -410,6 +422,8 @@ class SACAgent:
             'critic_target': self.critic_target.state_dict(),
             'actor_optimizer': self.actor_optimizer.state_dict(),
             'critic_optimizer': self.critic_optimizer.state_dict(),
+            'log_alpha': self.log_alpha,
+            'alpha_optimizer': self.alpha_optimizer.state_dict(),
             'episode': episode,
             'global_step': global_step,
         }
@@ -429,6 +443,12 @@ class SACAgent:
         self.critic_target.load_state_dict(checkpoint['critic_target'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+
+        if 'log_alpha' in checkpoint:
+            with torch.no_grad():
+                self.log_alpha.copy_(checkpoint['log_alpha'])
+            if 'alpha_optimizer' in checkpoint:
+                self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer'])
 
         # Carica il Replay Buffer dal file numpy separato
         buffer_path = filepath.replace('.pth', '_buffer.npz')
