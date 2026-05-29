@@ -286,7 +286,7 @@ class SACAgent:
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
 
         # Fixed Safe Alpha
-        self.alpha = 0.005
+        self.alpha = 0.02
 
     def select_action(self, state, evaluate=False):
         state_t = torch.FloatTensor(state).to(self.device).unsqueeze(0)
@@ -439,6 +439,11 @@ def train():
         while True:
             agent.actor.eval()
             cont_action, raw_gear = agent.select_action(stacked_state, evaluate=False)
+
+            # INIEZIONE DI ACTION NOISE NEL ROLLOUT
+            # Aggiungiamo rumore Gaussiano per scuotere la policy (μ=0, σ=0.05)
+            noise = np.random.normal(0, 0.05, size=cont_action.shape)
+            cont_action = np.clip(cont_action + noise, -1.0, 1.0)
 
             if raw_gear > current_gear + 1:
                 raw_gear = current_gear + 1
