@@ -38,9 +38,9 @@ La pipeline si compone di quattro fasi sequenziali:
 
 | Fase | Script | Descrizione |
 |------|--------|-------------|
-| 1. Data Collection | `data_collection.py` | Raccolta di giri guidati da umano (esperto) con controller PS5 DualSense o tastiera WASD. Solo i giri completati senza uscite di pista vengono salvati. |
-| 2. BC Training | `behavioral_cloning.py` | Addestramento della PolicyNetwork sui dati esperti. Produce una policy che imita l'esperto ma che potrebbe soffrire di Covariate Shift. |
-| 3. SAC RL | `sac_rl.py` | Fine-tuning del modello tramite Reinforcement Learning (Soft Actor-Critic) con Warm-Start. Massimizza la velocità penalizzando attivamente le derive laterali. |
+| 1. Data Collection | `data_collection.py` | Raccolta di giri guidati da umano con controller PS5 o tastiera WASD. Salva solo i giri puliti. |
+| 2. BC Training | `behavioral_cloning.py` | Addestramento della PolicyNetwork sui dati esperti. Produce una policy che imita l'esperto (`bc_policy.pth`). |
+| 3. SAC RL | `sac_rl.py` | Fine-tuning del modello tramite Soft Actor-Critic puro con Auto-Entropy tuning e Warm-Start. Massimizza la velocità, salva il *Best Lap* (`sac_best_policy.pth`). L'esecuzione avviene in un display virtuale invisibile tramite `Xvfb`. |
 | 4. Test & Eval | `test_agent.py` | Esecuzione deterministica del modello finale su TORCS per valutare la capacità di completare giri autonomi. |
 
 ---
@@ -64,7 +64,7 @@ AIcar/
 ├── telemetry/                 # Telemetria CSV dei test agent (auto-generata)
 └── train_set/                 # Dati e Checkpoint
     ├── laps/                  #   File HDF5 dei giri registrati (lap_001.h5 ...)
-    ├── checkpoints/           #   Pesi: bc_policy.pth, sac_policy.pth, sac_checkpoint.pth
+    ├── checkpoints/           #   Pesi: bc_policy.pth, sac_policy.pth, sac_best_policy.pth, sac_checkpoint.pth
     │   └── sac_checkpoint_buffer.npz  # Replay Buffer compresso (numpy)
     └── session_logs/          #   Log delle sessioni di training
 ```
@@ -133,19 +133,21 @@ python sac_rl.py \
 
 Il training è **resume-safe**: il checkpoint viene salvato ad ogni episodio. Puoi interromperlo con `Ctrl+C` e riprenderlo in qualsiasi momento.
 
-**Output:** `train_set/checkpoints/sac_policy.pth` + `sac_checkpoint.pth` + `sac_checkpoint_buffer.npz`
+Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per prevenire problemi di focus con il desktop dell'host. 
+
+**Output:** `train_set/checkpoints/sac_policy.pth` + `sac_best_policy.pth` + `sac_checkpoint.pth` + `sac_checkpoint_buffer.npz`
 
 ### 4. Test Deterministico (Inference)
 
-Il test agent auto-rileva i migliori pesi disponibili: `sac_policy.pth` → `bc_policy.pth`.
+Il test agent auto-rileva i migliori pesi disponibili: `sac_best_policy.pth` → `sac_policy.pth` → `bc_policy.pth`.
 
 ```bash
-# Auto-detect (priorità: SAC > BC)
-python test_agent.py
+# Esecuzione standard con bypass Xvfb (visibile a schermo)
+SHOW_GUI=1 python test_agent.py
 
 # Specificare esplicitamente i pesi
-python test_agent.py --weights train_set/checkpoints/sac_policy.pth --laps 3
-python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 1
+SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/sac_best_policy.pth --laps 3
+SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 1
 ```
 
 ### Script di Supporto
@@ -189,14 +191,16 @@ Actor (Warm-Start da BC)                    Critic (Twin Q-Network, da zero)
 
 **Critic Warm-Up:** I primi 5000 step aggiornano solo il Critic. Questo protegge i pesi BC dai gradienti randomici di un Critic non ancora calibrato.
 
-### Reward Reshaping (SAC-Compatible)
+### Reward Reshaping Unificato (SAC-Compatible)
 
-$$r_t = \underbrace{v_x \cos(\theta) \times 10}_{\text{progress}} \underbrace{- 1.0}_{\text{time penalty}} \underbrace{- 2|\theta|}_{\text{angle}} \underbrace{- p^2}_{\text{track pos}} \underbrace{- 0.5|\delta_t - \delta_{t-1}|}_{\text{steer smooth}}$$
+La formula del calcolo della ricompensa per timestep in `gym_torcs.py`:
 
-- **Progress ×10**: Bilanciato con il termine entropico $\alpha \cdot \log \pi$ del SAC
-- **Time Penalty -1.0**: Incentiva la velocità senza sparse reward
-- **Terminali cappati a -50.0**: Fuoripista, spin, stallo, collisione — tutti $r = -50$
-- **Nessuna sparse reward**: Niente bonus a fine giro per non distorcere la Value Function
+$$r_t = \underbrace{\frac{v_x}{50} \cos(\theta)}_{\text{progress}} \underbrace{- 0.1}_{\text{time penalty}} \underbrace{- 0.1|\delta_t - \delta_{t-1}|}_{\text{steer smooth}}$$
+
+- **Progress**: Basato sulla velocità in avanti normalizzata diviso 50.
+- **Time Penalty -0.1**: Costante per incentivare il completamento del tracciato rapido.
+- **Terminali cappati a -10.0**: Danno al veicolo, fuoripista, spin (retromarcia) e stallo, configurando il dizionario `info['crash'] = True`.
+- **Nessuna sparse reward**: Reward densa per evitare distorsioni del gradiente del Critic.
 
 ### Replay Buffer Checkpointing
 
@@ -245,6 +249,14 @@ Il training BC include perturbazione laterale dello stato (`trackPos ±0.15`) co
 ---
 
 ## 🐛 Bug Risolti (Workflow Tracking)
+
+### [2026-05-29] Finalizzazione Architettura (Xvfb, Best Lap, Pure SAC)
+
+**Fix applicati:**
+1. **Ambiente Isolato Xvfb:** TORCS e le macro girano confinati in un virtual display senza rubare focus. Usare `SHOW_GUI=1` per lo sblocco in rendering locale.
+2. **Auto-Entropy Tuning**: Introdotto tuning automatico del `log_alpha` per un corretto calcolo del SAC.
+3. **Pure SAC Actor Loss**: Rimossa la logica fallata TD3+BC dalla fase Online. L'Actor massimizza unicamente entropia e Q-Value target senza auto-imitare il proprio rumore di addestramento.
+4. **Early Checkpointing**: L'agente salva il `sac_best_policy.pth` a ogni giro da record. Logging semantico per gli episodi `[SUCCESS]`, `[CRASH]` o `[TIMEOUT]`.
 
 ### [2026-05-29] Migrazione Ibrida BC-RL (SAC) — ARCHITETTURALE
 
