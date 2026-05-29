@@ -15,8 +15,8 @@ _AUTOSTART_SH = os.path.join(_THIS_DIR, 'autostart.sh')
 
 
 class TorcsEnv:
-    terminal_judge_start = 100000  # Speed limit is applied after this step
-    termination_limit_progress = 5  # [km/h], episode terminates if car is running slower than this limit
+    terminal_judge_start = 150  # L'antistallo (speed limit) viene applicato dopo 150 step (3 secondi)
+    termination_limit_progress = 20  # [km/h], episode terminates if car is running slower than this limit
     default_speed = 50
 
     initial_reset = True
@@ -123,42 +123,55 @@ class TorcsEnv:
         # Make an obsevation from a raw observation vector from TORCS
         self.observation = self.make_observaton(obs)
 
-        # ─── Reward Reshaping (SAC-Compatible) ───────────────────────
-        # 1. Base Progress: velocità lungo l'asse della pista (×10 per
-        #    bilanciare il termine entropico α·log(π) del SAC)
-        sp = np.array(obs['speedX'])
-        progress = sp * np.cos(obs['angle']) * 10.0
+        # ─── Reward Consolidation (Scaled for Auto-Entropy SAC) ───────────────────────
+        # Progress: usiamo la velocità normalizzata per mantenere reward tra [0, ~5.0]
+        sp_norm = obs['speedX'] / self.default_speed
+        angle = obs['angle']
+        track_pos = obs['trackPos']
+        
+        progress = sp_norm * np.cos(angle)
+        
+        # Penalità di posizione: quadratica rispetto al centro pista
+        track_pos_penalty = - (track_pos / 1.25) ** 2
+        
+        # Penalità fluidità sterzo
+        current_steer = this_action['steer']
+        steer_smoothness = -0.1 * abs(current_steer - getattr(self, 'last_steer', current_steer))
+        self.last_steer = current_steer
+        
+        # Time penalty debole per incentivare velocità
+        time_penalty = -0.1
+        
+        reward = progress + track_pos_penalty + steer_smoothness + time_penalty
+        
+        info = {'crash': False, 'off_track': False, 'stall': False, 'spin': False}
 
-        # 2. Dense Time Penalty: incentiva tempi sul giro bassi
-        #    Scalata a -1.0 per essere proporzionata al progress ×10
-        reward = progress - 1.0
-
-        # 3. Collision Penalty (cappata a -50.0 per stabilità Q-Network)
+        # Collision Penalty (cappata a -10.0 per limitare TD-error, imposta crash)
         if obs['damage'] - obs_pre['damage'] > 0:
-            reward = -50.0
+            reward = -10.0
+            info['crash'] = True
+            client.R.d['meta'] = True
 
         # ─── Termination Conditions ──────────────────────────────────
-        episode_terminate = False
         if self.early_termination:
-            # Fuoripista (|trackPos| > 1.5)
-            if abs(obs['trackPos']) > 1.5:
-                reward = -50.0
-                episode_terminate = True
+            # Fuoripista (|trackPos| > 1.25) per combaciare con la data collection
+            if abs(track_pos) > 1.25:
+                reward = -10.0
+                info['off_track'] = True
                 client.R.d['meta'] = True
 
             # Stallo (velocità troppo bassa dopo warm-up iniziale)
             if self.terminal_judge_start < self.time_step:
-                if progress < self.termination_limit_progress:
-                    reward = -50.0
-                    episode_terminate = True
+                if (obs['speedX'] * np.cos(angle)) < self.termination_limit_progress:
+                    reward = -10.0
+                    info['stall'] = True
                     client.R.d['meta'] = True
 
             # Spin (l'agente sta andando in retromarcia)
-            if np.cos(obs['angle']) < 0:
-                reward = -50.0
-                episode_terminate = True
+            if np.cos(angle) < 0:
+                reward = -10.0
+                info['spin'] = True
                 client.R.d['meta'] = True
-
 
         if client.R.d['meta'] is True: # Send a reset signal
             self.initial_run = False
@@ -166,7 +179,7 @@ class TorcsEnv:
 
         self.time_step += 1
 
-        return self.get_obs(), reward, client.R.d['meta'] or client.so is None, {}
+        return self.get_obs(), reward, client.R.d['meta'] or client.so is None, info
 
     def reset(self, relaunch=False):
         #print("Reset")
@@ -199,6 +212,7 @@ class TorcsEnv:
         self.observation = self.make_observaton(obs)
 
         self.last_u = None
+        self.last_steer = 0.0
 
         self.initial_reset = False
         return self.get_obs()

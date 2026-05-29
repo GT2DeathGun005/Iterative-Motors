@@ -273,10 +273,16 @@ class SACAgent:
             param.requires_grad = False
 
         # Optimizer: aggiorna SOLO continuous_head e log_std_head
+        # LR ridotto a 3e-6 per evitare Catastrophic Forgetting dei pesi BC quando il Critic invia gradienti
         actor_params = list(self.actor.continuous_head.parameters()) + list(self.actor.log_std_head.parameters())
-        self.actor_optimizer = optim.Adam(actor_params, lr=3e-5)
+        self.actor_optimizer = optim.Adam(actor_params, lr=3e-6)
 
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
+
+        # Auto-Entropy Tuning
+        self.target_entropy = -3.0  # -dim_action (3 continue actions)
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
 
     def select_action(self, state, evaluate=False):
         state_t = torch.FloatTensor(state).to(self.device).unsqueeze(0)
@@ -293,11 +299,14 @@ class SACAgent:
         reward_b = torch.FloatTensor(reward_b).to(self.device).unsqueeze(1)
         mask_b = torch.FloatTensor(mask_b).to(self.device).unsqueeze(1)
 
+        # Alpha calculation
+        alpha = self.log_alpha.exp().item()
+
         # Critic Update
         with torch.no_grad():
             next_action, next_log_pi, _ = self.actor.sample(next_state_b)
             q1_next, q2_next = self.critic_target(next_state_b, next_action)
-            min_q_next = torch.min(q1_next, q2_next) - self.alpha * next_log_pi
+            min_q_next = torch.min(q1_next, q2_next) - alpha * next_log_pi
             target_q = reward_b + mask_b * self.gamma * min_q_next
 
         q1, q2 = self.critic(state_b, action_b)
@@ -316,19 +325,32 @@ class SACAgent:
             pi, log_pi, _ = self.actor.sample(state_b)
             q1_pi, q2_pi = self.critic(state_b, pi)
             min_q_pi = torch.min(q1_pi, q2_pi)
-            actor_loss = (self.alpha * log_pi - min_q_pi).mean()
+            
+            # BC Regularization (TD3+BC style) per prevenire Catastrophic Forgetting.
+            # Ancoriamo la policy all'azione del buffer (che è guidata dal BC puro).
+            # Il peso (bc_weight) scala con i Q-value per bilanciare i gradienti.
+            bc_weight = min_q_pi.abs().mean().detach() / 2.5
+            bc_loss = F.mse_loss(pi, action_b)
+            
+            actor_loss = (self.log_alpha.exp() * log_pi - min_q_pi).mean() + bc_weight * bc_loss
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_optimizer.step()
             actor_loss_val = actor_loss.item()
+            
+            # Alpha Update
+            alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
 
         # Target Soft Update
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
             tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
 
-        return critic_loss.item(), actor_loss_val
+        return critic_loss.item(), actor_loss_val, alpha
 
     def save_checkpoint(self, filepath, episode, global_step, memory):
         """Salva checkpoint PyTorch (reti + ottimizzatori) e buffer numpy separato."""
@@ -365,67 +387,6 @@ class SACAgent:
         print(f"✅ Checkpoint caricato: ripresa dall'Episodio {checkpoint['episode']} "
               f"(Step {checkpoint['global_step']}). Buffer: {len(memory)} transizioni")
         return checkpoint['episode'], checkpoint['global_step']
-
-# ──────────────────────────────────────────────────────────────────────
-#  Reward Function (SAC-Compatible, Scaled)
-# ──────────────────────────────────────────────────────────────────────
-def compute_reward(obs, prev_steer, cont_action, prev_damage):
-    """Calcola la reward SAC-compatible con Dense Shaping.
-
-    Componenti:
-      1. progress = speedX * cos(angle) * 10.0  (scalato ×10)
-      2. angle_penalty = -2.0 * |angle|
-      3. track_pos_penalty = -1.0 * trackPos²
-      4. steer_smoothness = -0.5 * |steer - prev_steer|
-      5. dense_time_penalty = -1.0
-      6. damage_penalty = -50.0 (se danno aumenta)
-
-    Terminali (tutte cappate a -50.0):
-      - Fuoripista (|trackPos| > 1.5) → -50.0, done=True
-      - Spin (cos(angle) < 0) → -50.0, done=True
-
-    Returns:
-        (reward, done, current_damage)
-    """
-    speed_x = float(np.array(obs.get('speedX', 0.0)).flat[0])
-    angle = float(np.array(obs.get('angle', 0.0)).flat[0])
-    track_pos = float(np.array(obs.get('trackPos', 0.0)).flat[0])
-    damage = float(np.array(obs.get('damage', 0.0)).flat[0])
-    steer = cont_action[0]
-
-    # Progress scalato ×10 per bilanciare α·log(π)
-    progress = speed_x * np.cos(angle) * 10.0
-    angle_penalty = -2.0 * abs(angle)
-    track_pos_penalty = -1.0 * (track_pos ** 2)
-
-    # Penalità regolarizzante sullo sterzo (fluidità)
-    steer_smoothness = -0.5 * abs(steer - prev_steer)
-
-    # Dense Time Penalty (scalata a -1.0 per match col progress ×10)
-    time_penalty = -1.0
-
-    # Penalità per collisione col muro o danno (cappata a -50.0)
-    damage_penalty = 0.0
-    if damage > prev_damage:
-        damage_penalty = -50.0
-
-    reward = progress + angle_penalty + track_pos_penalty + steer_smoothness + damage_penalty + time_penalty
-
-    done = False
-
-    # ── Terminali: Tutte cappate a -50.0 ──
-    # Fuoripista critico
-    if abs(track_pos) > 1.50:
-        reward = -50.0
-        done = True
-
-    # Spin (retromarcia)
-    if np.cos(angle) < 0:
-        reward = -50.0
-        done = True
-
-    return reward, done, damage
-
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bc_weights', type=str, default='train_set/checkpoints/bc_policy.pth')
@@ -437,8 +398,7 @@ def train():
 
     set_seed(args.seed)
 
-    # State Stacking (k=6, t-12, t-6, t) = 3x29 = 87
-    env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=False)
+    env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=True)
     agent = SACAgent()
     memory = ReplayBuffer(capacity=100000)
 
@@ -471,79 +431,53 @@ def train():
 
         episode_reward = 0
         step = 0
-        prev_steer = 0.0
-        prev_damage = 0.0
-        prev_dist = 0.0
         current_gear = 1
         critic_loss_val = 0.0
         actor_loss_val = 0.0
-        stuck_steps = 0
+        current_alpha = 0.02
+        prev_steer = 0.0
         max_dist = 0.0
 
         while True:
-            # L'Actor DEVE essere in eval() durante l'inferenza anche in fase di esplorazione SAC
-            # per disattivare eventuali dropout o BN (anche se non ci sono, è best practice).
             agent.actor.eval()
             cont_action, raw_gear = agent.select_action(stacked_state, evaluate=False)
 
-            # Gear Hysteresis (Sequential Filter)
             if raw_gear > current_gear + 1:
                 raw_gear = current_gear + 1
             elif raw_gear < current_gear - 1:
                 raw_gear = current_gear - 1
             current_gear = max(1, raw_gear)
 
-            agent.actor.train() # Riattiva train per i gradienti (su log_std_head e continuous_head)
+            agent.actor.train()
 
             env_action = action_to_env(cont_action, current_gear)
-            next_ob, _, env_done, _ = env.step(env_action)
-
-            reward, done, current_damage = compute_reward(next_ob, prev_steer, cont_action, prev_damage)
+            next_ob, reward, env_done, info = env.step(env_action)
+            
+            is_failure = info.get('crash') or info.get('off_track') or info.get('stall') or info.get('spin')
+            if is_failure:
+                if info.get('stall'):
+                    print(f"    ⚠️ Anti-Stall attivato allo step {step}!")
+                elif info.get('off_track'):
+                    print(f"    ⚠️ Fuori pista allo step {step}!")
+                elif info.get('spin'):
+                    print(f"    ⚠️ Spin allo step {step}!")
+                elif info.get('crash'):
+                    print(f"    ⚠️ Schianto/Danno allo step {step}!")
+                    
+            done = env_done or is_failure
             prev_steer = cont_action[0]
-            prev_damage = current_damage
-
-            # Anti-stall logic: speed_x in gym_torcs è normalizzata dividendo per 50.0 km/h.
-            # Quindi 20 km/h corrisponde a 20/50 = 0.4
-            speed_x = float(np.array(next_ob.get('speedX', 0.0)).flat[0])
-            if speed_x < 0.4:
-                stuck_steps += 1
-            else:
-                stuck_steps = 0
-
-            # Punizione se bloccata per più di 150 step (3 secondi) — cappata a -50.0
-            if stuck_steps > 150:
-                reward = -50.0
-                done = True
-                print(f"    ⚠️ Anti-Stall attivato allo step {step}!")
 
             next_f_state = flatten_state(next_ob)
             state_stack.append(next_f_state)
 
-            # Tracciamento distanza percorsa
-            current_dist = float(np.array(next_ob.get('distFromStart', 0.0)).flat[0])
-            last_lap_time = float(np.array(next_ob.get('lastLapTime', 0.0)).flat[0])
-            max_dist = max(max_dist, current_dist)
+            current_dist = float(np.array(next_ob.get('distRaced', 0.0)).flat[0])
+            max_dist = current_dist
 
-            # Controllo completamento/invalidazione giro
-            if prev_dist > 2500.0 and current_dist < 500.0 and step > 500:
-                if last_lap_time <= 0.0:
-                    # Giro invalidato dal simulatore (taglio curva o impatto)
-                    reward = -50.0
-                    done = True
-                else:
-                    # Giro valido! Nessun bonus sparso — il Dense Reward è sufficiente.
-                    # La Value Function non deve essere distorta da picchi.
-                    done = True
-
-            prev_dist = current_dist
             next_stacked_state = np.concatenate([state_stack[0], state_stack[6], state_stack[12]])
 
             # ── Done Masking (Cruciale per SAC) ──
-            # done=True va al buffer SOLO per terminazioni reali (schianti, fuoripista, spin).
-            # Il time-limit (max_steps) NON imposta done=True perché il vero state-value
-            # non è zero (l'auto sta ancora guidando).
             time_limit_reached = (step >= args.max_steps)
-            mask = 0.0 if done else 1.0
+            mask = 0.0 if is_failure else 1.0
             memory.push(stacked_state, cont_action, reward, next_stacked_state, mask)
 
             stacked_state = next_stacked_state
@@ -552,17 +486,19 @@ def train():
             global_step += 1
 
             if len(memory) > batch_size:
-                critic_loss_val, actor_loss_val = agent.update(memory, batch_size, global_step)
+                critic_loss_val, actor_loss_val, current_alpha = agent.update(memory, batch_size, global_step)
 
             if done or env_done or time_limit_reached:
                 break
 
         # Tempo stimato (50Hz = 0.02s per step)
         lap_time = step * 0.02
-        log_msg = (f"[{datetime.now().strftime('%H:%M:%S')}] Episode {episode+1:03d} | "
+        time_str = datetime.now().strftime("%H:%M:%S")
+        log_msg = (f"[{time_str}] Episode {episode+1:03d} | "
                    f"Reward: {episode_reward:7.1f} | Steps: {step:4d} | "
-                   f"Time: {lap_time:5.1f}s | Dist: {max_dist:6.0f}m | "
-                   f"CriticL: {critic_loss_val:.3f} | ActorL: {actor_loss_val:.3f}")
+                   f"Time: {lap_time:5.1f}s | Dist: {int(max_dist):5d}m | "
+                   f"CriticL: {critic_loss_val:.3f} | ActorL: {actor_loss_val:.3f} | "
+                   f"Alpha: {current_alpha:.3f}")
         print(f"🏁 {log_msg}")
 
         # Salva log testuale semplice
