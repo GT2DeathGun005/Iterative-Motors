@@ -279,10 +279,7 @@ class SACAgent:
 
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
 
-        # Auto-Entropy Tuning
-        self.target_entropy = -3.0  # -dim_action (3 continue actions)
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
+        self.alpha = 0.05  # Esplorazione bassa e costante, sicura per il BC
 
     def select_action(self, state, evaluate=False):
         state_t = torch.FloatTensor(state).to(self.device).unsqueeze(0)
@@ -300,7 +297,7 @@ class SACAgent:
         mask_b = torch.FloatTensor(mask_b).to(self.device).unsqueeze(1)
 
         # Alpha calculation
-        alpha = self.log_alpha.exp().item()
+        alpha = self.alpha
 
         # Critic Update
         with torch.no_grad():
@@ -327,20 +324,13 @@ class SACAgent:
             min_q_pi = torch.min(q1_pi, q2_pi)
             
             # L'Actor massimizza il Q-Value stimato e l'Entropia.
-            actor_loss = (self.log_alpha.exp() * log_pi - min_q_pi).mean()
+            actor_loss = (alpha * log_pi - min_q_pi).mean()
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_optimizer.step()
             actor_loss_val = actor_loss.item()
-            
-            # Alpha Update
-            alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
-
         # Target Soft Update
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
             tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
