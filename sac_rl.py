@@ -83,6 +83,63 @@ class ReplayBuffer:
         if len(self.buffer) == 0:
             return
         states, actions, rewards, next_states, dones = zip(*self.buffer)
+
+    def load_expert_data(self, h5_dir_or_file: str, max_samples: int = None):
+        """Carica dimostrazioni umane nel replay buffer per Expert Buffer Injection."""
+        import glob
+        import h5py
+        import os
+
+        if os.path.isdir(h5_dir_or_file):
+            h5_files = sorted(glob.glob(os.path.join(h5_dir_or_file, "**/lap_*.h5"), recursive=True))
+        else:
+            h5_files = [h5_dir_or_file]
+            
+        loaded = 0
+        for f in h5_files:
+            if max_samples and loaded >= max_samples: break
+            try:
+                with h5py.File(f, 'r') as h5f:
+                    states_np = h5f['states'][:]
+                    actions_np = h5f['actions'][:] # steer, accel, brake, gear
+                    
+                length = len(states_np)
+                k = 6
+                for i in range(length - 1): # -1 per avere next_state
+                    if max_samples and loaded >= max_samples: break
+                    
+                    idx_t6 = max(0, i - k)
+                    idx_t12 = max(0, i - 2 * k)
+                    
+                    next_i = i + 1
+                    n_idx_t6 = max(0, next_i - k)
+                    n_idx_t12 = max(0, next_i - 2 * k)
+                    
+                    stacked_state = np.concatenate([states_np[idx_t12], states_np[idx_t6], states_np[i]])
+                    next_stacked_state = np.concatenate([states_np[n_idx_t12], states_np[n_idx_t6], states_np[next_i]])
+                    
+                    cont_action = actions_np[i, 0:3]
+                    
+                    # Ricalcoliamo il reward con la nuova logica (Soft Shaping)
+                    speedX = states_np[i, 21] * 50.0
+                    angle = states_np[i, 0]
+                    trackPos = states_np[i, 20]
+                    
+                    progress = (speedX / 50.0) * np.cos(angle)
+                    pos_penalty = -1.0 * (trackPos ** 2)
+                    steer_change = cont_action[0] - actions_np[i-1, 0] if i > 0 else 0.0
+                        
+                    reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
+                    
+                    done = (i == length - 2)
+                    mask = 0.0 if done else 1.0
+                    
+                    self.push(stacked_state, cont_action, reward, next_stacked_state, mask)
+                    loaded += 1
+            except Exception as e:
+                print(f"Errore caricando {f} nel replay buffer: {e}")
+                
+        print(f"  📥 [EXPERT INJECTION] Caricati {loaded} campioni esperti nel Replay Buffer da {h5_dir_or_file}")
         np.savez_compressed(filepath,
             states=np.array(states, dtype=np.float32),
             actions=np.array(actions, dtype=np.float32),
@@ -392,10 +449,15 @@ def train():
     set_seed(args.seed)
 
     env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=True)
-    agent = SACAgent()
-    memory = ReplayBuffer(capacity=100000)
+    print("  Inizializzazione Replay Buffer...")
+    memory = ReplayBuffer(100000)
 
-    # Gestione Resumable Checkpoint
+    # ── Expert Buffer Injection ──
+    # Se vuoi ricaricare l'offline dataset per forzare il Critic a rivalutare i pesi
+    # scommenta la riga sottostante.
+    # memory.load_expert_data("train_set/laps")
+
+    agent = SACAgent()
     checkpoint_path = 'train_set/checkpoints/sac_checkpoint.pth'
     start_episode, global_step = agent.load_checkpoint(checkpoint_path, memory)
 

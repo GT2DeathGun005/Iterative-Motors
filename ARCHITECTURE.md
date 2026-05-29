@@ -41,13 +41,22 @@ Se l'auto esce di pista (`|trackPos| > 1.5`), si schianta, o va in stallo, l'epi
 > La perdita reale percepita dalla rete neurale per quell'errore è quindi un **differenziale di -110 punti** su una scala di 100. 
 > Se impostassimo la penalità a `-1000`, la Mean Squared Error del Critic impazzirebbe (`MSE = 1.2 Milioni`), causando esplosione dei gradienti e *Catastrophic Forgetting*. La penalità di -10 è letale per l'agente, ma "sicura" per i gradienti.
 
-- **Alpha (Entropia)**: Fissato in modo sicuro a `0.005`. Rimosso l'Adaptive Alpha poiché instabile su policy derivate da BC con azioni "hard-clipped".
+- **Alpha (Entropia)**: Attualmente impostato a `0.02`. Inizialmente basso, è stato rialzato per prevenire il collasso deterministico dell'Actor (dove ottimizzava il `log_std` verso lo zero ed entrava in uno stallo detto *Exploration Dip*).
+- **Action Noise nel Rollout**: Per rompere l'iper-confidenza di un Critic arrivato a un "ottimo locale" (es. andare dritto ai 470m schiantandosi), viene iniettato un rumore Gaussiano (`μ=0, σ=0.05`) alle azioni durante il rollout. Questo causa leggere vibrazioni sull'auto, forzandola a esplorare traiettorie non contemplate dalla vecchia policy, senza però causare lo stallo fisico del motore. L'inferenza (`evaluate=True`) rimane puramente deterministica.
 
-## 4. Replay Buffer e Checkpointing
+## 4. Replay Buffer, Checkpointing e Buffer Injection
 - **Masking Corretto**: Il flag `done=True` viene salvato nel buffer *esclusivamente* in caso di crash o fallimento. Il superamento del tempo massimo (`max_steps`) o il completamento del giro non alterano il valore di Bellman (mask = 1.0).
 - **Compressione su Disco**: Per evitare di perdere dati tra i vari run e mitigare il catastrophic forgetting, l'intero buffer viene salvato come array numpy compresso (`.npz`) parallelamente ai pesi PyTorch (`.pth`).
+- **Expert Buffer Injection**: Metodo `memory.load_expert_data()` implementato per risolvere le colli di bottiglia esplorativi (*Sample Inefficiency*). Consente di raccogliere dati umani mirati tramite `data_collection.py` su settori ostici e caricarli *offline-to-online* nel Replay Buffer del SAC. Il Critic valuterà istantaneamente i Q-Value di queste mosse esperte (ricalcolando i reward tramite il Soft Shaping), forzando l'Actor a imitarle in pochissimi step di gradiente, abbattendo le tempistiche da ore a minuti.
 
 ## 5. Memory Safety (TORCS C++ Engine)
 L'ambiente TORCS nativo soffre di un grave memory leak interno quando si riavvia la gara via socket (UDP). 
 
 > **Soluzione Relaunch**: Abbiamo bypassato il memory leak a livello di sistema operativo. Passando `relaunch=True` ad ogni episodio, il server TORCS viene ucciso (`pkill -9 torcs`), le porte UDP vengono svuotate, e viene lanciata una nuova istanza pulita all'interno di un server display virtuale isolato (`xvfb-run`). Questo rende l'ambiente **100% memory safe** anche per addestramenti di giorni interi.
+
+## 6. Strategie per Velocizzare l'Addestramento (Fast-Track)
+L'addestramento RL puro per il superamento di ostacoli complessi (come curve molto strette) può richiedere ore. Per accelerare massivamente il processo, è consigliato sfruttare la flessibilità dell'architettura ibrida:
+
+1. **Raccogliere nuovi dati mirati**: Usare `data_collection.py` per guidare manualmente e mostrare alla rete come superare il settore in cui si blocca.
+2. **Aggiornare il Backbone BC (Scelta Consigliata)**: Fondere i nuovi dati con `preprocess_dataset.py` e ri-addestrare la rete da zero con `behavioral_cloning.py`. Il BC impiega pochi minuti su GPU. Successivamente, riavviare il SAC (`./train_rl.sh --clean`); il RL convergerà quasi istantaneamente perché partirà da un modello che conosce già la fisica della curva.
+3. **Iniezione Offline-to-Online**: In alternativa, scommentare `memory.load_expert_data()` in `sac_rl.py` per caricare le proprie traiettorie umane direttamente nel Replay Buffer del SAC (senza resettare i pesi attuali). Il Critic estrarrà dal buffer i campioni perfetti e guiderà l'Actor ad apprendere la nuova manovra.
