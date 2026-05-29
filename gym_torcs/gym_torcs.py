@@ -42,9 +42,12 @@ class TorcsEnv:
         # Costruisce il comando torcs base
         torcs_cmd = 'torcs -nofuel -nodamage -vision' if self.vision else 'torcs -nofuel -nodamage'
         
-        # Encapsula torcs e autostart.sh nello stesso ambiente xvfb-run per condividere il DISPLAY virtuale
-        xvfb_cmd = f'xvfb-run -a -s "-screen 0 640x480x24" sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1"'
-        os.system(f"{xvfb_cmd} &")
+        # Se la variabile SHOW_GUI è settata a 1, avvia normalmente. Altrimenti usa Xvfb.
+        if os.environ.get('SHOW_GUI', '0') == '1':
+            os.system(f'sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1" &')
+        else:
+            xvfb_cmd = f'xvfb-run -a -s "-screen 0 640x480x24" sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1"'
+            os.system(f"{xvfb_cmd} &")
         
         time.sleep(3.0) # Attendi l'inizializzazione del server X virtuale, torcs e della macro
 
@@ -233,8 +236,13 @@ class TorcsEnv:
         time.sleep(1.5)  # Garantisce che il sistema operativo liberi la porta UDP
         
         torcs_cmd = 'torcs -nofuel -nodamage -vision' if self.vision else 'torcs -nofuel -nodamage'
-        xvfb_cmd = f'xvfb-run -a -s "-screen 0 640x480x24" sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1"'
-        os.system(f"{xvfb_cmd} &")
+        
+        # Se la variabile SHOW_GUI è settata a 1, avvia normalmente. Altrimenti usa Xvfb.
+        if os.environ.get('SHOW_GUI', '0') == '1':
+            os.system(f'sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1" &')
+        else:
+            xvfb_cmd = f'xvfb-run -a -s "-screen 0 640x480x24" sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1"'
+            os.system(f"{xvfb_cmd} &")
         
         time.sleep(3.0)  # Tempo combinato per avvio e macro
 

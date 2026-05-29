@@ -326,13 +326,8 @@ class SACAgent:
             q1_pi, q2_pi = self.critic(state_b, pi)
             min_q_pi = torch.min(q1_pi, q2_pi)
             
-            # BC Regularization (TD3+BC style) per prevenire Catastrophic Forgetting.
-            # Ancoriamo la policy all'azione del buffer (che è guidata dal BC puro).
-            # Il peso (bc_weight) scala con i Q-value per bilanciare i gradienti.
-            bc_weight = min_q_pi.abs().mean().detach() / 2.5
-            bc_loss = F.mse_loss(pi, action_b)
-            
-            actor_loss = (self.log_alpha.exp() * log_pi - min_q_pi).mean() + bc_weight * bc_loss
+            # L'Actor massimizza il Q-Value stimato e l'Entropia.
+            actor_loss = (self.log_alpha.exp() * log_pi - min_q_pi).mean()
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
@@ -420,6 +415,8 @@ def train():
 
     print("🚀 Avvio training SAC (Warm-Start)..." if start_episode == 0 else "🚀 Ripresa training SAC...")
 
+    best_lap_time = float('inf')
+
     for episode in range(start_episode, args.episodes):
         # Relaunch=True garantisce azzeramento residui fisici
         ob = env.reset(relaunch=True)
@@ -437,6 +434,9 @@ def train():
         current_alpha = 0.02
         prev_steer = 0.0
         max_dist = 0.0
+        
+        termination_reason = "TIMEOUT"
+        new_record = False
 
         while True:
             agent.actor.eval()
@@ -466,11 +466,17 @@ def train():
             # Check completamento giro
             if last_lap_time > 0.0 and step > 500:
                 done = True  # L'episodio finisce perché hai vinto
+                termination_reason = "SUCCESS"
                 print(f"  🏎️  Giro completato: {last_lap_time:.2f}s!")
+                if last_lap_time < best_lap_time:
+                    best_lap_time = last_lap_time
+                    new_record = True
+                    torch.save(agent.actor.state_dict(), 'train_set/checkpoints/sac_best_policy.pth')
                 
             # Anche uno schianto finisce l'episodio
             if info.get('crash', False):
                 done = True
+                termination_reason = "CRASH"
 
             prev_dist = current_dist
             next_stacked_state = np.concatenate([state_stack[0], state_stack[6], state_stack[12]])
@@ -496,11 +502,15 @@ def train():
         # Tempo stimato (50Hz = 0.02s per step)
         lap_time = step * 0.02
         time_str = datetime.now().strftime("%H:%M:%S")
-        log_msg = (f"[{time_str}] Episode {episode+1:03d} | "
+        log_msg = (f"[{time_str}] Episode {episode+1:03d} | [{termination_reason}] | "
                    f"Reward: {episode_reward:7.1f} | Steps: {step:4d} | "
                    f"Time: {lap_time:5.1f}s | Dist: {int(max_dist):5d}m | "
                    f"CriticL: {critic_loss_val:.3f} | ActorL: {actor_loss_val:.3f} | "
                    f"Alpha: {current_alpha:.3f}")
+        
+        if new_record:
+            log_msg += f" | 🏆 NEW RECORD: {best_lap_time:.2f}s"
+            
         print(f"🏁 {log_msg}")
 
         # Salva log testuale semplice
