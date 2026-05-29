@@ -123,31 +123,39 @@ class TorcsEnv:
         # Make an obsevation from a raw observation vector from TORCS
         self.observation = self.make_observaton(obs)
 
-        # Reward setting Here #######################################
-        # direction-dependent positive reward
-        track = np.array(obs['track'])
+        # ─── Reward Reshaping (SAC-Compatible) ───────────────────────
+        # 1. Base Progress: velocità lungo l'asse della pista (×10 per
+        #    bilanciare il termine entropico α·log(π) del SAC)
         sp = np.array(obs['speedX'])
-        progress = sp*np.cos(obs['angle'])
-        reward = progress
+        progress = sp * np.cos(obs['angle']) * 10.0
 
-        # collision detection
+        # 2. Dense Time Penalty: incentiva tempi sul giro bassi
+        #    Scalata a -1.0 per essere proporzionata al progress ×10
+        reward = progress - 1.0
+
+        # 3. Collision Penalty (cappata a -50.0 per stabilità Q-Network)
         if obs['damage'] - obs_pre['damage'] > 0:
-            reward = -1
+            reward = -50.0
 
-        # Termination judgement #########################
+        # ─── Termination Conditions ──────────────────────────────────
         episode_terminate = False
         if self.early_termination:
-            if track.min() < 0:  # Episode is terminated if the car is out of track
-                reward = - 1
+            # Fuoripista (|trackPos| > 1.5)
+            if abs(obs['trackPos']) > 1.5:
+                reward = -50.0
                 episode_terminate = True
                 client.R.d['meta'] = True
 
-            if self.terminal_judge_start < self.time_step: # Episode terminates if the progress of agent is small
+            # Stallo (velocità troppo bassa dopo warm-up iniziale)
+            if self.terminal_judge_start < self.time_step:
                 if progress < self.termination_limit_progress:
+                    reward = -50.0
                     episode_terminate = True
                     client.R.d['meta'] = True
 
-            if np.cos(obs['angle']) < 0: # Episode is terminated if the agent runs backward
+            # Spin (l'agente sta andando in retromarcia)
+            if np.cos(obs['angle']) < 0:
+                reward = -50.0
                 episode_terminate = True
                 client.R.d['meta'] = True
 

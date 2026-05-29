@@ -1,3 +1,27 @@
+"""
+SAC Fine-Tuning — Soft Actor-Critic con Warm-Start da Behavioral Cloning
+
+Architettura Ibrida BC-RL per TORCS:
+  - L'Actor eredita backbone + gear_head dal BC (congelati via Gradient Freezing)
+  - Il SAC aggiorna SOLO continuous_head e log_std_head
+  - Il Critic (Twin Q-Network) è addestrato da zero
+  - Critic Warm-Up: i primi 5000 step aggiornano solo il Critic
+
+Reward Reshaping (SAC-Compatible):
+  - progress = speedX * cos(angle) * 10.0  (scalato per bilanciare α·log(π))
+  - Dense Time Penalty: -1.0 per step
+  - Tutte le penalità terminali: cappate a -50.0
+  - Nessuna sparse reward a fine episodio
+
+Replay Buffer:
+  - Salvataggio su disco con np.savez_compressed (separato dal checkpoint PyTorch)
+  - Previene catastrophic forgetting durante interruzioni
+
+Done Masking:
+  - done=True SOLO per schianti, fuoripista e spin
+  - Il time-limit (max_steps) NON imposta done=True nel buffer
+"""
+
 import os
 import sys
 import argparse
@@ -35,7 +59,7 @@ def set_seed(seed=42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 # ──────────────────────────────────────────────────────────────────────
-#  Replay Buffer
+#  Replay Buffer con Checkpointing su Disco
 # ──────────────────────────────────────────────────────────────────────
 class ReplayBuffer:
     def __init__(self, capacity: int):
@@ -48,6 +72,35 @@ class ReplayBuffer:
         batch = random.sample(self.buffer, batch_size)
         state, action, reward, next_state, done = map(np.stack, zip(*batch))
         return state, action, reward, next_state, done
+
+    def save(self, filepath: str):
+        """Salva il buffer su disco con compressione numpy."""
+        if len(self.buffer) == 0:
+            return
+        states, actions, rewards, next_states, dones = zip(*self.buffer)
+        np.savez_compressed(filepath,
+            states=np.array(states, dtype=np.float32),
+            actions=np.array(actions, dtype=np.float32),
+            rewards=np.array(rewards, dtype=np.float32),
+            next_states=np.array(next_states, dtype=np.float32),
+            dones=np.array(dones, dtype=np.float32))
+
+    def load(self, filepath: str):
+        """Carica il buffer da disco."""
+        if not os.path.exists(filepath):
+            return
+        data = np.load(filepath)
+        states = data['states']
+        actions = data['actions']
+        rewards = data['rewards']
+        next_states = data['next_states']
+        dones = data['dones']
+        for i in range(len(states)):
+            self.buffer.append((
+                states[i], actions[i], float(rewards[i]),
+                next_states[i], float(dones[i])
+            ))
+        print(f"  📦 Replay Buffer caricato da disco: {len(self.buffer)} transizioni")
 
     def __len__(self):
         return len(self.buffer)
@@ -79,30 +132,28 @@ def flatten_state(state_dict: dict) -> np.ndarray:
         return np.zeros(29, dtype=np.float32)
 
 def action_to_env(cont_action, gear_idx):
-    """Converte l'output dell'Actor (Tanh [-1, 1] e Gear Idx [0-6]) nel formato TORCS.
-    
-    Ricostruisce ESATTAMENTE l'attivazione Sigmoid che il backbone BC si aspetta.
+    """Converte l'output Tanh [-1, 1] dell'Actor SAC nel formato TORCS.
+
+    Mappatura:
+      - steer: [-1, 1] → [-1, 1]  (diretto, già Tanh)
+      - accel: [-1, 1] → [0, 1]   (trasformazione affine (x+1)/2)
+      - brake: [-1, 1] → [0, 1]   (trasformazione affine (x+1)/2)
+
+    La trasformazione affine è stabile e priva degli asintoti dell'arctanh.
     """
     env_action = np.zeros(4, dtype=np.float32)
     env_action[0] = np.clip(cont_action[0], -1.0, 1.0)               # steer
-    
-    # Inverte il Tanh dell'Actor SAC per recuperare i raw logits
-    u_accel = np.clip(cont_action[1], -0.9999, 0.9999)
-    u_brake = np.clip(cont_action[2], -0.9999, 0.9999)
-    
-    x_accel = np.arctanh(u_accel)
-    x_brake = np.arctanh(u_brake)
-    
-    # Applica il Sigmoid per un matching 1:1 con il BC
-    accel = 1.0 / (1.0 + np.exp(-x_accel))
-    brake = 1.0 / (1.0 + np.exp(-x_brake))
-    
+
+    # Rimappatura affine: Tanh [-1, 1] → TORCS [0, 1]
+    accel = np.clip((cont_action[1] + 1.0) / 2.0, 0.0, 1.0)
+    brake = np.clip((cont_action[2] + 1.0) / 2.0, 0.0, 1.0)
+
     # Mutual exclusion (come l'esperto umano e il test_agent)
     if brake > 0.05:
         accel = 0.0
-        
-    env_action[1] = np.clip(accel, 0.0, 1.0)
-    env_action[2] = np.clip(brake, 0.0, 1.0)
+
+    env_action[1] = accel
+    env_action[2] = brake
     env_action[3] = float(max(1, min(6, gear_idx)))
     return env_action
 
@@ -127,11 +178,11 @@ class Actor(nn.Module):
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
         )
-        
+
         # Teste originali del BC
         self.continuous_head = nn.Linear(hidden_size, 3) # Steer, Accel, Brake
         self.gear_head = nn.Linear(hidden_size, 7)       # Cambio (discreto)
-        
+
         # Nuova testa per la deviazione standard SAC
         self.log_std_head = nn.Linear(hidden_size, 3)
 
@@ -145,20 +196,20 @@ class Actor(nn.Module):
 
     def sample(self, state, evaluate=False):
         mean, log_std, gear_logits = self.forward(state)
-        
-        # Gear: Scelta puramente deterministica basata sui pesi BC
+
+        # Gear: Scelta puramente deterministica basata sui pesi BC (congelati)
         gear_idx = torch.argmax(gear_logits, dim=-1)
-        
+
         if evaluate:
-            # Determinismo assoluto per le azioni continue
+            # Determinismo assoluto: restituisce tanh(mean), nessun campionamento
             action = torch.tanh(mean)
             return action, None, gear_idx
-            
+
         std = log_std.exp()
         normal = Normal(mean, std)
         x_t = normal.rsample()  # Reparameterization trick
         action = torch.tanh(x_t)
-        
+
         log_prob = normal.log_prob(x_t)
         log_prob -= torch.log(1 - action.pow(2) + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
@@ -169,10 +220,10 @@ class Actor(nn.Module):
         if not os.path.exists(bc_path):
             print(f"⚠️ Checkpoint BC {bc_path} non trovato. Partenza da zero.")
             return
-            
+
         bc_state = torch.load(bc_path, map_location='cpu', weights_only=True)
         self.load_state_dict(bc_state, strict=False)
-        
+
         # Inizializza log_std per esplorazione infinitesimale (Warm-Start)
         nn.init.constant_(self.log_std_head.weight, 0.0)
         nn.init.constant_(self.log_std_head.bias, -6.0)
@@ -224,7 +275,7 @@ class SACAgent:
         # Optimizer: aggiorna SOLO continuous_head e log_std_head
         actor_params = list(self.actor.continuous_head.parameters()) + list(self.actor.log_std_head.parameters())
         self.actor_optimizer = optim.Adam(actor_params, lr=3e-5)
-        
+
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
 
     def select_action(self, state, evaluate=False):
@@ -235,7 +286,7 @@ class SACAgent:
 
     def update(self, memory, batch_size, global_step):
         state_b, action_b, reward_b, next_state_b, mask_b = memory.sample(batch_size)
-        
+
         state_b = torch.FloatTensor(state_b).to(self.device)
         next_state_b = torch.FloatTensor(next_state_b).to(self.device)
         action_b = torch.FloatTensor(action_b).to(self.device)
@@ -280,6 +331,7 @@ class SACAgent:
         return critic_loss.item(), actor_loss_val
 
     def save_checkpoint(self, filepath, episode, global_step, memory):
+        """Salva checkpoint PyTorch (reti + ottimizzatori) e buffer numpy separato."""
         checkpoint = {
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
@@ -288,79 +340,112 @@ class SACAgent:
             'critic_optimizer': self.critic_optimizer.state_dict(),
             'episode': episode,
             'global_step': global_step,
-            'memory_buffer': memory.buffer
         }
         torch.save(checkpoint, filepath)
-        
+
+        # Salva il Replay Buffer separatamente con compressione numpy
+        buffer_path = filepath.replace('.pth', '_buffer.npz')
+        memory.save(buffer_path)
+
     def load_checkpoint(self, filepath, memory):
         if not os.path.exists(filepath):
             return 0, 0
-            
-        checkpoint = torch.load(filepath, map_location=self.device)
+
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
         self.actor.load_state_dict(checkpoint['actor'])
         self.critic.load_state_dict(checkpoint['critic'])
         self.critic_target.load_state_dict(checkpoint['critic_target'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
-        memory.buffer = checkpoint['memory_buffer']
-        
-        print(f"✅ Checkpoint integrale caricato: ripresa dall'Episodio {checkpoint['episode']} (Step {checkpoint['global_step']}). Buffer size: {len(memory)}")
+
+        # Carica il Replay Buffer dal file numpy separato
+        buffer_path = filepath.replace('.pth', '_buffer.npz')
+        memory.load(buffer_path)
+
+        print(f"✅ Checkpoint caricato: ripresa dall'Episodio {checkpoint['episode']} "
+              f"(Step {checkpoint['global_step']}). Buffer: {len(memory)} transizioni")
         return checkpoint['episode'], checkpoint['global_step']
 
 # ──────────────────────────────────────────────────────────────────────
-#  Reward Function e Loop
+#  Reward Function (SAC-Compatible, Scaled)
 # ──────────────────────────────────────────────────────────────────────
 def compute_reward(obs, prev_steer, cont_action, prev_damage):
+    """Calcola la reward SAC-compatible con Dense Shaping.
+
+    Componenti:
+      1. progress = speedX * cos(angle) * 10.0  (scalato ×10)
+      2. angle_penalty = -2.0 * |angle|
+      3. track_pos_penalty = -1.0 * trackPos²
+      4. steer_smoothness = -0.5 * |steer - prev_steer|
+      5. dense_time_penalty = -1.0
+      6. damage_penalty = -50.0 (se danno aumenta)
+
+    Terminali (tutte cappate a -50.0):
+      - Fuoripista (|trackPos| > 1.5) → -50.0, done=True
+      - Spin (cos(angle) < 0) → -50.0, done=True
+
+    Returns:
+        (reward, done, current_damage)
+    """
     speed_x = float(np.array(obs.get('speedX', 0.0)).flat[0])
     angle = float(np.array(obs.get('angle', 0.0)).flat[0])
     track_pos = float(np.array(obs.get('trackPos', 0.0)).flat[0])
     damage = float(np.array(obs.get('damage', 0.0)).flat[0])
     steer = cont_action[0]
 
-    # Penalità deterministica base
-    progress = speed_x * np.cos(angle)
+    # Progress scalato ×10 per bilanciare α·log(π)
+    progress = speed_x * np.cos(angle) * 10.0
     angle_penalty = -2.0 * abs(angle)
     track_pos_penalty = -1.0 * (track_pos ** 2)
-    
+
     # Penalità regolarizzante sullo sterzo (fluidità)
     steer_smoothness = -0.5 * abs(steer - prev_steer)
-    
-    # Time Penalty (Dense Reward Shaping per massimizzare la velocità)
-    time_penalty = -0.1
-    
-    # Penalità per collisione col muro o danno
+
+    # Dense Time Penalty (scalata a -1.0 per match col progress ×10)
+    time_penalty = -1.0
+
+    # Penalità per collisione col muro o danno (cappata a -50.0)
     damage_penalty = 0.0
     if damage > prev_damage:
-        damage_penalty = -50.0  # Punizione per impatto col muro
+        damage_penalty = -50.0
 
     reward = progress + angle_penalty + track_pos_penalty + steer_smoothness + damage_penalty + time_penalty
-    
+
     done = False
-    # Fuoripista critico / taglio curva estremo
-    if track_pos > 1.50 or track_pos < -1.50:
-        reward = -100.0
+
+    # ── Terminali: Tutte cappate a -50.0 ──
+    # Fuoripista critico
+    if abs(track_pos) > 1.50:
+        reward = -50.0
         done = True
-        
+
+    # Spin (retromarcia)
+    if np.cos(angle) < 0:
+        reward = -50.0
+        done = True
+
     return reward, done, damage
 
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bc_weights', type=str, default='train_set/checkpoints/bc_policy.pth')
-    parser.add_argument('--episodes', type=int, default=100)
+    parser.add_argument('--episodes', type=int, default=1000)
+    parser.add_argument('--max_steps', type=int, default=5000,
+                        help='Max step per episodio (time-limit, non imposta done nel buffer)')
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
     set_seed(args.seed)
-    
+
     # State Stacking (k=6, t-12, t-6, t) = 3x29 = 87
     env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=False)
     agent = SACAgent()
     memory = ReplayBuffer(capacity=100000)
-    
+
     # Gestione Resumable Checkpoint
     checkpoint_path = 'train_set/checkpoints/sac_checkpoint.pth'
     start_episode, global_step = agent.load_checkpoint(checkpoint_path, memory)
-    
+
     if start_episode == 0:
         agent.actor.load_bc_weights(args.bc_weights)
 
@@ -374,16 +459,16 @@ def train():
         global_step = 0
 
     print("🚀 Avvio training SAC (Warm-Start)..." if start_episode == 0 else "🚀 Ripresa training SAC...")
-    
+
     for episode in range(start_episode, args.episodes):
         # Relaunch=True garantisce azzeramento residui fisici
         ob = env.reset(relaunch=True)
-        
+
         # Inizializza stack con maxlen=13 per replicare k=6 (t-12, t-6, t)
         f_state = flatten_state(ob)
         state_stack = deque([f_state]*13, maxlen=13)
         stacked_state = np.concatenate([state_stack[0], state_stack[6], state_stack[12]])
-        
+
         episode_reward = 0
         step = 0
         prev_steer = 0.0
@@ -393,29 +478,30 @@ def train():
         critic_loss_val = 0.0
         actor_loss_val = 0.0
         stuck_steps = 0
+        max_dist = 0.0
 
         while True:
             # L'Actor DEVE essere in eval() durante l'inferenza anche in fase di esplorazione SAC
             # per disattivare eventuali dropout o BN (anche se non ci sono, è best practice).
             agent.actor.eval()
             cont_action, raw_gear = agent.select_action(stacked_state, evaluate=False)
-            
+
             # Gear Hysteresis (Sequential Filter)
             if raw_gear > current_gear + 1:
                 raw_gear = current_gear + 1
             elif raw_gear < current_gear - 1:
                 raw_gear = current_gear - 1
             current_gear = max(1, raw_gear)
-            
+
             agent.actor.train() # Riattiva train per i gradienti (su log_std_head e continuous_head)
 
             env_action = action_to_env(cont_action, current_gear)
             next_ob, _, env_done, _ = env.step(env_action)
-            
+
             reward, done, current_damage = compute_reward(next_ob, prev_steer, cont_action, prev_damage)
             prev_steer = cont_action[0]
             prev_damage = current_damage
-            
+
             # Anti-stall logic: speed_x in gym_torcs è normalizzata dividendo per 50.0 km/h.
             # Quindi 20 km/h corrisponde a 20/50 = 0.4
             speed_x = float(np.array(next_ob.get('speedX', 0.0)).flat[0])
@@ -423,36 +509,40 @@ def train():
                 stuck_steps += 1
             else:
                 stuck_steps = 0
-                
-            # Punizione se bloccata per più di 150 step (3 secondi)
+
+            # Punizione se bloccata per più di 150 step (3 secondi) — cappata a -50.0
             if stuck_steps > 150:
-                reward -= 100.0
+                reward = -50.0
                 done = True
                 print(f"    ⚠️ Anti-Stall attivato allo step {step}!")
-            
+
             next_f_state = flatten_state(next_ob)
             state_stack.append(next_f_state)
-            
-            # Controllo invalidazione giro (taglio curva o muro non rilevato)
+
+            # Tracciamento distanza percorsa
             current_dist = float(np.array(next_ob.get('distFromStart', 0.0)).flat[0])
             last_lap_time = float(np.array(next_ob.get('lastLapTime', 0.0)).flat[0])
-            
-            # Se la distanza crolla improvvisamente (abbiamo tagliato il traguardo)
-            # Aggiungiamo step > 500 per evitare che il passaggio della linea di partenza al via inneschi l'errore
+            max_dist = max(max_dist, current_dist)
+
+            # Controllo completamento/invalidazione giro
             if prev_dist > 2500.0 and current_dist < 500.0 and step > 500:
                 if last_lap_time <= 0.0:
                     # Giro invalidato dal simulatore (taglio curva o impatto)
-                    reward -= 100.0
+                    reward = -50.0
                     done = True
                 else:
-                    # Giro valido!
-                    reward += 200.0
+                    # Giro valido! Nessun bonus sparso — il Dense Reward è sufficiente.
+                    # La Value Function non deve essere distorta da picchi.
                     done = True
-                    
+
             prev_dist = current_dist
             next_stacked_state = np.concatenate([state_stack[0], state_stack[6], state_stack[12]])
 
-            # Ignora la termination artificiale se non è causata dal muro
+            # ── Done Masking (Cruciale per SAC) ──
+            # done=True va al buffer SOLO per terminazioni reali (schianti, fuoripista, spin).
+            # Il time-limit (max_steps) NON imposta done=True perché il vero state-value
+            # non è zero (l'auto sta ancora guidando).
+            time_limit_reached = (step >= args.max_steps)
             mask = 0.0 if done else 1.0
             memory.push(stacked_state, cont_action, reward, next_stacked_state, mask)
 
@@ -464,12 +554,15 @@ def train():
             if len(memory) > batch_size:
                 critic_loss_val, actor_loss_val = agent.update(memory, batch_size, global_step)
 
-            if done or env_done or step >= 3000:
+            if done or env_done or time_limit_reached:
                 break
 
         # Tempo stimato (50Hz = 0.02s per step)
         lap_time = step * 0.02
-        log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] Episode {episode+1:03d} | Reward: {episode_reward:7.1f} | Steps: {step:4d} | Time: {lap_time:5.1f}s"
+        log_msg = (f"[{datetime.now().strftime('%H:%M:%S')}] Episode {episode+1:03d} | "
+                   f"Reward: {episode_reward:7.1f} | Steps: {step:4d} | "
+                   f"Time: {lap_time:5.1f}s | Dist: {max_dist:6.0f}m | "
+                   f"CriticL: {critic_loss_val:.3f} | ActorL: {actor_loss_val:.3f}")
         print(f"🏁 {log_msg}")
 
         # Salva log testuale semplice

@@ -5,8 +5,9 @@
 
 echo "🛑 Arresto dei processi di addestramento AIcar in corso..."
 
-# Ferma train_all.sh
+# Ferma train_all.sh e train_rl.sh
 pkill -f "train_all.sh" || echo "Nessun processo train_all.sh attivo."
+pkill -f "train_rl.sh" || echo "Nessun processo train_rl.sh attivo."
 
 # Ferma Behavioral Cloning
 pkill -f "behavioral_cloning.py" || echo "Nessun processo behavioral_cloning.py attivo."

@@ -1,11 +1,27 @@
 """
-Test Agent — Guida Autonoma su TORCS (BC Deterministico)
+Test Agent — Guida Autonoma su TORCS (Compatibile BC + SAC)
 
-Carica i pesi del modello Behavioral Cloning (BC) e fa guidare l'agente
-in modalità rigorosamente deterministica per replicare il giro perfetto.
+Carica i pesi del modello (BC o SAC) e fa guidare l'agente in modalità
+rigorosamente deterministica.
+
+La classe BCActor è compatibile con entrambi i formati:
+  - bc_policy.pth  (senza log_std_head) — caricato con strict=False
+  - sac_policy.pth (con log_std_head)   — caricato con strict=True
+
+Priorità di caricamento automatica:
+  1. sac_policy.pth  (se esiste e --weights non è specificato)
+  2. bc_policy.pth   (fallback)
+  3. --weights path   (override esplicito)
+
+Determinismo:
+  - Seeding globale (torch, numpy, random) a 42
+  - model.eval() per disabilitare dropout/batchnorm stocastiche
+  - actor.sample(state, evaluate=True) bypassa il campionamento gaussiano
 
 Uso:
+  python test_agent.py --weights train_set/checkpoints/sac_policy.pth
   python test_agent.py --weights train_set/checkpoints/bc_policy.pth
+  python test_agent.py  # auto-detect migliore checkpoint
 """
 
 import os
@@ -25,49 +41,55 @@ from gym_torcs import TorcsEnv
 import random
 
 # ──────────────────────────────────────────────────────────────────────
-#  Determinismo
+#  Determinismo Assoluto
 # ──────────────────────────────────────────────────────────────────────
-def set_seed(seed=42):
-    """Garantisce il determinismo assoluto."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    os.environ['PYTHONHASHSEED'] = str(seed)
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+os.environ['PYTHONHASHSEED'] = str(SEED)
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  Rete (identica a behavioral_cloning.py)
+#  BCActor — Rete compatibile con BC e SAC
 # ──────────────────────────────────────────────────────────────────────
 
-class PolicyNetwork(nn.Module):
-    """Rete Actor per Behavioral Cloning con architettura Multi-Head:
-    stato (29D) → testa continua (steer, accel, brake) & testa discreta (gear).
+class BCActor(nn.Module):
+    """Actor ibrido BC-RL con architettura identica all'Actor SAC.
 
-    Il backbone estrae feature condivise. Le due teste separate evitano
-    le oscillazioni e i ritardi tipici della regressione sul cambio marcia.
+    Include log_std_head per compatibilità con sac_policy.pth.
+    In modalità evaluate=True (usata per il test), la log_std_head
+    viene completamente ignorata: si usa solo tanh(mean).
+
+    forward() restituisce (continuous, gear_logits) con le attivazioni
+    originali del BC (Tanh steer, Sigmoid accel/brake) per compatibilità
+    all'indietro.
+
+    sample(state, evaluate=True) restituisce (tanh_action, None, gear_idx)
+    per l'inferenza deterministica SAC-style.
     """
 
     def __init__(self, state_dim: int = 87, hidden_size: int = 512):
-        super(PolicyNetwork, self).__init__()
+        super(BCActor, self).__init__()
 
         self.backbone = nn.Sequential(
             nn.Linear(state_dim, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            
+
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            
+
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            
+
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.ReLU(),
@@ -75,24 +97,65 @@ class PolicyNetwork(nn.Module):
 
         # Testa continua per: steer (1), accel (1), brake (1)
         self.continuous_head = nn.Linear(hidden_size, 3)
-        
+
         # Testa discreta per la marcia (7 classi: 0, 1, 2, 3, 4, 5, 6)
         self.gear_head = nn.Linear(hidden_size, 7)
 
+        # Testa log_std per compatibilità SAC (ignorata in evaluate mode)
+        self.log_std_head = nn.Linear(hidden_size, 3)
+
     def forward(self, state: torch.Tensor):
+        """Forward compatibile all'indietro col BC: Tanh steer, Sigmoid accel/brake.
+
+        Usato SOLO quando si caricano pesi BC puri (bc_policy.pth).
+        """
         features = self.backbone(state)
-        
+
         cont_out = self.continuous_head(features)
-        
-        # Separiamo e applichiamo le attivazioni corrette
+
+        # Attivazioni originali del BC
         steer = torch.tanh(cont_out[:, 0:1])          # [-1, 1]
         accel_brake = torch.sigmoid(cont_out[:, 1:3])   # [0, 1]
-        
-        continuous = torch.cat([steer, accel_brake], dim=1) # 3D: [steer, accel, brake]
-        
-        gear_logits = self.gear_head(features)          # 7D logits
-        
+
+        continuous = torch.cat([steer, accel_brake], dim=1)  # 3D: [steer, accel, brake]
+
+        gear_logits = self.gear_head(features)
+
         return continuous, gear_logits
+
+    def sample(self, state: torch.Tensor, evaluate: bool = False):
+        """Campionamento SAC-compatible. Con evaluate=True: determinismo assoluto.
+
+        Restituisce (action, log_prob, gear_idx):
+          - evaluate=True:  action = tanh(mean), log_prob = None
+          - evaluate=False: action = tanh(rsample), log_prob calcolato
+
+        In modalità evaluate, la log_std_head e la distribuzione gaussiana
+        vengono completamente bypassate. L'output è deterministico al bit.
+        """
+        features = self.backbone(state)
+        mean = self.continuous_head(features)
+        gear_logits = self.gear_head(features)
+        gear_idx = torch.argmax(gear_logits, dim=-1)
+
+        if evaluate:
+            # Determinismo assoluto: solo tanh(mean), nessun campionamento
+            action = torch.tanh(mean)
+            return action, None, gear_idx
+
+        # Campionamento stocastico (non usato a test-time)
+        log_std = self.log_std_head(features)
+        log_std = torch.clamp(log_std, min=-20, max=2)
+        std = log_std.exp()
+        from torch.distributions import Normal
+        normal = Normal(mean, std)
+        x_t = normal.rsample()
+        action = torch.tanh(x_t)
+
+        log_prob = normal.log_prob(x_t)
+        log_prob -= torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+        return action, log_prob, gear_idx
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -131,75 +194,30 @@ def flatten_state(state_dict: dict) -> np.ndarray:
         return np.zeros(29, dtype=np.float32)
 
 
-def denormalize_action(cont_action: np.ndarray, gear: int) -> np.ndarray:
-    """Converte l'azione continua (3D) + marcia (int) nel formato TORCS.
-
-    Gli output di accel e brake derivano da un'attivazione Sigmoid [0, 1].
-    """
+def denormalize_action_bc(cont_action: np.ndarray, gear: int) -> np.ndarray:
+    """Converte l'output BC (Tanh steer, Sigmoid accel/brake) nel formato TORCS."""
     env_action = np.zeros(4, dtype=np.float32)
     env_action[0] = np.clip(cont_action[0], -1.0, 1.0)               # steer
-    env_action[1] = np.clip(cont_action[1], 0.0, 1.0)                # accel
-    env_action[2] = np.clip(cont_action[2], 0.0, 1.0)                # brake
+    env_action[1] = np.clip(cont_action[1], 0.0, 1.0)                # accel (già Sigmoid)
+    env_action[2] = np.clip(cont_action[2], 0.0, 1.0)                # brake (già Sigmoid)
     env_action[3] = float(max(0, min(6, gear)))                      # gear
     return env_action
 
 
-def apply_tcs(action: np.ndarray, obs: dict, slip_threshold: float = 5.0) -> np.ndarray:
-    wsv = obs.get('wheelSpinVel', None)
-    if wsv is None:
-        return action
+def denormalize_action_sac(cont_action: np.ndarray, gear: int) -> np.ndarray:
+    """Converte l'output SAC (tutto Tanh [-1, 1]) nel formato TORCS.
 
-    wsv = np.array(wsv, dtype=np.float64).flatten()
-    if wsv.shape[0] < 4:
-        return action
-
-    # Slip = (rear avg) - (front avg)
-    rear_avg = (wsv[2] + wsv[3]) / 2.0
-    front_avg = (wsv[0] + wsv[1]) / 2.0
-    slip = rear_avg - front_avg
-
-    if slip > slip_threshold:
-        reduction = max(0.2, 1.0 - (slip - slip_threshold) / 30.0)
-        action = action.copy()
-        action[1] *= reduction  # Scala l'acceleratore
-
-    return action
-
-
-def apply_esp(action, obs, step=0):
+    Mappatura:
+      - steer: [-1, 1] → [-1, 1]  (diretto)
+      - accel: [-1, 1] → [0, 1]   (affine: (x+1)/2)
+      - brake: [-1, 1] → [0, 1]   (affine: (x+1)/2)
     """
-    Active Safety Envelope (ESP / Lane Keep Assist) — Versione Progressiva
-    Interviene a partire da |trackPos| > 0.95 con un profilo quadratico
-    per correggere la traiettoria prima che diventi irrecuperabile.
-    Il gain cresce con il quadrato dell'eccesso, rendendo l'intervento
-    dolce vicino al centro e deciso vicino al limite.
-    """
-    track_pos = obs.get('trackPos', 0.0)
-    if isinstance(track_pos, np.ndarray):
-        track_pos = track_pos.flat[0]
-
-    action = action.copy()
-
-    # Intervento sterzo progressivo a partire da |trackPos| > 0.95
-    if abs(track_pos) > 0.95:
-        excess = abs(track_pos) - 0.95
-        # Gain quadratico: dolce vicino a 0.95, forte vicino a 1.30+
-        steer_nudge = -np.sign(track_pos) * 0.40 * excess * (1.0 + 2.0 * excess)
-        action[0] = np.clip(action[0] + steer_nudge, -1.0, 1.0)
-
-        # Parzializzazione gas e frenata stabilizzante sopra 1.10
-        if abs(track_pos) > 1.10:
-            throttle_scale = max(0.50, 1.0 - 2.0 * (abs(track_pos) - 1.10))
-            action[1] *= throttle_scale
-
-            brake_nudge = 0.30 * (abs(track_pos) - 1.10)
-            if brake_nudge > 0.01:
-                action[2] = max(action[2], min(0.15, brake_nudge))
-
-            if step % 20 == 0:
-                print(f"    [ESP] tp={track_pos:+.3f} | nudge={steer_nudge:+.3f} | throttle={throttle_scale:.2f} | brake={action[2]:.2f}")
-
-    return action
+    env_action = np.zeros(4, dtype=np.float32)
+    env_action[0] = np.clip(cont_action[0], -1.0, 1.0)               # steer
+    env_action[1] = np.clip((cont_action[1] + 1.0) / 2.0, 0.0, 1.0) # accel
+    env_action[2] = np.clip((cont_action[2] + 1.0) / 2.0, 0.0, 1.0) # brake
+    env_action[3] = float(max(0, min(6, gear)))                      # gear
+    return env_action
 
 
 def apply_gear_hysteresis(predicted_gear, current_gear, gear_counter, gear_candidate,
@@ -242,47 +260,92 @@ def apply_gear_hysteresis(predicted_gear, current_gear, gear_counter, gear_candi
 
 
 # ──────────────────────────────────────────────────────────────────────
+#  Auto-detect e caricamento pesi
+# ──────────────────────────────────────────────────────────────────────
+
+def load_best_weights(model, weights_arg, device):
+    """Carica i migliori pesi disponibili con auto-detect del formato.
+
+    Priorità (se --weights non è specificato):
+      1. sac_policy.pth  (pesi SAC — formato Actor con log_std_head)
+      2. bc_policy.pth   (pesi BC — formato PolicyNetwork senza log_std_head)
+
+    Se --weights è specificato, usa quello direttamente.
+
+    Returns:
+        (model, is_sac_weights: bool)
+    """
+    checkpoint_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'train_set', 'checkpoints')
+    sac_path = os.path.join(checkpoint_dir, 'sac_policy.pth')
+    bc_path = os.path.join(checkpoint_dir, 'bc_policy.pth')
+
+    # Se l'utente ha specificato un path esplicito, usalo
+    if weights_arg:
+        load_path = weights_arg
+    elif os.path.exists(sac_path):
+        load_path = sac_path
+        print(f"  🔍 Auto-detect: trovato sac_policy.pth")
+    elif os.path.exists(bc_path):
+        load_path = bc_path
+        print(f"  🔍 Auto-detect: fallback su bc_policy.pth")
+    else:
+        print(f"  ❌ Nessun file pesi trovato!")
+        sys.exit(1)
+
+    if not os.path.exists(load_path):
+        print(f"  ❌ File pesi non trovato: {load_path}")
+        sys.exit(1)
+
+    try:
+        state_dict = torch.load(load_path, map_location=device, weights_only=True)
+    except Exception:
+        state_dict = torch.load(load_path, map_location=device, weights_only=False)
+
+    # Determina se sono pesi SAC (contengono log_std_head) o BC (non lo contengono)
+    has_log_std = any('log_std_head' in k for k in state_dict.keys())
+
+    # Carica con strict=False per gestire la chiave mancante log_std_head nei pesi BC
+    model.load_state_dict(state_dict, strict=has_log_std)
+    model.eval()
+
+    weight_type = "SAC" if has_log_std else "BC"
+    print(f"  ✅ Pesi [{weight_type}] caricati da: {load_path}")
+
+    return model, has_log_std
+
+
+# ──────────────────────────────────────────────────────────────────────
 #  Main
 # ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Test Agent Autonomo (BC) — TORCS")
-    parser.add_argument("--weights", type=str, required=True,
-                        help="Path ai pesi del modello (.pth)")
+    parser = argparse.ArgumentParser(description="Test Agent Autonomo (BC/SAC) — TORCS")
+    parser.add_argument("--weights", type=str, default=None,
+                        help="Path ai pesi del modello (.pth). Se omesso, auto-detect.")
     parser.add_argument("--laps", type=int, default=3,
                         help="Numero di giri da completare")
     parser.add_argument("--max_steps", type=int, default=15000,
                         help="Max step per giro (timeout)")
     args = parser.parse_args()
 
-    # Applica seed fisso per determinismo
-    set_seed(42)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"\n{'=' * 64}")
-    print(f"  🏁 TEST AGENTE AUTONOMO (BC) — TORCS")
+    print(f"  🏁 TEST AGENTE AUTONOMO (BC/SAC) — TORCS")
     print(f"  Device: {device}")
-    print(f"  Pesi: {args.weights}")
     print(f"  Stride Type: static (k=6, 0.24s)")
-    print(f"  🎯 Modalità: DETERMINISTICA (Zero Noise)")
+    print(f"  🎯 Modalità: DETERMINISTICA (evaluate=True, Zero Noise)")
     print(f"{'=' * 64}\n")
 
-    # ── Carica modello ──
-    model = PolicyNetwork().to(device)
+    # ── Carica modello con auto-detect ──
+    model = BCActor().to(device)
+    model, is_sac = load_best_weights(model, args.weights, device)
 
-    if not os.path.exists(args.weights):
-        print(f"  ❌ File pesi non trovato: {args.weights}")
-        sys.exit(1)
-
-    try:
-        state_dict = torch.load(args.weights, map_location=device, weights_only=True)
-    except Exception:
-        state_dict = torch.load(args.weights, map_location=device, weights_only=False)
-
-    model.load_state_dict(state_dict)
-    model.eval()
-    print(f"  ✅ Pesi caricati correttamente.")
+    # Seleziona la funzione di denormalizzazione corretta
+    denormalize_fn = denormalize_action_sac if is_sac else denormalize_action_bc
+    inference_mode = "SAC (sample evaluate=True)" if is_sac else "BC (forward diretto)"
+    print(f"  📐 Inference mode: {inference_mode}")
 
     # ── Ambiente ──
     print("  Inizializzazione TORCS...")
@@ -294,7 +357,7 @@ def main():
     try:
         while len(lap_times) < args.laps:
             total_attempts += 1
-            
+
             # Reset ambiente con relaunch forzato ad ogni tentativo per garantire uno stato fisico iniziale pulito ed identico
             obs = env.reset(relaunch=True)
             initial_state = flatten_state(obs)
@@ -329,12 +392,20 @@ def main():
                     state_buffer[12]
                 ])
 
-                # ── Inferenza DETERMINISTICA (Pure BC, sterzata/acceleratore/freno + marcia dal modello) ──
+                # ── Inferenza DETERMINISTICA ──
                 with torch.no_grad():
                     state_t = torch.FloatTensor(stacked_state).to(device).unsqueeze(0)
-                    pred_cont, gear_logits = model(state_t)
-                    cont_action = pred_cont.cpu().numpy()[0]          # [steer, accel, brake]
-                    raw_gear = int(gear_logits.argmax(dim=1).item())
+
+                    if is_sac:
+                        # SAC: usa sample(evaluate=True) per determinismo assoluto
+                        tanh_action, _, gear_idx = model.sample(state_t, evaluate=True)
+                        cont_action = tanh_action.cpu().numpy()[0]
+                        raw_gear = int(gear_idx.item())
+                    else:
+                        # BC: usa forward() con Tanh steer + Sigmoid accel/brake
+                        pred_cont, gear_logits = model(state_t)
+                        cont_action = pred_cont.cpu().numpy()[0]
+                        raw_gear = int(gear_logits.argmax(dim=1).item())
 
                 # ── Gear Filter (solo vincolo sequenziale ±1, nessuna latenza) ──
                 predicted_gear = raw_gear
@@ -345,11 +416,18 @@ def main():
                 current_gear = max(1, predicted_gear)
 
                 # ── Mutual exclusion accel/brake (come l'esperto umano) ──
-                if cont_action[2] > 0.05:
-                    cont_action[1] = 0.0  # Se freno, niente gas
+                # Per i pesi BC, cont_action[1:3] sono già [0,1] (Sigmoid)
+                # Per i pesi SAC, cont_action[1:3] sono [-1,1] (Tanh) — denormalize_fn li converte
+                if not is_sac and cont_action[2] > 0.05:
+                    cont_action[1] = 0.0  # Se freno, niente gas (solo per BC)
 
-                # ── Step nell'ambiente (azione pura dal modello, zero filtri artificiali) ──
-                env_action = denormalize_action(cont_action, current_gear)
+                # ── Step nell'ambiente ──
+                env_action = denormalize_fn(cont_action, current_gear)
+
+                # Mutual exclusion post-denormalize per SAC
+                if is_sac and env_action[2] > 0.05:
+                    env_action[1] = 0.0
+
                 next_obs, _, env_done, _ = env.step(env_action)
                 next_state = flatten_state(next_obs)
 
@@ -360,7 +438,7 @@ def main():
                 spd_kmh = float(next_state[21] * 50.0)
                 track_pos = float(np.array(next_obs.get('trackPos', 0.0)).flat[0])
                 angle = float(np.array(next_obs.get('angle', 0.0)).flat[0])
-                
+
                 telemetry_data.append({
                     'step': step,
                     'dist': dist_m,
