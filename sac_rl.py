@@ -352,6 +352,7 @@ def train():
         current_gear = 1
         critic_loss_val = 0.0
         actor_loss_val = 0.0
+        stuck_steps = 0
 
         while True:
             # L'Actor DEVE essere in eval() durante l'inferenza anche in fase di esplorazione SAC
@@ -374,6 +375,20 @@ def train():
             reward, done, current_damage = compute_reward(next_ob, prev_steer, cont_action, prev_damage)
             prev_steer = cont_action[0]
             prev_damage = current_damage
+            
+            # Anti-stall logic: speed_x in gym_torcs è normalizzata dividendo per 50.0 km/h.
+            # Quindi 20 km/h corrisponde a 20/50 = 0.4
+            speed_x = float(np.array(next_ob.get('speedX', 0.0)).flat[0])
+            if speed_x < 0.4:
+                stuck_steps += 1
+            else:
+                stuck_steps = 0
+                
+            # Punizione se bloccata per più di 150 step (3 secondi)
+            if stuck_steps > 150:
+                reward -= 100.0
+                done = True
+                print(f"    ⚠️ Anti-Stall attivato allo step {step}!")
             
             next_f_state = flatten_state(next_ob)
             state_stack.append(next_f_state)
