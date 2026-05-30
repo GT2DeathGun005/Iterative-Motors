@@ -516,6 +516,19 @@ class SACAgent:
             elite_memory.save(elite_buffer_path)
 
     def load_checkpoint(self, filepath, memory, elite_memory=None):
+        # ── Carica i Replay Buffer INDIPENDENTEMENTE dal checkpoint di rete ──
+        # In questo modo possiamo resettare i pesi della rete ma mantenere i record d'élite!
+        buffer_dir = os.path.join(os.path.dirname(filepath), 'buffers')
+        base_name = os.path.basename(filepath).replace('.pth', '')
+        
+        buffer_path = os.path.join(buffer_dir, f"{base_name}_buffer.npz")
+        elite_buffer_path = os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz")
+        
+        if os.path.exists(buffer_path):
+            memory.load(buffer_path)
+        if elite_memory and os.path.exists(elite_buffer_path):
+            elite_memory.load(elite_buffer_path)
+
         if not os.path.exists(filepath):
             return 0, 0
 

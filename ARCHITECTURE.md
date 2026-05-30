@@ -96,6 +96,14 @@ Durante l'addestramento ibrido, l'architettura risolve due problematiche critich
    Per impedirlo, l'agente istanzia un **Frozen BC Anchor** (`self.bc_policy`), ovvero una copia congelata e immutabile della rete neurale al suo stato iniziale (pesi del clone umano `bc_policy.pth`). 
    Durante il training, per ogni campione non-élite, la BC Penalty calcola l'errore quadratico medio (MSE) forzando l'Actor ad aderire alle mosse sicure del maestro umano, garantendo un ancoraggio indistruttibile alla traiettoria di base.
 
-2. **Terminal State Mimicry (Sgancio Pre-Schianto)**: 
+1. **Terminal State Mimicry (Sgancio Pre-Schianto)**: 
    Quando un episodio record (salvato nell'Elite Buffer) termina con uno schianto, le ultime azioni sono la causa diretta del fallimento. Forzare l'Actor a imitarle (tramite Self-Imitation) indurrebbe una *Causal Confusion*. 
    Il sistema risolve questo paradosso azzerando la maschera di imitazione (`expert=0.0`) negli ultimi 50 step (esattamente 1 secondo a 50Hz) di un record schiantato. In quella "finestra di evasione", l'agente smette di imitare il suo vecchio errore e torna istantaneamente sotto l'influenza del Reinforcement Learning puro e del Frozen BC Anchor, riuscendo così a frenare e a sopravvivere per estendere ulteriormente il record.
+
+## 10. Offline RL Warm-Start (Safe Restart)
+Durante le lunghe sessioni di RL, il Critic può saturarsi irrimediabilmente di Q-Value negativi a causa della continua esplorazione stocastica, portando la rete a un punto morto ("Traumatized Critic") dove l'Actor Loss impazzisce.
+
+Per risolvere questo stallo senza perdere le decine di ore di esperienza accumulate, l'architettura implementa un caricamento **disaccoppiato** tra i pesi neurali e i Replay Buffer:
+- I file `.npz` (`buffer` ed `elite_buffer`) vengono caricati in memoria **indipendentemente** dall'esistenza di un checkpoint valido (`sac_checkpoint.pth`).
+- Questo consente il **Safe Restart**: è possibile cancellare manualmente i pesi della rete SAC (`.pth`), ripartendo con un Actor immacolato (clonato dal BC) e un Critic inizializzato a zero, ma fornendo loro *fin dal primo step* un Elite Buffer già popolato di record da chilometri.
+- **Vantaggio**: Il nuovo Critic salta l'intera fase di esplorazione traumatica iniziale, estraendo immediatamente Q-Value ottimali per le sezioni avanzate della pista, permettendo all'Actor di superare agilmente plateau di addestramento irrecuperabili. Durante i primi 5000 step di questo nuovo ciclo ("Critic Warm-Up"), l'Actor viene deliberatamente "congelato" per proteggere i pesi clonati dal BC mentre il Critic assimila l'esperienza offline.
