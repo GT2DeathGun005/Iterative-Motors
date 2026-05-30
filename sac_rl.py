@@ -222,10 +222,6 @@ def action_to_env(cont_action, gear_idx):
     accel = np.clip((cont_action[1] + 1.0) / 2.0, 0.0, 1.0)
     brake = np.clip((cont_action[2] + 1.0) / 2.0, 0.0, 1.0)
 
-    # Mutual exclusion (come l'esperto umano e il test_agent)
-    if brake > 0.05:
-        accel = 0.0
-
     env_action[1] = accel
     env_action[2] = brake
     env_action[3] = float(max(1, min(6, gear_idx)))
@@ -265,7 +261,7 @@ class Actor(nn.Module):
         mean = self.continuous_head(features)
         gear_logits = self.gear_head(features)
         log_std = self.log_std_head(features)
-        log_std = torch.clamp(log_std, min=-20, max=2)
+        log_std = torch.clamp(log_std, min=-20.0, max=-2.0)
         return mean, log_std, gear_logits
 
     def sample(self, state, evaluate=False):
@@ -353,7 +349,7 @@ class SACAgent:
         self.actor_optimizer = optim.Adam([
             {'params': self.actor.continuous_head.parameters()},
             {'params': self.actor.log_std_head.parameters()}
-        ], lr=1e-5)
+        ], lr=3e-4)
 
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
 
@@ -419,17 +415,22 @@ class SACAgent:
             # L'Actor massimizza il Q-Value stimato e l'Entropia.
             actor_loss_sac = (alpha * log_pi - min_q_pi).mean()
             
-            # BC Regularization Asimmetrica (si attiva SOLO sui campioni esperti)
-            bc_loss = F.mse_loss(pi, action_b, reduction='none').mean(dim=1, keepdim=True)
-            bc_penalty = (expert_mask_b * bc_loss).mean()
-            
-            actor_loss = actor_loss_sac + 5.0 * bc_penalty
+            # BC Penalty (Asymmetric)
+            bc_loss = F.mse_loss(pi, action_b, reduction='none')
+            bc_penalty = (bc_loss.mean(dim=1, keepdim=True) * expert_mask_b).mean()
+
+            # Decay lineare del peso BC: da 5.0 a 0.0 in 50.000 step
+            # Raggiunti i 50k step, il SAC è puro e libero dalla media umana
+            bc_weight = max(0.0, 5.0 * (1.0 - min(global_step, 50000) / 50000.0))
+
+            # Total Actor Loss
+            total_actor_loss = actor_loss_sac + bc_weight * bc_penalty
 
             self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+            total_actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_optimizer.step()
-            actor_loss_val = actor_loss.item()
+            actor_loss_val = total_actor_loss.item()
 
             # Alpha (Entropy) Update
             alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
@@ -437,9 +438,9 @@ class SACAgent:
             alpha_loss.backward()
             self.alpha_optimizer.step()
 
-            # Evita che Alpha esploda: limitato a un massimo di ~0.05 (precision driving)
+            # Evita che l'entropia crolli a zero: Alpha limitato a un minimo di ~0.007
             with torch.no_grad():
-                self.log_alpha.clamp_(max=-3.0)
+                self.log_alpha.clamp_(min=-5.0)
 
         # Target Soft Update
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
@@ -482,6 +483,15 @@ class SACAgent:
                 self.log_alpha.copy_(checkpoint['log_alpha'])
             if 'alpha_optimizer' in checkpoint:
                 self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer'])
+
+        # Forza esplicitamente il Learning Rate a 3e-4 su tutti i param_groups
+        # Altrimenti PyTorch ripristinerebbe il vecchio LR=1e-5 salvato nel file
+        for param_group in self.actor_optimizer.param_groups:
+            param_group['lr'] = 3e-4
+        for param_group in self.critic_optimizer.param_groups:
+            param_group['lr'] = 3e-4
+        for param_group in self.alpha_optimizer.param_groups:
+            param_group['lr'] = 3e-4
 
         # Carica il Replay Buffer dal file numpy separato
         buffer_path = filepath.replace('.pth', '_buffer.npz')

@@ -15,8 +15,8 @@ _AUTOSTART_SH = os.path.join(_THIS_DIR, 'autostart.sh')
 
 
 class TorcsEnv:
-    terminal_judge_start = 150  # L'antistallo (speed limit) viene applicato dopo 150 step (3 secondi)
-    termination_limit_progress = 20  # [km/h], episode terminates if car is running slower than this limit
+    terminal_judge_start = 500  # 10 secondi per consentire il transitorio di partenza
+    termination_limit_progress = 5  # Soglia tollerante per non punire le incertezze
     default_speed = 50
 
     initial_reset = True
