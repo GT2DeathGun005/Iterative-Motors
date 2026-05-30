@@ -69,14 +69,18 @@ def set_seed(seed=42):
 class ReplayBuffer:
     def __init__(self, capacity: int):
         self.buffer = deque(maxlen=capacity)
+        self.expert_masks = deque(maxlen=capacity)
 
-    def push(self, state, action, reward, next_state, done):
+    def push(self, state, action, reward, next_state, done, expert=0.0):
         self.buffer.append((state, action, reward, next_state, done))
+        self.expert_masks.append(expert)
 
     def sample(self, batch_size: int):
-        batch = random.sample(self.buffer, batch_size)
+        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        batch = [self.buffer[i] for i in indices]
+        expert_masks_batch = [self.expert_masks[i] for i in indices]
         state, action, reward, next_state, done = map(np.stack, zip(*batch))
-        return state, action, reward, next_state, done
+        return state, action, reward, next_state, done, np.array(expert_masks_batch, dtype=np.float32)
 
     def save(self, filepath: str):
         """Salva il buffer su disco con compressione numpy."""
@@ -88,7 +92,8 @@ class ReplayBuffer:
             actions=np.array(actions, dtype=np.float32),
             rewards=np.array(rewards, dtype=np.float32),
             next_states=np.array(next_states, dtype=np.float32),
-            dones=np.array(dones, dtype=np.float32))
+            dones=np.array(dones, dtype=np.float32),
+            expert_masks=np.array(list(self.expert_masks), dtype=np.float32))
 
     def load_expert_data(self, h5_dir_or_file: str, max_samples: int = None):
         """Carica dimostrazioni umane nel replay buffer per Expert Buffer Injection."""
@@ -125,6 +130,11 @@ class ReplayBuffer:
                     next_stacked_state = np.concatenate([states_np[n_idx_t12], states_np[n_idx_t6], states_np[next_i]])
                     
                     cont_action = actions_np[i, 0:3]
+                    # FIX ARCHITETTURALE: I dati BC hanno accel/brake in [0, 1].
+                    # SAC usa tanh() per tutte le azioni in [-1, 1].
+                    # Mappiamo accel/brake da [0, 1] a [-1, 1] per il ReplayBuffer.
+                    cont_action[1] = (cont_action[1] * 2.0) - 1.0
+                    cont_action[2] = (cont_action[2] * 2.0) - 1.0
                     
                     # Ricalcoliamo il reward con la nuova logica (Soft Shaping)
                     speedX = states_np[i, 21] * 50.0
@@ -140,7 +150,7 @@ class ReplayBuffer:
                     done = (i == length - 2)
                     mask = 0.0 if done else 1.0
                     
-                    self.push(stacked_state, cont_action, reward, next_stacked_state, mask)
+                    self.push(stacked_state, cont_action, reward, next_stacked_state, mask, expert=1.0)
                     loaded += 1
             except Exception as e:
                 print(f"Errore caricando {f} nel replay buffer: {e}")
@@ -157,11 +167,13 @@ class ReplayBuffer:
         rewards = data['rewards']
         next_states = data['next_states']
         dones = data['dones']
+        expert_masks_data = data.get('expert_masks', np.zeros(len(states)))
         for i in range(len(states)):
             self.buffer.append((
                 states[i], actions[i], float(rewards[i]),
                 next_states[i], float(dones[i])
             ))
+            self.expert_masks.append(float(expert_masks_data[i]))
         print(f"  📦 Replay Buffer caricato da disco: {len(self.buffer)} transizioni")
 
     def __len__(self):
@@ -336,9 +348,12 @@ class SACAgent:
             param.requires_grad = False
 
         # Optimizer: aggiorna SOLO continuous_head e log_std_head
-        # LR ridotto a 1e-6 per evitare Catastrophic Forgetting dei pesi BC quando il Critic invia gradienti
-        actor_params = list(self.actor.continuous_head.parameters()) + list(self.actor.log_std_head.parameters())
-        self.actor_optimizer = optim.Adam(actor_params, lr=1e-6)
+        # Actor Optimizer (Fase RL: solo continuous e log_std, backbone frozen)
+        # 🛡️ TRUST REGION: LR microscopico (1e-5) per impedire il Policy Drift su stati OOD
+        self.actor_optimizer = optim.Adam([
+            {'params': self.actor.continuous_head.parameters()},
+            {'params': self.actor.log_std_head.parameters()}
+        ], lr=1e-5)
 
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
 
@@ -361,7 +376,7 @@ class SACAgent:
         return cont_action.cpu().numpy()[0], gear_idx.cpu().item()
 
     def update(self, memory, batch_size, global_step):
-        state_b, action_b, reward_b, next_state_b, mask_b = memory.sample(batch_size)
+        state_b, action_b, reward_b, next_state_b, mask_b, expert_mask_b = memory.sample(batch_size)
 
         # 🛡️ REWARD SCALING per prevenire il collasso dell'Actor
         reward_scale = 0.02
@@ -372,6 +387,7 @@ class SACAgent:
         action_b = torch.FloatTensor(action_b).to(self.device)
         reward_b = torch.FloatTensor(reward_b).to(self.device).unsqueeze(1)
         mask_b = torch.FloatTensor(mask_b).to(self.device).unsqueeze(1)
+        expert_mask_b = torch.FloatTensor(expert_mask_b).to(self.device).unsqueeze(1)
 
         # Alpha calculation
         alpha = self.alpha
@@ -401,7 +417,13 @@ class SACAgent:
             min_q_pi = torch.min(q1_pi, q2_pi)
             
             # L'Actor massimizza il Q-Value stimato e l'Entropia.
-            actor_loss = (alpha * log_pi - min_q_pi).mean()
+            actor_loss_sac = (alpha * log_pi - min_q_pi).mean()
+            
+            # BC Regularization Asimmetrica (si attiva SOLO sui campioni esperti)
+            bc_loss = F.mse_loss(pi, action_b, reduction='none').mean(dim=1, keepdim=True)
+            bc_penalty = (expert_mask_b * bc_loss).mean()
+            
+            actor_loss = actor_loss_sac + 5.0 * bc_penalty
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
@@ -415,9 +437,9 @@ class SACAgent:
             alpha_loss.backward()
             self.alpha_optimizer.step()
 
-            # Evita che Alpha esploda: limitato a un massimo di ~0.2
+            # Evita che Alpha esploda: limitato a un massimo di ~0.05 (precision driving)
             with torch.no_grad():
-                self.log_alpha.clamp_(max=-1.609)
+                self.log_alpha.clamp_(max=-3.0)
 
         # Target Soft Update
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
@@ -535,18 +557,24 @@ def train():
             noise = np.random.normal(0, 0.05, size=cont_action.shape)
             cont_action = np.clip(cont_action + noise, -1.0, 1.0)
 
-            if raw_gear > current_gear + 1:
-                raw_gear = current_gear + 1
-            elif raw_gear < current_gear - 1:
-                raw_gear = current_gear - 1
-            current_gear = max(1, raw_gear)
+            # Gestione marce semplificata
+            current_gear = max(1, min(6, raw_gear))
 
             agent.actor.train()
 
-            env_action = action_to_env(cont_action, current_gear)
+            env_action = np.zeros(4)
+            env_action[0:3] = cont_action
+            env_action[3] = current_gear
+            
+            # FIX ARCHITETTURALE: L'Actor SAC lavora con azioni in [-1, 1].
+            # TORCS richiede accel e brake in [0, 1].
+            # Mappiamo le azioni prima di inviarle al simulatore.
+            torcs_action = env_action.copy()
+            torcs_action[1] = np.clip((torcs_action[1] + 1.0) / 2.0, 0.0, 1.0)
+            torcs_action[2] = np.clip((torcs_action[2] + 1.0) / 2.0, 0.0, 1.0)
             
             # Affidiamoci alla reward di gym_torcs e al dict "info"
-            next_ob, reward, env_done, info = env.step(env_action)
+            next_ob, reward, env_done, info = env.step(torcs_action)
             
             next_f_state = flatten_state(next_ob)
             state_stack.append(next_f_state)
@@ -570,6 +598,15 @@ def train():
             if info.get('crash', False):
                 done = True
                 termination_reason = "CRASH"
+
+            # Salva i pesi per la distanza record
+            global best_distance
+            if 'best_distance' not in globals():
+                best_distance = 0.0
+                
+            if max_dist > best_distance and max_dist > 500.0:
+                best_distance = max_dist
+                torch.save(agent.actor.state_dict(), 'train_set/checkpoints/sac_best_dist.pth')
 
             prev_dist = current_dist
             next_stacked_state = np.concatenate([state_stack[0], state_stack[6], state_stack[12]])

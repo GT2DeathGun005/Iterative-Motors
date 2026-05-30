@@ -64,7 +64,7 @@ AIcar/
 ├── telemetry/                 # Telemetria CSV dei test agent (auto-generata)
 └── train_set/                 # Dati e Checkpoint
     ├── laps/                  #   File HDF5 dei giri registrati (lap_001.h5 ...)
-    ├── checkpoints/           #   Pesi: bc_policy.pth, sac_policy.pth, sac_best_policy.pth, sac_checkpoint.pth
+    ├── checkpoints/           #   Pesi: bc_policy.pth, sac_policy.pth, sac_best_policy.pth, sac_best_dist.pth, sac_checkpoint.pth
     │   └── sac_checkpoint_buffer.npz  # Replay Buffer compresso (numpy)
     └── session_logs/          #   Log delle sessioni di training
 ```
@@ -135,11 +135,11 @@ Il training è **resume-safe**: il checkpoint viene salvato ad ogni episodio. Pu
 
 Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per prevenire problemi di focus con il desktop dell'host. 
 
-**Output:** `train_set/checkpoints/sac_policy.pth` + `sac_best_policy.pth` + `sac_checkpoint.pth` + `sac_checkpoint_buffer.npz`
+**Output:** `train_set/checkpoints/sac_policy.pth` + `sac_best_policy.pth` + `sac_best_dist.pth` + `sac_checkpoint.pth` + `sac_checkpoint_buffer.npz`
 
 ### 4. Test Deterministico (Inference)
 
-Il test agent auto-rileva i migliori pesi disponibili: `sac_best_policy.pth` → `sac_policy.pth` → `bc_policy.pth`.
+Il test agent auto-rileva i migliori pesi disponibili: `sac_best_policy.pth` → `sac_best_dist.pth` → `sac_policy.pth` → `bc_policy.pth`.
 
 ```bash
 # Esecuzione standard con bypass Xvfb (visibile a schermo)
@@ -174,8 +174,8 @@ Durante il training RL, il log stampa metriche fondamentali per diagnosticare la
 
 ### 3. Entropia Auto-Regolata (`Alpha`)
 * **Cos'è:** Il "termostato" (Soft Actor-Critic) che inietta casualità nello sterzo.
-* **Valori Sani:** Inizia da `0.020` per favorire l'exploiting dei pesi preaddestrati. È impostato un *hard clamp* (tetto massimo) a `0.200`.
-* **Diagnosi:** Quando l'Actor cerca di eseguire la traiettoria BC in modo troppo deterministico (entropia sotto il target di `-3.0`), l'Alpha viene spinto in alto. Il limite di `0.200` è salvavita: impedisce ad Alpha di schizzare a livelli in cui il rumore sul volante diventerebbe talmente violento da far schiantare l'auto immediatamente, costringendo l'agente a un'esplorazione controllata.
+* **Valori Sani:** Inizia da `0.020` per favorire l'exploiting dei pesi preaddestrati. È impostato un *hard clamp* (tetto massimo) a `0.050` (5% di rumore).
+* **Diagnosi:** Quando l'Actor cerca di eseguire la traiettoria BC in modo troppo deterministico (entropia sotto il target di `-3.0`), l'Alpha viene spinto in alto. Il limite di `0.050` (che risolve il bug dell'*Alpha Poisoning*) è vitale per un'auto da F1: garantisce una "sana curiosità" per scoprire traiettorie ottimali, impedendo però che il rumore superi la soglia critica del 5%, oltre la quale la macchina si schianterebbe costantemente inquinando il Replay Buffer.
 
 ---
 
@@ -280,6 +280,9 @@ Il training BC include perturbazione laterale dello stato (`trackPos ±0.15`) co
 2. **Gradient Clipping**: Capping della norma dei gradienti a 1.0 (tramite `clip_grad_norm_`) per Actor e Critic, mitigando il "Critic Shock".
 3. **Alpha Autotuning Fix**: Aumento del learning rate di `log_alpha` a `3e-4` per permettere al termostato entropico di reagire tempestivamente alla perdita di stochasticità.
 4. **Reward Scaling**: Scalate le ricompense a `reward * 0.02` per bilanciare matematicamente i Q-values con la loss entropica (`alpha * log_pi`), prevenendo l'**Entropy Annihilation** e garantendo un'esplorazione stabile a lungo termine.
+5. **Alpha Poisoning Clamp**: Abbassato l'hard clamp di `log_alpha` a `-3.0` (Alpha max **5%**) per impedire che l'entropia inietti un rumore fatale (>20%) per la precisione di guida di una Formula 1, proteggendo il Replay Buffer da schianti continui.
+6. **Actor Trust Region (Micro-LR)**: Abbassato drasticamente il Learning Rate dell'Actor da `3e-4` a `1e-5`. Senza una regolarizzazione BC esplicita, questo impedisce l'**Extrapolation Error** e il Policy Drift, facendo sì che l'Actor compia passi microscopici e sicuri quando valuta gradienti OOD calcolati dal Critic.
+7. **Architectural Action Space Mismatch**: Risolto un bug critico di mappatura dove il BC model emetteva valori `[0, 1]` (tramite sigmoide) ma l'Actor SAC emetteva valori `[-1, 1]` (tramite tanh), causando output nulli e stalli continui. Le azioni vengono ora ri-mappate istantaneamente a `[0, 1]` appena prima dell'invio al simulatore, preservando la simmetria del SAC e i pesi originali del BC.
 
 ### [2026-05-29] Finalizzazione Architettura (Xvfb, Best Lap, Pure SAC)
 
@@ -287,7 +290,7 @@ Il training BC include perturbazione laterale dello stato (`trackPos ±0.15`) co
 1. **Ambiente Isolato Xvfb:** TORCS e le macro girano confinati in un virtual display senza rubare focus. Usare `SHOW_GUI=1` per lo sblocco in rendering locale.
 2. **Auto-Entropy Tuning**: Introdotto tuning automatico del `log_alpha` per un corretto calcolo del SAC.
 3. **Pure SAC Actor Loss**: Rimossa la logica fallata TD3+BC dalla fase Online. L'Actor massimizza unicamente entropia e Q-Value target senza auto-imitare il proprio rumore di addestramento.
-4. **Early Checkpointing**: L'agente salva il `sac_best_policy.pth` a ogni giro da record. Logging semantico per gli episodi `[SUCCESS]`, `[CRASH]` o `[TIMEOUT]`.
+4. **Dual Checkpointing**: L'agente salva `sac_best_policy.pth` ad ogni giro da record. Durante l'esplorazione, salva anche `sac_best_dist.pth` ad ogni nuovo record di distanza percorsa prima dello schianto (se > 500m). Logging semantico per gli episodi `[SUCCESS]`, `[CRASH]` o `[TIMEOUT]`.
 
 ### [2026-05-29] Migrazione Ibrida BC-RL (SAC) — ARCHITETTURALE
 

@@ -277,15 +277,23 @@ def load_best_weights(model, weights_arg, device):
     """
     checkpoint_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'train_set', 'checkpoints')
+    sac_best_lap_path = os.path.join(checkpoint_dir, 'sac_best_policy.pth')
+    sac_best_dist_path = os.path.join(checkpoint_dir, 'sac_best_dist.pth')
     sac_path = os.path.join(checkpoint_dir, 'sac_policy.pth')
     bc_path = os.path.join(checkpoint_dir, 'bc_policy.pth')
 
     # Se l'utente ha specificato un path esplicito, usalo
     if weights_arg:
         load_path = weights_arg
+    elif os.path.exists(sac_best_lap_path):
+        load_path = sac_best_lap_path
+        print(f"  🔍 Auto-detect: trovato sac_best_policy.pth (Record sul giro!)")
+    elif os.path.exists(sac_best_dist_path):
+        load_path = sac_best_dist_path
+        print(f"  🔍 Auto-detect: trovato sac_best_dist.pth (Record di distanza!)")
     elif os.path.exists(sac_path):
         load_path = sac_path
-        print(f"  🔍 Auto-detect: trovato sac_policy.pth")
+        print(f"  🔍 Auto-detect: trovato sac_policy.pth (Ultimo step)")
     elif os.path.exists(bc_path):
         load_path = bc_path
         print(f"  🔍 Auto-detect: fallback su bc_policy.pth")
