@@ -329,7 +329,10 @@ class Critic(nn.Module):
 class SACAgent:
     def __init__(self, device="cuda"):
         self.device = torch.device(device)
-        self.gamma = 0.99
+        # A 50Hz, gamma=0.99 dava un orizzonte di soli 2 secondi (100 step).
+        # Aumentato a 0.999 per un orizzonte di 20 secondi (1000 step),
+        # vitale per permettere al Critic di "vedere" la velocità oltre la linea di partenza.
+        self.gamma = 0.999
         self.tau = 0.005
 
         self.actor = Actor().to(self.device)
