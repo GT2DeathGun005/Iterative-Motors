@@ -436,7 +436,7 @@ class SACAgent:
             alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
-            self.alpha_optimizer.step()
+            # self.alpha_optimizer.step() # DISABILITATO: Alpha fisso a 0.02 per evitare l'esplosione ai bordi (gas a tavoletta)
 
             # Evita che l'entropia crolli a zero: Alpha limitato a un minimo di ~0.007
             with torch.no_grad():

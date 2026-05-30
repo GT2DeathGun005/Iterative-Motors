@@ -172,10 +172,10 @@ Durante il training RL, il log stampa metriche fondamentali per diagnosticare la
 * **Valori Sani:** Nel RL puro **non esiste un valore assoluto ideale** per l'Actor Loss, poiché scala in base alle reward. L'aspetto cruciale è **la pendenza della curva**.
 * **Diagnosi:** Una salita dolce e lineare (es. da `3.0` a `74.0` in decine di step) è segno di un apprendimento sanissimo, in cui l'Actor lima gradualmente le sue traiettorie. Salti giganteschi in un singolo step denotano un gradiente "sledgehammer" in arrivo dal Critic che distruggerà i pesi.
 
-### 3. Entropia Auto-Regolata (`Alpha`)
-* **Cos'è:** Il "termostato" (Soft Actor-Critic) che inietta casualità nello sterzo.
-* **Valori Sani:** Inizia da `0.020` per favorire l'exploiting dei pesi preaddestrati. È impostato un *hard clamp* (tetto massimo) a `0.050` (5% di rumore).
-* **Diagnosi:** Quando l'Actor cerca di eseguire la traiettoria BC in modo troppo deterministico (entropia sotto il target di `-3.0`), l'Alpha viene spinto in alto. Il limite di `0.050` (che risolve il bug dell'*Alpha Poisoning*) è vitale per un'auto da F1: garantisce una "sana curiosità" per scoprire traiettorie ottimali, impedendo però che il rumore superi la soglia critica del 5%, oltre la quale la macchina si schianterebbe costantemente inquinando il Replay Buffer.
+### 3. Entropia Costante (`Alpha` Fisso)
+* **Cos'è:** Il parametro (Soft Actor-Critic) che regola l'importanza dell'esplorazione stocastica rispetto all'ottimizzazione del Q-value.
+* **Valori Sani:** Fissato rigorosamente a `0.02`. 
+* **Diagnosi:** Inizialmente l'Alpha era auto-regolato, ma la natura "bang-bang" (tutto gas/tutto freno) delle corse in simulazione causava un'esplosione dei gradienti ai bordi del dominio `tanh`. Questo spingeva la rete a fermarsi (Stall Trap) per fuggire alla penalità entropica infinita. Fissando Alpha, l'agente esplora con una deviazione standard costante e sana, disinnescando il bug matematico.
 
 ---
 
@@ -283,6 +283,13 @@ Il training BC include perturbazione laterale dello stato (`trackPos ±0.15`) co
 5. **Alpha Poisoning Clamp**: Abbassato l'hard clamp di `log_alpha` a `-3.0` (Alpha max **5%**) per impedire che l'entropia inietti un rumore fatale (>20%) per la precisione di guida di una Formula 1, proteggendo il Replay Buffer da schianti continui.
 6. **Actor Trust Region (Micro-LR)**: Abbassato drasticamente il Learning Rate dell'Actor da `3e-4` a `1e-5`. Senza una regolarizzazione BC esplicita, questo impedisce l'**Extrapolation Error** e il Policy Drift, facendo sì che l'Actor compia passi microscopici e sicuri quando valuta gradienti OOD calcolati dal Critic.
 7. **Architectural Action Space Mismatch**: Risolto un bug critico di mappatura dove il BC model emetteva valori `[0, 1]` (tramite sigmoide) ma l'Actor SAC emetteva valori `[-1, 1]` (tramite tanh), causando output nulli e stalli continui. Le azioni vengono ora ri-mappate istantaneamente a `[0, 1]` appena prima dell'invio al simulatore, preservando la simmetria del SAC e i pesi originali del BC.
+
+### [2026-05-30] Risoluzione Definitiva dello "Stall Trap" (Differentiability Cliff & Tanh Paradosso)
+
+**Fix applicati:**
+1. **Rimozione Mutual Exclusion**: Eliminato l'`if brake > 0.05: accel = 0.0` in `action_to_env`. Questa regola, pensata per gli umani, era un "Differentiability Cliff" che uccideva il flusso del gradiente e spegneva inaspettatamente il motore durante le esplorazioni incerte dell'agente.
+2. **Ambiente Esplorativo (Anti-Stall Relaxed)**: In `gym_torcs.py`, il timer di antistallo originale uccideva spietatamente l'agente a 3.0 secondi esatti (150 step) se andava a meno di 20 km/h. La regola è stata allentata (10 secondi, 5 km/h) per permettere all'Actor di muovere i primi passi con cautela senza subire falsi negativi fatali.
+3. **Disattivazione Alpha Auto-Tuning**: Risolto il paradosso dello schiacciamento del `tanh` ai limiti. Nelle corse ("bang-bang" actions come gas a 1.0), lo Jacobiano esplode penalizzando infinitamente l'Actor e forzandolo a stallare. L'Alpha è stato fissato a `0.02` (Entropia Costante) disattivando l'ottimizzatore, tecnica standard per il RL in ambienti limitati, stabilizzando permanentemente i gradienti esplosivi.
 
 ### [2026-05-29] Finalizzazione Architettura (Xvfb, Best Lap, Pure SAC)
 
