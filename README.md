@@ -158,6 +158,27 @@ SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/bc_policy.pth --
 
 ---
 
+## 📊 Interpretazione dei Log di Addestramento SAC
+
+Durante il training RL, il log stampa metriche fondamentali per diagnosticare la salute dell'addestramento. Ecco i valori corretti da aspettarsi:
+
+### 1. Critic Loss (`CriticL`)
+* **Cos'è:** Misura l'errore (MSE) del Critic nel prevedere le reward future.
+* **Valori Sani:** Grazie al *Reward Scaling* implementato, i valori ottimali oscillano **tra `0.01` e `5.0`** (con occasionali picchi isolati a `10-20` quando la macchina scopre porzioni di pista inedite). 
+* **Diagnosi:** Un valore stabilmente basso significa che il Critic comprende perfettamente la fisica del gioco e sta fornendo valutazioni accurate. Se la `CriticL` schizza permanentemente a centinaia, c'è un'esplosione dei gradienti (o mancano i dati BC nel replay buffer).
+
+### 2. Actor Loss (`ActorL`)
+* **Cos'è:** Misura quanto l'Actor sta massimizzando le reward del Critic combinate all'entropia (l'esplorazione).
+* **Valori Sani:** Nel RL puro **non esiste un valore assoluto ideale** per l'Actor Loss, poiché scala in base alle reward. L'aspetto cruciale è **la pendenza della curva**.
+* **Diagnosi:** Una salita dolce e lineare (es. da `3.0` a `74.0` in decine di step) è segno di un apprendimento sanissimo, in cui l'Actor lima gradualmente le sue traiettorie. Salti giganteschi in un singolo step denotano un gradiente "sledgehammer" in arrivo dal Critic che distruggerà i pesi.
+
+### 3. Entropia Auto-Regolata (`Alpha`)
+* **Cos'è:** Il "termostato" (Soft Actor-Critic) che inietta casualità nello sterzo.
+* **Valori Sani:** Inizia da `0.020` per favorire l'exploiting dei pesi preaddestrati. È impostato un *hard clamp* (tetto massimo) a `0.200`.
+* **Diagnosi:** Quando l'Actor cerca di eseguire la traiettoria BC in modo troppo deterministico (entropia sotto il target di `-3.0`), l'Alpha viene spinto in alto. Il limite di `0.200` è salvavita: impedisce ad Alpha di schizzare a livelli in cui il rumore sul volante diventerebbe talmente violento da far schiantare l'auto immediatamente, costringendo l'agente a un'esplorazione controllata.
+
+---
+
 ## 🔧 Dettagli Tecnici
 
 ### PolicyNetwork / Actor Multi-Head
@@ -249,6 +270,16 @@ Il training BC include perturbazione laterale dello stato (`trackPos ±0.15`) co
 ---
 
 ## 🐛 Bug Risolti (Workflow Tracking)
+
+### [2026-05-30] Stabilizzazione SAC: Expert Buffer Injection, Gradient Clipping e Reward Scaling
+
+**Problema:** L'Actor collassava istantaneamente (Catastrophic Forgetting) al termine dei 5000 step di Warm-Up del Critic, incapace di guidare oltre i primi metri a causa di gradienti esplosivi e di un crollo deterministico indotto dai Q-values sbilanciati.
+
+**Fix applicati:**
+1. **Expert Buffer Injection**: Precaricamento di 50.000 memorie BC nel Replay Buffer per addestrare il Critic su traiettorie ottimali fin dal primo step.
+2. **Gradient Clipping**: Capping della norma dei gradienti a 1.0 (tramite `clip_grad_norm_`) per Actor e Critic, mitigando il "Critic Shock".
+3. **Alpha Autotuning Fix**: Aumento del learning rate di `log_alpha` a `3e-4` per permettere al termostato entropico di reagire tempestivamente alla perdita di stochasticità.
+4. **Reward Scaling**: Scalate le ricompense a `reward * 0.02` per bilanciare matematicamente i Q-values con la loss entropica (`alpha * log_pi`), prevenendo l'**Entropy Annihilation** e garantendo un'esplorazione stabile a lungo termine.
 
 ### [2026-05-29] Finalizzazione Architettura (Xvfb, Best Lap, Pure SAC)
 

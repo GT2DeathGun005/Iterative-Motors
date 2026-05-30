@@ -83,6 +83,12 @@ class ReplayBuffer:
         if len(self.buffer) == 0:
             return
         states, actions, rewards, next_states, dones = zip(*self.buffer)
+        np.savez_compressed(filepath,
+            states=np.array(states, dtype=np.float32),
+            actions=np.array(actions, dtype=np.float32),
+            rewards=np.array(rewards, dtype=np.float32),
+            next_states=np.array(next_states, dtype=np.float32),
+            dones=np.array(dones, dtype=np.float32))
 
     def load_expert_data(self, h5_dir_or_file: str, max_samples: int = None):
         """Carica dimostrazioni umane nel replay buffer per Expert Buffer Injection."""
@@ -140,12 +146,6 @@ class ReplayBuffer:
                 print(f"Errore caricando {f} nel replay buffer: {e}")
                 
         print(f"  📥 [EXPERT INJECTION] Caricati {loaded} campioni esperti nel Replay Buffer da {h5_dir_or_file}")
-        np.savez_compressed(filepath,
-            states=np.array(states, dtype=np.float32),
-            actions=np.array(actions, dtype=np.float32),
-            rewards=np.array(rewards, dtype=np.float32),
-            next_states=np.array(next_states, dtype=np.float32),
-            dones=np.array(dones, dtype=np.float32))
 
     def load(self, filepath: str):
         """Carica il buffer da disco."""
@@ -344,9 +344,11 @@ class SACAgent:
 
         # Entropy Auto-Tuning (Alpha)
         self.target_entropy = -3.0
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-        # LR abbassato per pareggiare la velocità dell'Actor
-        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=1e-6)
+        # Inizializziamo log_alpha a -3.91 (che corrisponde a un Alpha iniziale di ~0.02)
+        init_log_alpha = -3.91
+        self.log_alpha = torch.tensor([init_log_alpha], requires_grad=True, device=self.device)
+        # LR standard (3e-4) per permettere ad Alpha di autoregolarsi correttamente
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
 
     @property
     def alpha(self):
@@ -360,6 +362,10 @@ class SACAgent:
 
     def update(self, memory, batch_size, global_step):
         state_b, action_b, reward_b, next_state_b, mask_b = memory.sample(batch_size)
+
+        # 🛡️ REWARD SCALING per prevenire il collasso dell'Actor
+        reward_scale = 0.02
+        reward_b = reward_b * reward_scale
 
         state_b = torch.FloatTensor(state_b).to(self.device)
         next_state_b = torch.FloatTensor(next_state_b).to(self.device)
@@ -409,9 +415,9 @@ class SACAgent:
             alpha_loss.backward()
             self.alpha_optimizer.step()
 
-            # Evita che Alpha esploda: log_alpha <= 0 significa Alpha <= 1.0
+            # Evita che Alpha esploda: limitato a un massimo di ~0.2
             with torch.no_grad():
-                self.log_alpha.clamp_(max=0.0)
+                self.log_alpha.clamp_(max=-1.609)
 
         # Target Soft Update
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
@@ -483,6 +489,8 @@ def train():
 
     if start_episode == 0:
         agent.actor.load_bc_weights(args.bc_weights)
+        print("  💉 Iniezione dell'Expert Buffer in corso...")
+        memory.load_expert_data('train_set/laps', max_samples=50000)
 
     # Crea la directory di output
     os.makedirs('train_set/checkpoints', exist_ok=True)
