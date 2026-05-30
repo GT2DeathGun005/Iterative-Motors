@@ -366,7 +366,9 @@ class SACAgent:
 
     @property
     def alpha(self):
-        return self.log_alpha.exp().item()
+        # Disabilitiamo l'entropia (0.0) per evitare il drain dei Q-Values
+        # quando l'Actor cerca di matchare le azioni deterministiche del BC ai bordi della tanh.
+        return 0.0
 
     def select_action(self, state, evaluate=False):
         state_t = torch.FloatTensor(state).to(self.device).unsqueeze(0)
