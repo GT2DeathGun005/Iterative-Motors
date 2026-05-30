@@ -419,9 +419,10 @@ class SACAgent:
             bc_loss = F.mse_loss(pi, action_b, reduction='none')
             bc_penalty = (bc_loss.mean(dim=1, keepdim=True) * expert_mask_b).mean()
 
-            # Decay lineare del peso BC: da 5.0 a 0.0 in 50.000 step
-            # Raggiunti i 50k step, il SAC è puro e libero dalla media umana
-            bc_weight = max(0.0, 5.0 * (1.0 - min(global_step, 50000) / 50000.0))
+            # Decay lineare del peso BC: da 5.0 a 0.0 in 200.000 step
+            # Orizzonte ideale per continuous control: previene shock stocastici 
+            # senza causare plateau di apprendimento (Multimodal Averaging)
+            bc_weight = max(0.0, 5.0 * (1.0 - min(global_step, 200000) / 200000.0))
 
             # Total Actor Loss
             total_actor_loss = actor_loss_sac + bc_weight * bc_penalty
