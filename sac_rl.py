@@ -336,6 +336,9 @@ class SACAgent:
         self.tau = 0.005
 
         self.actor = Actor().to(self.device)
+        self.bc_policy = Actor().to(self.device)
+        for p in self.bc_policy.parameters():
+            p.requires_grad = False
         self.critic = Critic().to(self.device)
         self.critic_target = Critic().to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
@@ -438,9 +441,20 @@ class SACAgent:
             # L'Actor massimizza il Q-Value stimato e l'Entropia.
             actor_loss_sac = (alpha * log_pi - min_q_pi).mean()
             
-            # BC Penalty (Asymmetric)
-            bc_loss = F.mse_loss(pi, action_b, reduction='none')
-            bc_penalty = (bc_loss.mean(dim=1, keepdim=True) * expert_mask_b).mean()
+            # --- PERMANENT BC ANCHOR & SELF-IMITATION ---
+            # 1. Genera le azioni sicure dal modello BC umano (frozen)
+            with torch.no_grad():
+                bc_action, _, _ = self.bc_policy.sample(state_b, evaluate=True)
+
+            # 2. Target ibrido:
+            # - Se expert_mask_b == 1.0 (Elite), imita l'azione record (action_b)
+            # - Se expert_mask_b == 0.0 (Standard/Schianto imminente), imita l'umano (bc_action)
+            target_action = torch.where(expert_mask_b == 1.0, action_b, bc_action)
+
+            # 3. La BC_Penalty si applica SEMPRE al 100% del batch.
+            # Ora possiamo usare una mean() globale senza azzerare nulla con la maschera.
+            bc_loss = F.mse_loss(pi, target_action)
+            bc_penalty = bc_loss # Rinominato per chiarezza nel total_loss
 
             # Decay lineare del peso BC: Permanent BC Adherence (Residual RL)
             # Forza iniziale: 10.0 per proteggere i pesi BC dal Critic ancora acerbo.
@@ -558,6 +572,7 @@ def train():
     elite_memory = ReplayBuffer(20000)
 
     agent = SACAgent()
+    agent.bc_policy.load_bc_weights(args.bc_weights)
     checkpoint_path = 'train_set/checkpoints/sac_checkpoint.pth'
     start_episode, global_step = agent.load_checkpoint(checkpoint_path, memory, elite_memory)
 
@@ -688,9 +703,13 @@ def train():
                 
                 # ── Elite Buffer Admission ──
                 if max_dist >= elite_threshold:
-                    for t in episode_transitions:
-                        # expert=1.0 forza il Self-Imitation Learning
-                        elite_memory.push(t[0], t[1], t[2], t[3], t[4], expert=1.0)
+                    n_transitions = len(episode_transitions)
+                    danger_zone_steps = 50  # Sgancia il target d'élite 1 secondo prima del botto
+                    for i, t in enumerate(episode_transitions):
+                        is_danger_zone = (termination_reason == "CRASH") and (i >= n_transitions - danger_zone_steps)
+                        exp_val = 0.0 if is_danger_zone else 1.0
+                        elite_memory.push(t[0], t[1], t[2], t[3], t[4], expert=exp_val)
+                    
                     elite_threshold = max(500.0, max_dist * 0.8)
                 
                 break

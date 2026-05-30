@@ -85,5 +85,17 @@ Per mitigare la *Sample Inefficiency* e il *Catastrophic Forgetting* intrinseco 
 - **Caching Episodico**: Le transizioni non vengono caricate step-by-step, ma raggruppate per episodio.
 - **Elite Buffer**: Se un episodio supera una soglia dinamica di eccellenza (inizialmente `500.0` metri di `distRaced`), l'intero episodio viene clonato in un buffer secondario a capacità ridotta (`20.000` step).
 - **Iniezione Expert**: I campioni clonati nell'Elite Buffer vengono flaggati con `expert=1.0`. Questo "inganna" la `bc_penalty` dell'Actor, forzando la rete a trattare i propri record come se fossero dimostrazioni umane ottimali, innescando l'auto-imitazione (Self-Imitation Learning).
-- **Hybrid Sampling**: Durante il training, il SAC estrae il 75% del minibatch dal buffer standard (per l'esplorazione e la mappatura dei crash) e il 25% dall'Elite Buffer. Questo campionamento ibrido O(1) garantisce che i pesi della rete non "dimentichino" mai la fisica dei giri migliori, stabilizzando definitivamente le prestazioni a lungo termine.
+- **Hybrid Sampling (Generalization Balance)**: Durante il training, il SAC estrae il 75% del minibatch dal buffer standard e il 25% dall'Elite Buffer. Sebbene in passato si sia tentato un "Extreme Optimism" (85% Elite), questo portava a un forte **overfitting** sui singoli stati esatti dei record. Poiché la rete aggiunge un rumore Gaussiano esplorativo (`std=0.05`), l'auto si troverà sempre in stati "sporchi" leggermente diversi dalla traiettoria perfetta. Il 75% di Standard Buffer (con la BC_Penalty ancorata al maestro umano) è vitale per insegnare all'agente a **generalizzare** e recuperare la traiettoria quando si verifica una deviazione stocastica.
 - **Isolamento Dati**: Per mantenere pulita la directory dei checkpoint, entrambi i buffer (principale e elite) vengono serializzati in formato `.npz` e memorizzati in una sottocartella dedicata `train_set/checkpoints/buffers/`.
+
+## 9. Prevenzione del Collasso (Frozen BC Anchor e Causal Confusion)
+Durante l'addestramento ibrido, l'architettura risolve due problematiche critiche intrinseche al Self-Imitation Learning:
+
+1. **Frozen BC Anchor (Prevenzione Extrapolation Error)**: 
+   Nel buffer standard (75% del batch esplorativo), i gradienti RL puri possono degenerare se il Critic si riempie di Q-Value negativi (a seguito di molti schianti in esplorazione), portando l'Actor a manovre suicide (es. schiantarsi alla partenza). 
+   Per impedirlo, l'agente istanzia un **Frozen BC Anchor** (`self.bc_policy`), ovvero una copia congelata e immutabile della rete neurale al suo stato iniziale (pesi del clone umano `bc_policy.pth`). 
+   Durante il training, per ogni campione non-élite, la BC Penalty calcola l'errore quadratico medio (MSE) forzando l'Actor ad aderire alle mosse sicure del maestro umano, garantendo un ancoraggio indistruttibile alla traiettoria di base.
+
+2. **Terminal State Mimicry (Sgancio Pre-Schianto)**: 
+   Quando un episodio record (salvato nell'Elite Buffer) termina con uno schianto, le ultime azioni sono la causa diretta del fallimento. Forzare l'Actor a imitarle (tramite Self-Imitation) indurrebbe una *Causal Confusion*. 
+   Il sistema risolve questo paradosso azzerando la maschera di imitazione (`expert=0.0`) negli ultimi 50 step (esattamente 1 secondo a 50Hz) di un record schiantato. In quella "finestra di evasione", l'agente smette di imitare il suo vecchio errore e torna istantaneamente sotto l'influenza del Reinforcement Learning puro e del Frozen BC Anchor, riuscendo così a frenare e a sopravvivere per estendere ulteriormente il record.
