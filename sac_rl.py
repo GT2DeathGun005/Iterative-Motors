@@ -376,8 +376,23 @@ class SACAgent:
             cont_action, _, gear_idx = self.actor.sample(state_t, evaluate=evaluate)
         return cont_action.cpu().numpy()[0], gear_idx.cpu().item()
 
-    def update(self, memory, batch_size, global_step):
-        state_b, action_b, reward_b, next_state_b, mask_b, expert_mask_b = memory.sample(batch_size)
+    def update(self, memory, elite_memory, batch_size, global_step):
+        # ── Hybrid Sampling (Elite Buffer) ──
+        if len(elite_memory.buffer) >= 64:
+            b1 = int(batch_size * 0.75) # 192
+            b2 = batch_size - b1        # 64
+            
+            s1, a1, r1, ns1, m1, em1 = memory.sample(b1)
+            s2, a2, r2, ns2, m2, em2 = elite_memory.sample(b2)
+            
+            state_b = np.concatenate([s1, s2], axis=0)
+            action_b = np.concatenate([a1, a2], axis=0)
+            reward_b = np.concatenate([r1, r2], axis=0)
+            next_state_b = np.concatenate([ns1, ns2], axis=0)
+            mask_b = np.concatenate([m1, m2], axis=0)
+            expert_mask_b = np.concatenate([em1, em2], axis=0)
+        else:
+            state_b, action_b, reward_b, next_state_b, mask_b, expert_mask_b = memory.sample(batch_size)
 
         # 🛡️ REWARD SCALING per prevenire il collasso dell'Actor
         # Gamma è 0.999 (orizzonte 1000 step), quindi i Q-Value sono 10 volte più grandi.
@@ -427,10 +442,12 @@ class SACAgent:
             bc_loss = F.mse_loss(pi, action_b, reduction='none')
             bc_penalty = (bc_loss.mean(dim=1, keepdim=True) * expert_mask_b).mean()
 
-            # Decay lineare del peso BC: da 5.0 a 0.0 in 200.000 step
-            # Orizzonte ideale per continuous control: previene shock stocastici 
-            # senza causare plateau di apprendimento (Multimodal Averaging)
-            bc_weight = max(0.0, 5.0 * (1.0 - min(global_step, 200000) / 200000.0))
+            # Decay lineare del peso BC: Permanent BC Adherence (Residual RL)
+            # Forza iniziale: 10.0 per proteggere i pesi BC dal Critic ancora acerbo.
+            # Orizzonte lunghissimo: 500.000 step, per evitare Extrapolation Errors.
+            # Hard Minimum: 2.0 (non arriva mai a zero) così l'Actor usa i Q-Value 
+            # solo come correzioni locali (Residuals) della policy umana, senza sbandare.
+            bc_weight = max(2.0, 10.0 * (1.0 - global_step / 500000.0))
 
             # Total Actor Loss
             total_actor_loss = actor_loss_sac + bc_weight * bc_penalty
@@ -457,7 +474,7 @@ class SACAgent:
 
         return critic_loss.item(), actor_loss_val, alpha
 
-    def save_checkpoint(self, filepath, episode, global_step, memory):
+    def save_checkpoint(self, filepath, episode, global_step, memory, elite_memory=None):
         """Salva checkpoint PyTorch (reti + ottimizzatori) e buffer numpy separato."""
         checkpoint = {
             'actor': self.actor.state_dict(),
@@ -472,11 +489,19 @@ class SACAgent:
         }
         torch.save(checkpoint, filepath)
 
-        # Salva il Replay Buffer separatamente con compressione numpy
-        buffer_path = filepath.replace('.pth', '_buffer.npz')
+        # Salva i Replay Buffer separatamente nella sottocartella "buffers"
+        buffer_dir = os.path.join(os.path.dirname(filepath), 'buffers')
+        os.makedirs(buffer_dir, exist_ok=True)
+        base_name = os.path.basename(filepath).replace('.pth', '')
+        
+        buffer_path = os.path.join(buffer_dir, f"{base_name}_buffer.npz")
+        elite_buffer_path = os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz")
+        
         memory.save(buffer_path)
+        if elite_memory:
+            elite_memory.save(elite_buffer_path)
 
-    def load_checkpoint(self, filepath, memory):
+    def load_checkpoint(self, filepath, memory, elite_memory=None):
         if not os.path.exists(filepath):
             return 0, 0
 
@@ -502,9 +527,16 @@ class SACAgent:
         for param_group in self.alpha_optimizer.param_groups:
             param_group['lr'] = 3e-4
 
-        # Carica il Replay Buffer dal file numpy separato
-        buffer_path = filepath.replace('.pth', '_buffer.npz')
+        # Carica i Replay Buffer dalla sottocartella "buffers"
+        buffer_dir = os.path.join(os.path.dirname(filepath), 'buffers')
+        base_name = os.path.basename(filepath).replace('.pth', '')
+        
+        buffer_path = os.path.join(buffer_dir, f"{base_name}_buffer.npz")
+        elite_buffer_path = os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz")
+        
         memory.load(buffer_path)
+        if elite_memory and os.path.exists(elite_buffer_path):
+            elite_memory.load(elite_buffer_path)
 
         print(f"✅ Checkpoint caricato: ripresa dall'Episodio {checkpoint['episode']} "
               f"(Step {checkpoint['global_step']}). Buffer: {len(memory)} transizioni")
@@ -523,10 +555,11 @@ def train():
     env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=True)
     print("  Inizializzazione Replay Buffer...")
     memory = ReplayBuffer(100000)
+    elite_memory = ReplayBuffer(20000)
 
     agent = SACAgent()
     checkpoint_path = 'train_set/checkpoints/sac_checkpoint.pth'
-    start_episode, global_step = agent.load_checkpoint(checkpoint_path, memory)
+    start_episode, global_step = agent.load_checkpoint(checkpoint_path, memory, elite_memory)
 
     if start_episode == 0:
         agent.actor.load_bc_weights(args.bc_weights)
@@ -545,10 +578,13 @@ def train():
     print("🚀 Avvio training SAC (Warm-Start)..." if start_episode == 0 else "🚀 Ripresa training SAC...")
 
     best_lap_time = float('inf')
+    elite_threshold = 500.0
 
     for episode in range(start_episode, args.episodes):
         # Relaunch=True garantisce azzeramento residui fisici
         ob = env.reset(relaunch=True)
+
+        episode_transitions = []
 
         # Inizializza stack con maxlen=13 per replicare k=6 (t-12, t-6, t)
         f_state = flatten_state(ob)
@@ -635,7 +671,7 @@ def train():
             mask = 0.0 if info.get('crash', False) else 1.0
             
             time_limit_reached = (step >= args.max_steps)
-            memory.push(stacked_state, cont_action, reward, next_stacked_state, mask)
+            episode_transitions.append((stacked_state, cont_action, reward, next_stacked_state, mask))
 
             stacked_state = next_stacked_state
             episode_reward += reward
@@ -643,9 +679,20 @@ def train():
             global_step += 1
 
             if len(memory) > batch_size:
-                critic_loss_val, actor_loss_val, current_alpha = agent.update(memory, batch_size, global_step)
+                critic_loss_val, actor_loss_val, current_alpha = agent.update(memory, elite_memory, batch_size, global_step)
 
             if done or env_done or time_limit_reached:
+                # ── Caching Episodico ──
+                for t in episode_transitions:
+                    memory.push(t[0], t[1], t[2], t[3], t[4], expert=0.0)
+                
+                # ── Elite Buffer Admission ──
+                if max_dist >= elite_threshold:
+                    for t in episode_transitions:
+                        # expert=1.0 forza il Self-Imitation Learning
+                        elite_memory.push(t[0], t[1], t[2], t[3], t[4], expert=1.0)
+                    elite_threshold = max(500.0, max_dist * 0.8)
+                
                 break
 
         # Tempo stimato (50Hz = 0.02s per step)
@@ -667,7 +714,7 @@ def train():
             f.write(log_msg + "\n")
 
         # Salva i pesi aggiornati e il checkpoint integrale
-        agent.save_checkpoint(checkpoint_path, episode + 1, global_step, memory)
+        agent.save_checkpoint(checkpoint_path, episode + 1, global_step, memory, elite_memory)
         torch.save(agent.actor.state_dict(), 'train_set/checkpoints/sac_policy.pth')
 
     env.end()

@@ -65,7 +65,9 @@ AIcar/
 └── train_set/                 # Dati e Checkpoint
     ├── laps/                  #   File HDF5 dei giri registrati (lap_001.h5 ...)
     ├── checkpoints/           #   Pesi: bc_policy.pth, sac_policy.pth, sac_best_policy.pth, sac_best_dist.pth, sac_checkpoint.pth
-    │   └── sac_checkpoint_buffer.npz  # Replay Buffer compresso (numpy)
+    │   └── buffers/
+    │       ├── sac_checkpoint_buffer.npz        # Replay Buffer standard compresso (numpy)
+    │       └── sac_checkpoint_elite_buffer.npz  # Elite Buffer compresso (numpy)
     └── session_logs/          #   Log delle sessioni di training
 ```
 
@@ -135,7 +137,7 @@ Il training è **resume-safe**: il checkpoint viene salvato ad ogni episodio. Pu
 
 Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per prevenire problemi di focus con il desktop dell'host. 
 
-**Output:** `train_set/checkpoints/sac_policy.pth` + `sac_best_policy.pth` + `sac_best_dist.pth` + `sac_checkpoint.pth` + `sac_checkpoint_buffer.npz`
+**Output:** `train_set/checkpoints/sac_policy.pth` + `sac_best_policy.pth` + `sac_best_dist.pth` + `sac_checkpoint.pth` + `buffers/sac_checkpoint_buffer.npz` + `buffers/sac_checkpoint_elite_buffer.npz`
 
 ### 4. Test Deterministico (Inference)
 
@@ -226,7 +228,7 @@ $$r_t = \underbrace{\frac{v_x}{50} \cos(\theta)}_{\text{progress}} \underbrace{-
 ### Replay Buffer Checkpointing
 
 Il Replay Buffer viene salvato separatamente in formato `np.savez_compressed`:
-- **File**: `sac_checkpoint_buffer.npz` (~50-100MB compressi vs >1GB con pickle)
+- **File**: `buffers/sac_checkpoint_buffer.npz` e `buffers/sac_checkpoint_elite_buffer.npz` (~50-100MB compressi vs >1GB con pickle)
 - **Previene il Catastrophic Forgetting** quando il training viene interrotto e ripreso
 - **Resume-safe**: Ad ogni episodio vengono salvati sia il checkpoint PyTorch che il buffer numpy
 
@@ -298,8 +300,8 @@ Il training BC include perturbazione laterale dello stato (`trackPos ±0.15`) co
 2. **Auto-Entropy Tuning**: Introdotto tuning automatico del `log_alpha` per un corretto calcolo del SAC.
 3. **Pure SAC Actor Loss**: Rimossa la logica fallata TD3+BC dalla fase Online. L'Actor massimizza unicamente entropia e Q-Value target senza auto-imitare il proprio rumore di addestramento.
 4. **Dual Checkpointing**: L'agente salva `sac_best_policy.pth` ad ogni giro da record. Durante l'esplorazione, salva anche `sac_best_dist.pth` ad ogni nuovo record di distanza percorsa prima dello schianto (se > 500m). Logging semantico per gli episodi `[SUCCESS]`, `[CRASH]` o `[TIMEOUT]`.
-5. **BC Penalty Decay (Multimodal Averaging Fix)**: Implementato un decadimento lineare della penalità di Behavioral Cloning (da 5.0 a 0.0 in 200.000 step). Questo risolve il problema del *Multimodal Averaging* (dove il dataset BC eterogeneo costringeva la rete deterministica ad andare dritta nelle curve) permettendo al SAC di svincolarsi dalla "media umana" in modo fluido senza generare shock stocastici prematuri.
-6. **Actor LR Restore & Alpha Clamp Fix**: Ripristinato il Learning Rate dell'Actor a `3e-4` (con override forzato post-resume da PyTorch checkpoint) per permettere all'agente di imparare rapidamente a guidare in autonomia una volta svanita la `bc_penalty`. Corretto anche un bug nel clamping matematico dell'Alpha, rimuovendo il limite massimo (`max=-3.0`) che impediva al sistema di auto-regolazione di aumentare la temperatura per esplorare in sicurezza.
+5. **Permanent BC Adherence (Residual RL)**: Implementata una strategia di "guinzaglio" asintotico per la penalità di Behavioral Cloning. Il peso decade lentissimamente (da 10.0 a 2.0 in 500.000 step) ma non arriva *mai* a zero. Questo previene il *Policy Collapse* causato dall'Extrapolation Error, obbligando l'Actor a restare ancorato alla fisica della policy BC, e sfruttando i gradienti Q-Value del SAC unicamente come affinamento locale (Residual RL) per ottimizzare le curve in cui la media umana fallisce.
+6. **Alpha Math-Fix e Reward Scaling**: Disattivata l'Entropia SAC (`alpha = 0.0`) per curare in via definitiva l'esplosione dei gradienti ai confini del dominio `tanh` (`gas a tavoletta`). Per compensare l'iper-ottimismo del Critic (che porta all'Extrapolation Error summenzionato), la `reward_scale` è stata abbattuta a `0.002`, armonizzando i Q-value generati da un `gamma = 0.999`.
 7. **Gamma Horizon Fix (50Hz Myopia)**: Aumentato il discount factor `gamma` da `0.99` a `0.999`. In un simulatore a 50Hz, `gamma=0.99` limitava l'orizzonte visivo del Q-Value a soli 2 secondi (100 step), rendendo la partenza (speed=0) indistinguibile da uno stallo e portando l'Actor a massimizzare l'entropia (0.5 gas, 0.5 freno). Con `gamma=0.999`, l'orizzonte si espande a 20 secondi, permettendo al Critic di ricompensare l'accelerazione a lungo termine.
 
 ### [2026-05-29] Migrazione Ibrida BC-RL (SAC) — ARCHITETTURALE

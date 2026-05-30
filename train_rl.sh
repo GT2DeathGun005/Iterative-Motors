@@ -31,10 +31,12 @@ cd "$SCRIPT_DIR"
 # ── Configurazione ──
 BC_WEIGHTS="train_set/checkpoints/bc_policy.pth"
 SAC_CHECKPOINT="train_set/checkpoints/sac_checkpoint.pth"
-SAC_BUFFER="train_set/checkpoints/sac_checkpoint_buffer.npz"
+SAC_BUFFER="train_set/checkpoints/buffers/sac_checkpoint_buffer.npz"
+SAC_ELITE_BUFFER="train_set/checkpoints/buffers/sac_checkpoint_elite_buffer.npz"
 SAC_POLICY="train_set/checkpoints/sac_policy.pth"
 LOG_DIR="train_set/session_logs"
 CHECKPOINT_DIR="train_set/checkpoints"
+BUFFER_DIR="train_set/checkpoints/buffers"
 
 # SAC Hyperparameters (override con variabili d'ambiente)
 SAC_EPISODES="${SAC_EPISODES:-1000}"
@@ -55,7 +57,7 @@ log_phase() { echo -e "\n${BOLD}${BLUE}═════════════�
 # ── Gestione flag --clean ──
 if [[ "${1:-}" == "--clean" ]]; then
     log_warn "Flag --clean rilevato: cancellazione checkpoint SAC precedenti..."
-    rm -f "$SAC_CHECKPOINT" "$SAC_BUFFER" "$SAC_POLICY" "train_set/checkpoints/sac_best_policy.pth" "train_set/checkpoints/sac_best_dist.pth"
+    rm -f "$SAC_CHECKPOINT" "$SAC_BUFFER" "$SAC_ELITE_BUFFER" "$SAC_POLICY" "train_set/checkpoints/sac_best_policy.pth" "train_set/checkpoints/sac_best_dist.pth"
     log_ok "Checkpoint SAC cancellati. Ripartenza pulita."
 fi
 
