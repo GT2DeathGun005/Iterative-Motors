@@ -378,7 +378,10 @@ class SACAgent:
         state_b, action_b, reward_b, next_state_b, mask_b, expert_mask_b = memory.sample(batch_size)
 
         # 🛡️ REWARD SCALING per prevenire il collasso dell'Actor
-        reward_scale = 0.02
+        # Gamma è 0.999 (orizzonte 1000 step), quindi i Q-Value sono 10 volte più grandi.
+        # Riduciamo il reward_scale a 0.002 per mantenere bilanciati i gradienti del Critic
+        # rispetto alla BC Penalty e all'Entropia.
+        reward_scale = 0.002
         reward_b = reward_b * reward_scale
 
         state_b = torch.FloatTensor(state_b).to(self.device)
