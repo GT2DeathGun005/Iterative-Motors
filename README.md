@@ -168,9 +168,9 @@ Durante il training RL, il log stampa metriche fondamentali per diagnosticare la
 * **Diagnosi:** Un valore stabilmente basso significa che il Critic comprende perfettamente la fisica del gioco e sta fornendo valutazioni accurate. Se la `CriticL` schizza permanentemente a centinaia, c'è un'esplosione dei gradienti (o mancano i dati BC nel replay buffer).
 
 ### 2. Actor Loss (`ActorL`)
-* **Cos'è:** Misura quanto l'Actor sta massimizzando le reward del Critic combinate all'entropia (l'esplorazione).
-* **Valori Sani:** Nel RL puro **non esiste un valore assoluto ideale** per l'Actor Loss, poiché scala in base alle reward. L'aspetto cruciale è **la pendenza della curva**.
-* **Diagnosi:** Una salita dolce e lineare (es. da `3.0` a `74.0` in decine di step) è segno di un apprendimento sanissimo, in cui l'Actor lima gradualmente le sue traiettorie. Salti giganteschi in un singolo step denotano un gradiente "sledgehammer" in arrivo dal Critic che distruggerà i pesi.
+* **Cos'è:** Misura quanto l'Actor sta massimizzando le reward stimate dal Critic. Essendo calcolata in PyTorch (che sa solo minimizzare) come `ActorL = BC_Penalty - Q_Value`, invertire il segno è necessario.
+* **Valori Sani:** L'Actor Loss **deve diventare negativa**. Non esiste un limite inferiore, più scende sotto lo zero, più punti l'Actor si aspetta di guadagnare.
+* **Diagnosi:** Una discesa dolce e lineare (es. da `0.0` a `-0.8` e oltre) è segno di un apprendimento sanissimo, in cui l'Actor sta capitalizzando sul Q-Value. Salti "positivi" giganteschi in un singolo step denotano un gradiente "sledgehammer" (solitamente causato dall'entropia o dalla BC Penalty) che punisce l'Actor.
 
 ### 3. Entropia Costante (`Alpha` Fisso)
 * **Cos'è:** Il parametro (Soft Actor-Critic) che regola l'importanza dell'esplorazione stocastica rispetto all'ottimizzazione del Q-value.

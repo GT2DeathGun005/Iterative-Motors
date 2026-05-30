@@ -12,6 +12,10 @@ L'Actor è una rete neurale ibrida progettata per trattenere la conoscenza dell'
 
 > **Tanh Explosion Prevention**: L'output della rete viene fatto passare per una funzione `tanh`. Poiché la derivata della `tanh` tende a zero agli estremi, la probabilità `log_pi` rischia di esplodere a `+infinito`. Abbiamo implementato un limite matematico (`torch.clamp(log_prob, -20.0, 10.0)`) per garantire la stabilità numerica ad ogni step.
 
+> [!NOTE]
+> **Interpretazione dei Log: Perché l'Actor Loss deve essere NEGATIVA?**
+> Nel Machine Learning tradizionale (come il Behavioral Cloning), la *Loss* calcola un errore (Mean Squared Error) e l'obiettivo è averla positiva e tendente a zero. In Reinforcement Learning (Actor-Critic), l'obiettivo dell'Actor è *massimizzare* il punteggio (il Q-Value stimato dal Critic). Poiché gli ottimizzatori (PyTorch) lavorano unicamente per *minimizzare*, la funzione di Loss dell'Actor è definita invertendo il segno: `ActorL = BC_Penalty - Q_Value`.
+> Quando l'Actor impara a compiere azioni redditizie, il Q-Value previsto diventa fortemente positivo (es. `+100`). Poiché la BC Penalty è già vicina a zero, il termine dominante nell'equazione diventa `-100`. Di conseguenza, nei log di training, una **ActorL che scende sotto lo zero e diventa sempre più negativa è la prova matematica che l'Actor sta imparando a vincere**.
 ## 2. Critic (Twin Q-Network)
 Il Critic ha il compito di stimare il valore (Q-value) della coppia (Stato, Azione). Poiché il BC non usa una value-function, il Critic deve essere addestrato da zero.
 - **Architettura Twin**: Usa due reti Q indipendenti per mitigare l'Overestimation Bias tipico del Q-learning. Si prende il minimo tra le due stime durante l'aggiornamento dell'Actor.
