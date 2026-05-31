@@ -471,12 +471,15 @@ class SACAgent:
             accel_loss = F.mse_loss(det_accel, target_accel)
             brake_loss = F.mse_loss(det_brake, target_brake)
 
-            # Penalità di Mutual Exclusion (Soft Shaping)
-            # Se l'Actor prova a frenare e accelerare contemporaneamente, viene punito.
+            # 1. Normalizzazione della componente direzionale per mantenere la magnitudine originaria
+            directional_loss = (steer_loss * 2.0 + accel_loss + brake_loss * 2.0) / 5.0
+
+            # 2. Penalità di Mutual Exclusion ridotta a un "gentle nudge" (Soft Shaping)
+            # Invece di un martello moltiplicato per 5, usiamo un tocco leggero (es. 0.1)
             mutual_exclusion_penalty = (det_accel * det_brake).mean()
 
-            # Ricomposizione della BC Penalty (Con peso maggiorato sullo sterzo per evitare il Drift)
-            bc_penalty = (steer_loss * 2.0) + accel_loss + (brake_loss * 2.0) + (mutual_exclusion_penalty * 5.0)
+            # Ricomposizione equilibrata
+            bc_penalty = directional_loss + (mutual_exclusion_penalty * 0.1)
 
             # Decay Esponenziale Smorzato del peso BC: Permanent BC Adherence
             bc_weight = 2.0 + 8.0 * np.exp(-global_step / 150000.0)

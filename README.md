@@ -283,6 +283,7 @@ Il training BC include perturbazione laterale dello stato (`trackPos ±0.15`) co
 3. **Calcolo Deterministico BC Penalty**: La distorsione introdotta dall'uso stocastico è stata risolta calcolando la loss (MSE) tra l'azione umana e l'azione deterministica pre-tanh (`torch.tanh(mean)`), separando la varianza esplorativa dal target direzionale.
 4. **Monotonicità Elite Threshold**: La soglia per l'ammissione nell'Elite Buffer non decade più progressivamente, ma dipende strettamente dal record assoluto globale (`best_distance * 0.9`), prevenendo avvelenamenti causati da runs mediocri.
 5. **Soft Mutual Exclusion e Critic LR**: Modificata la BC Penalty per penalizzare esplicitamente la pressione simultanea di acceleratore e freno, proteggendo l'addestramento. Sostituito il decay lineare del peso BC con un decadimento Esponenziale Smorzato e abbassato il Learning Rate del Critic a `1e-4` per rallentare l'assimilazione del gradiente ed evitare l'Extrapolation Error.
+6. **Risoluzione Scalar Shock (BC Penalty Normalization)**: Normalizzata la loss direzionale e ridotta la magnitudine della *Mutual Exclusion Penalty* per prevenire l'overpowering del gradiente. Questo impedisce il crollo della deviazione standard (Variance Collapse) che precedentemente induceva un panico entropico e l'esplosione distruttiva di Alpha.
 
 ### [2026-05-30] Stabilizzazione SAC: Expert Buffer Injection, Gradient Clipping e Reward Scaling
 
