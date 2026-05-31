@@ -357,7 +357,7 @@ class SACAgent:
             {'params': self.actor.log_std_head.parameters()}
         ], lr=3e-4)
 
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-4)
 
         # Entropy Auto-Tuning (Alpha)
         self.target_entropy = -3.0
@@ -454,14 +454,32 @@ class SACAgent:
             # Usiamo l'azione deterministica torch.tanh(mean) per isolare la varianza stocastica
             mean, _, _ = self.actor(state_b)
             deterministic_action = torch.tanh(mean)
-            bc_penalty = F.mse_loss(deterministic_action, target_action)
 
-            # Decay lineare del peso BC: Permanent BC Adherence (Residual RL)
-            # Forza iniziale: 10.0 per proteggere i pesi BC dal Critic ancora acerbo.
-            # Orizzonte lunghissimo: 500.000 step, per evitare Extrapolation Errors.
-            # Hard Minimum: 2.0 (non arriva mai a zero) così l'Actor usa i Q-Value 
-            # solo come correzioni locali (Residuals) della policy umana, senza sbandare.
-            bc_weight = max(2.0, 10.0 * (1.0 - global_step / 500000.0))
+            # Separazione azioni deterministiche per penalizzazione Mutual Exclusion
+            det_steer = deterministic_action[:, 0]
+            det_accel = (deterministic_action[:, 1] + 1.0) / 2.0
+            det_brake = (deterministic_action[:, 2] + 1.0) / 2.0
+
+            target_steer = target_action[:, 0]
+            target_accel = (target_action[:, 1] + 1.0) / 2.0
+            target_brake = (target_action[:, 2] + 1.0) / 2.0
+
+            # MSE Ponderata per Steering (Priorità Massima)
+            steer_loss = F.mse_loss(det_steer, target_steer)
+
+            # MSE Ponderata per Accelerazione e Freno
+            accel_loss = F.mse_loss(det_accel, target_accel)
+            brake_loss = F.mse_loss(det_brake, target_brake)
+
+            # Penalità di Mutual Exclusion (Soft Shaping)
+            # Se l'Actor prova a frenare e accelerare contemporaneamente, viene punito.
+            mutual_exclusion_penalty = (det_accel * det_brake).mean()
+
+            # Ricomposizione della BC Penalty (Con peso maggiorato sullo sterzo per evitare il Drift)
+            bc_penalty = (steer_loss * 2.0) + accel_loss + (brake_loss * 2.0) + (mutual_exclusion_penalty * 5.0)
+
+            # Decay Esponenziale Smorzato del peso BC: Permanent BC Adherence
+            bc_weight = 2.0 + 8.0 * np.exp(-global_step / 150000.0)
 
             # Total Actor Loss
             total_actor_loss = actor_loss_sac + bc_weight * bc_penalty
@@ -550,7 +568,7 @@ class SACAgent:
         for param_group in self.actor_optimizer.param_groups:
             param_group['lr'] = 3e-4
         for param_group in self.critic_optimizer.param_groups:
-            param_group['lr'] = 3e-4
+            param_group['lr'] = 1e-4
         for param_group in self.alpha_optimizer.param_groups:
             param_group['lr'] = 3e-4
 

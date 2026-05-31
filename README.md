@@ -282,6 +282,7 @@ Il training BC include perturbazione laterale dello stato (`trackPos ±0.15`) co
 2. **Rimozione Rumore Manuale**: Eliminato l'uso di `np.random.normal(0, 0.05)` a valle dell'Actor. L'esplorazione è ora gestita interamente in modo nativo dal campionamento del SAC (`log_std`), rimuovendo il *distillation error* che forzava l'Actor a imparare il proprio tremolio.
 3. **Calcolo Deterministico BC Penalty**: La distorsione introdotta dall'uso stocastico è stata risolta calcolando la loss (MSE) tra l'azione umana e l'azione deterministica pre-tanh (`torch.tanh(mean)`), separando la varianza esplorativa dal target direzionale.
 4. **Monotonicità Elite Threshold**: La soglia per l'ammissione nell'Elite Buffer non decade più progressivamente, ma dipende strettamente dal record assoluto globale (`best_distance * 0.9`), prevenendo avvelenamenti causati da runs mediocri.
+5. **Soft Mutual Exclusion e Critic LR**: Modificata la BC Penalty per penalizzare esplicitamente la pressione simultanea di acceleratore e freno, proteggendo l'addestramento. Sostituito il decay lineare del peso BC con un decadimento Esponenziale Smorzato e abbassato il Learning Rate del Critic a `1e-4` per rallentare l'assimilazione del gradiente ed evitare l'Extrapolation Error.
 
 ### [2026-05-30] Stabilizzazione SAC: Expert Buffer Injection, Gradient Clipping e Reward Scaling
 
