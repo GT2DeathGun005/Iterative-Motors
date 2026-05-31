@@ -369,9 +369,8 @@ class SACAgent:
 
     @property
     def alpha(self):
-        # Disabilitiamo l'entropia (0.0) per evitare il drain dei Q-Values
-        # quando l'Actor cerca di matchare le azioni deterministiche del BC ai bordi della tanh.
-        return 0.0
+        # Restituisce l'alpha ottimizzato automaticamente per il bilanciamento esplorazione/exploit
+        return self.log_alpha.exp().detach()
 
     def select_action(self, state, evaluate=False):
         state_t = torch.FloatTensor(state).to(self.device).unsqueeze(0)
@@ -452,9 +451,10 @@ class SACAgent:
             target_action = torch.where(expert_mask_b == 1.0, action_b, bc_action)
 
             # 3. La BC_Penalty si applica SEMPRE al 100% del batch.
-            # Ora possiamo usare una mean() globale senza azzerare nulla con la maschera.
-            bc_loss = F.mse_loss(pi, target_action)
-            bc_penalty = bc_loss # Rinominato per chiarezza nel total_loss
+            # Usiamo l'azione deterministica torch.tanh(mean) per isolare la varianza stocastica
+            mean, _, _ = self.actor(state_b)
+            deterministic_action = torch.tanh(mean)
+            bc_penalty = F.mse_loss(deterministic_action, target_action)
 
             # Decay lineare del peso BC: Permanent BC Adherence (Residual RL)
             # Forza iniziale: 10.0 per proteggere i pesi BC dal Critic ancora acerbo.
@@ -476,7 +476,7 @@ class SACAgent:
             alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
-            # self.alpha_optimizer.step() # DISABILITATO: Alpha fisso a 0.02 per evitare l'esplosione ai bordi (gas a tavoletta)
+            self.alpha_optimizer.step()
 
             # Evita che l'entropia crolli a zero: Alpha limitato a un minimo di ~0.007
             with torch.no_grad():
@@ -635,10 +635,7 @@ def train():
             agent.actor.eval()
             cont_action, raw_gear = agent.select_action(stacked_state, evaluate=False)
 
-            # INIEZIONE DI ACTION NOISE NEL ROLLOUT
-            # Aggiungiamo rumore Gaussiano per scuotere la policy (μ=0, σ=0.05)
-            noise = np.random.normal(0, 0.05, size=cont_action.shape)
-            cont_action = np.clip(cont_action + noise, -1.0, 1.0)
+            # Nessun rumore manuale aggiunto. L'esplorazione e' gestita nativamente dal campionamento SAC.
 
             # Gestione marce semplificata
             current_gear = max(1, min(6, raw_gear))
@@ -723,7 +720,8 @@ def train():
                         exp_val = 0.0 if is_danger_zone else 1.0
                         elite_memory.push(t[0], t[1], t[2], t[3], t[4], expert=exp_val)
                     
-                    elite_threshold = max(500.0, max_dist * 0.8)
+                    # Manteniamo la soglia d'elite monotonicamente legata al record assoluto globale
+                    elite_threshold = max(500.0, best_distance * 0.9)
                 
                 break
 

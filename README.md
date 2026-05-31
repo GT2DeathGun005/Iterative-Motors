@@ -174,10 +174,10 @@ Durante il training RL, il log stampa metriche fondamentali per diagnosticare la
 * **Valori Sani:** L'Actor Loss **deve diventare negativa**. Non esiste un limite inferiore, più scende sotto lo zero, più punti l'Actor si aspetta di guadagnare.
 * **Diagnosi:** Una discesa dolce e lineare (es. da `0.0` a `-0.8` e oltre) è segno di un apprendimento sanissimo, in cui l'Actor sta capitalizzando sul Q-Value. Salti "positivi" giganteschi in un singolo step denotano un gradiente "sledgehammer" (solitamente causato dall'entropia o dalla BC Penalty) che punisce l'Actor.
 
-### 3. Entropia Costante (`Alpha` Fisso)
-* **Cos'è:** Il parametro (Soft Actor-Critic) che regola l'importanza dell'esplorazione stocastica rispetto all'ottimizzazione del Q-value.
-* **Valori Sani:** Fissato rigorosamente a `0.02`. 
-* **Diagnosi:** Inizialmente l'Alpha era auto-regolato, ma la natura "bang-bang" (tutto gas/tutto freno) delle corse in simulazione causava un'esplosione dei gradienti ai bordi del dominio `tanh`. Questo spingeva la rete a fermarsi (Stall Trap) per fuggire alla penalità entropica infinita. Fissando Alpha, l'agente esplora con una deviazione standard costante e sana, disinnescando il bug matematico.
+### 3. Entropia Autoregolata (`Alpha`)
+* **Cos'è:** Il parametro (Soft Actor-Critic) che regola l'importanza dell'esplorazione stocastica rispetto all'ottimizzazione del Q-value, fungendo anche da freno all'overestimation bias.
+* **Valori Sani:** Si autoregola per raggiungere il target_entropy. I valori tipici si assestano solitamente attorno a scale decrescenti.
+* **Diagnosi:** L'Auto-Tuning dell'entropia assicura che il Critic non sviluppi una fiducia irrealistica verso azioni instabili, tenendo sotto controllo la divergenza della stima di Bellman (Q-Value Explosion). La discesa di Alpha significa che la rete è diventata più sicura nelle sue manovre e sta riducendo gradualmente l'esplorazione, solidificando il comportamento verso l'exploit puro delle azioni vincenti.
 
 ---
 
@@ -272,6 +272,16 @@ Il training BC include perturbazione laterale dello stato (`trackPos ±0.15`) co
 ---
 
 ## 🐛 Bug Risolti (Workflow Tracking)
+
+### [2026-05-31] Risoluzione del Collasso della Policy (Stall Trap & Q-Value Explosion)
+
+**Problema:** L'agente soffriva di uno "Stall Trap" alla partenza a causa di un *overestimation bias* critico (Critic Loss > 2000), seguito dal collasso della rete. Questo era indotto da Alpha azzerato forzatamente, iniezione di rumore scorretta e una soglia dell'elite buffer degenerata.
+
+**Fix applicati:**
+1. **Riattivazione Auto-Tuning Entropia**: Ripristinata l'ottimizzazione dinamica di `alpha`. L'entropia agisce ora come regolarizzatore nell'equazione di Bellman per frenare l'overestimation bias causata da Q-Values asintotici in stati *OOD*.
+2. **Rimozione Rumore Manuale**: Eliminato l'uso di `np.random.normal(0, 0.05)` a valle dell'Actor. L'esplorazione è ora gestita interamente in modo nativo dal campionamento del SAC (`log_std`), rimuovendo il *distillation error* che forzava l'Actor a imparare il proprio tremolio.
+3. **Calcolo Deterministico BC Penalty**: La distorsione introdotta dall'uso stocastico è stata risolta calcolando la loss (MSE) tra l'azione umana e l'azione deterministica pre-tanh (`torch.tanh(mean)`), separando la varianza esplorativa dal target direzionale.
+4. **Monotonicità Elite Threshold**: La soglia per l'ammissione nell'Elite Buffer non decade più progressivamente, ma dipende strettamente dal record assoluto globale (`best_distance * 0.9`), prevenendo avvelenamenti causati da runs mediocri.
 
 ### [2026-05-30] Stabilizzazione SAC: Expert Buffer Injection, Gradient Clipping e Reward Scaling
 
