@@ -486,7 +486,7 @@ class SACAgent:
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
             tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
 
-        return critic_loss.item(), actor_loss_val, alpha
+        return critic_loss.item(), actor_loss_val, alpha.item()
 
     def save_checkpoint(self, filepath, episode, global_step, memory, elite_memory=None):
         """Salva checkpoint PyTorch (reti + ottimizzatori) e buffer numpy separato."""
