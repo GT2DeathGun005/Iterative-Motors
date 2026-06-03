@@ -26,9 +26,9 @@ Il Critic ha il compito di stimare il valore (Q-value) della coppia (Stato, Azio
 ## 3. Parametri TD3+BC e Il Sistema di Loss (Anti-Drift)
 L'integrazione di una BC Penalty in un algoritmo TD3 richiede una calibrazione millimetrica per bilanciare l'imitazione dell'esperto e la massimizzazione del Reward.
 
-- **Equazione Actor Loss (TD3+BC)**: $L_{actor} = -Q(s,a) + \lambda \cdot \text{MSE}(a, a_{expert})$.
+- **Equazione Actor Loss (TD3+BC)**: $L_{actor} = -Q(s,a) + \alpha \cdot \text{BC\_Penalty}(a, a_{expert})$.
 - L'Actor viene costretto a massimizzare il Q-Value (derivato dal RL) **senza** abbandonare la traccia dei dati estratti dal Behavioral Cloning.
-- **Peso BC Costante ($\lambda = 5.0$)**: Invece di normalizzare la loss in base a $2.5 / |Q|$, sfruttiamo un $\lambda$ fisso grazie al nostro **Reward Scaling globale a 0.002**, che impedisce matematicamente che l'Actor Loss prevarichi il termine imitativo.
+- **Dynamic Alpha Normalization**: Il coefficiente $\alpha$ viene calcolato dinamicamente come $\frac{2.5}{\frac{1}{N} \sum |Q|}$, rendendo la BC Penalty auto-bilanciante rispetto alla magnitudo dei Q-value (cfr. Sezione 1.1).
 
 ### A. Reward per Singolo Step (Dense Reward & Soft Shaping)
 A ogni istante `t`, l'agente riceve una ricompensa così calcolata:
@@ -46,10 +46,10 @@ A ogni istante `t`, l'agente riceve una ricompensa così calcolata:
 Se l'auto esce di pista (`|trackPos| > 1.5`), si schianta, o va in stallo, l'episodio termina (`done=True`) e riceve un **`-10.0`**.
 
 > **Perché -10 e non -1000? La matematica di Bellman**
-> Il Critic valuta il Q-Value con un discount factor `gamma = 0.99`. Il valore massimo stimabile per una guida perfetta e infinita è una serie geometrica: `Q_max = 1.0 / (1 - 0.99) = 100.0`.
-> Se l'auto va fuori strada, il flag `done=True` "brucia" del tutto l'aspettativa di vita (+100.0) e impone il limite terminale di `-10.0`.
-> La perdita reale percepita dalla rete neurale per quell'errore è quindi un **differenziale di -110 punti** su una scala di 100. 
-> Se impostassimo la penalità a `-1000`, la Mean Squared Error del Critic impazzirebbe (`MSE = 1.2 Milioni`), causando esplosione dei gradienti e *Catastrophic Forgetting*. La penalità di -10 è letale per l'agente, ma "sicura" per i gradienti.
+> Il Critic valuta il Q-Value con un discount factor `gamma = 0.999`. Il valore massimo stimabile per una guida perfetta e infinita è una serie geometrica: `Q_max = 1.0 / (1 - 0.999) = 1000.0`.
+> Se l'auto va fuori strada, il flag `done=True` "brucia" del tutto l'aspettativa di vita (+1000.0) e impone il limite terminale di `-10.0`.
+> La perdita reale percepita dalla rete neurale per quell'errore è quindi un **differenziale di -1010 punti** su una scala di 1000 (prima del Reward Scaling). 
+> Se impostassimo la penalità a `-1000`, la Mean Squared Error del Critic impazzirebbe, causando esplosione dei gradienti e *Catastrophic Forgetting*. La penalità di -10 è letale per l'agente, ma "sicura" per i gradienti.
 
 ### C. Bilanciamento Matematico (Gamma, Reward Scale, Alpha)
 L'integrazione di una BC Penalty in un algoritmo RL ad alta frequenza (50Hz) richiede una calibrazione millimetrica per evitare che una forza matematica sopprima l'altra.
@@ -116,7 +116,7 @@ Durante l'addestramento ibrido, l'architettura risolve due problematiche critich
    La BC Penalty calcola l'MSE tra l'azione umana e l'azione deterministica `torch.tanh(mean)`, con componente direzionale normalizzata e Mutual Exclusion Penalty bilanciata (Soft Shaping).
    La BC Penalty viene ora calibrata tramite la Normalizzazione Dinamica dell'Alpha, garantendo una regolarizzazione proporzionata e permanente.
 
-1. **Terminal State Mimicry (Sgancio Pre-Schianto)**: 
+2. **Terminal State Mimicry (Sgancio Pre-Schianto)**: 
    Quando un episodio record (salvato nell'Elite Buffer) termina con uno schianto, le ultime azioni sono la causa diretta del fallimento. Forzare l'Actor a imitarle (tramite Self-Imitation) indurrebbe una *Causal Confusion*. 
    Il sistema risolve questo paradosso azzerando la maschera di imitazione (`expert=0.0`) negli ultimi 50 step (esattamente 1 secondo a 50Hz) di un record schiantato. In quella "finestra di evasione", l'agente smette di imitare il suo vecchio errore e torna istantaneamente sotto l'influenza del Reinforcement Learning puro e del Frozen BC Anchor, riuscendo così a frenare e a sopravvivere per estendere ulteriormente il record.
 

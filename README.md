@@ -58,7 +58,7 @@ AIcar/
 ├── stop_training.sh           # 🛑 Ferma i processi di training/TORCS
 ├── README.md
 ├── gym_torcs/                 # Wrapper Python per TORCS
-│   ├── gym_torcs.py           #   Ambiente OpenAI Gym con Reward Reshaping SAC
+│   ├── gym_torcs.py           #   Ambiente OpenAI Gym con Reward Reshaping
 │   ├── snakeoil3_gym.py       #   Client UDP per comunicazione con TORCS
 │   └── autostart.sh           #   Automazione menu TORCS (via xte/xautomation)
 ├── telemetry/                 # Telemetria CSV dei test agent (auto-generata)
@@ -210,19 +210,21 @@ Actor (Warm-Start da BC)                    Critic (Twin Q-Network, da zero)
 └─────────────────────────┘                 + Target Q (Polyak τ=0.005)
 ```
 
-**Gradient Freezing:** Il backbone e la gear_head hanno `requires_grad=False`. L'ottimizzatore aggiorna SOLO `continuous_head` (LR=1e-5) e `log_std_head` (LR=1e-4). LR differenziati per proteggere i pesi BC calibrati.
+**Gradient Freezing:** Il backbone e la gear_head hanno `requires_grad=False`. L'ottimizzatore aggiorna SOLO `continuous_head` (LR=3e-4). La `log_std_head` è mantenuta con `requires_grad=False` per retro-compatibilità, ma è completamente isolata dal training TD3.
 
 **Critic Warm-Up:** I primi 5000 step aggiornano solo il Critic. Questo protegge i pesi BC dai gradienti randomici di un Critic non ancora calibrato.
 
 **Update Frequency 1:4:** L'aggiornamento avviene ogni 4 step, non ad ogni step. Riduce l'overfitting su transizioni correlate.
 
-### Reward Reshaping Unificato (SAC-Compatible)
+### Reward Reshaping
 
 La formula del calcolo della ricompensa per timestep in `gym_torcs.py`:
 
-$$r_t = \underbrace{\frac{v_x}{50} \cos(\theta)}_{\text{progress}} \underbrace{- 0.1}_{\text{time penalty}} \underbrace{- 0.1|\delta_t - \delta_{t-1}|}_{\text{steer smooth}}$$
+$$r_t = \underbrace{\frac{v_x}{50} \cos(\theta) \times 1.5}_{\text{progress}} \underbrace{- (\text{trackPos})^2}_{\text{pos penalty}} \underbrace{- 0.05|\delta_t - \delta_{t-1}|}_{\text{steer smooth}}$$
 
-- **Progress**: Basato sulla velocità in avanti normalizzata diviso 50.
+- **Progress**: Velocità in avanti normalizzata, ponderata dal coseno dell'angolo di imbardata, moltiplicata per 1.5.
+- **Pos Penalty**: Penalità quadratica sulla distanza dal centro pista (deadzone naturale).
+- **Steer Smoothness**: Penalità sulle variazioni brusche di sterzo (coefficiente 0.05).
 - **Terminali cappati a -10.0**: Danno al veicolo, fuoripista, spin e stallo.
 - **Bonus completamento giro: +50.0**: Segnale esplicito per il Critic.
 - **Nessuna sparse reward**: Reward densa per evitare distorsioni del gradiente del Critic.
@@ -230,13 +232,13 @@ $$r_t = \underbrace{\frac{v_x}{50} \cos(\theta)}_{\text{progress}} \underbrace{-
 ### Replay Buffer Checkpointing
 
 Il Replay Buffer viene salvato separatamente in formato `np.savez_compressed`:
-- **File**: `buffers/sac_checkpoint_buffer.npz` e `buffers/sac_checkpoint_elite_buffer.npz` (~50-100MB compressi vs >1GB con pickle)
+- **File**: `buffers/td3_checkpoint_buffer.npz` e `buffers/td3_checkpoint_elite_buffer.npz` (~50-100MB compressi vs >1GB con pickle)
 - **Previene il Catastrophic Forgetting** quando il training viene interrotto e ripreso
 - **Resume-safe**: Ad ogni episodio vengono salvati sia il checkpoint PyTorch che il buffer numpy
 
 ### Done Masking
 
-Nel SAC, il flag `done` nel Replay Buffer è cruciale per la Bellman equation:
+Nel TD3+BC, il flag `done` nel Replay Buffer è cruciale per la Bellman equation:
 - **done=True** → Solo per terminazioni reali (fuoripista, spin, stallo, collisione)
 - **done=False** → Per il time-limit (`max_steps`) e il completamento giro, perché il vero state-value non è zero
 - **Dati expert** → `mask=1.0` per tutti i campioni (giri completati, non crash)
