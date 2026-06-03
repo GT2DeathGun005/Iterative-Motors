@@ -40,7 +40,7 @@ La pipeline si compone di quattro fasi sequenziali:
 |------|--------|-------------|
 | 1. Data Collection | `data_collection.py` | Raccolta di giri guidati da umano con controller PS5 o tastiera WASD. Salva solo i giri puliti. |
 | 2. BC Training | `behavioral_cloning.py` | Addestramento della PolicyNetwork sui dati esperti. Produce una policy che imita l'esperto (`bc_policy.pth`). |
-| 3. SAC RL | `sac_rl.py` | Fine-tuning del modello tramite Soft Actor-Critic puro con Auto-Entropy tuning e Warm-Start. Massimizza la velocità, salva il *Best Lap* (`sac_best_policy.pth`). L'esecuzione avviene in un display virtuale invisibile tramite `Xvfb`. |
+| 3. SAC RL | `sac_rl.py` | Fine-tuning del modello tramite Soft Actor-Critic con Alpha fisso e Residual RL. Massimizza la velocità, salva il *Best Lap* (`sac_best_policy.pth`) e il *Best Eval* deterministico (`sac_best_eval.pth`). |
 | 4. Test & Eval | `test_agent.py` | Esecuzione deterministica del modello finale su TORCS per valutare la capacità di completare giri autonomi. |
 
 ---
@@ -64,7 +64,7 @@ AIcar/
 ├── telemetry/                 # Telemetria CSV dei test agent (auto-generata)
 └── train_set/                 # Dati e Checkpoint
     ├── laps/                  #   File HDF5 dei giri registrati (lap_001.h5 ...)
-    ├── checkpoints/           #   Pesi: bc_policy.pth, sac_policy.pth, sac_best_policy.pth, sac_best_dist.pth, sac_checkpoint.pth
+    ├── checkpoints/           #   Pesi: bc_policy.pth, sac_policy.pth, sac_best_policy.pth, sac_best_dist.pth, sac_best_eval.pth, sac_checkpoint.pth
     │   └── buffers/
     │       ├── sac_checkpoint_buffer.npz        # Replay Buffer standard compresso (numpy)
     │       └── sac_checkpoint_elite_buffer.npz  # Elite Buffer compresso (numpy)
@@ -137,11 +137,11 @@ Il training è **resume-safe**: il checkpoint viene salvato ad ogni episodio. Pu
 
 Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per prevenire problemi di focus con il desktop dell'host. 
 
-**Output:** `train_set/checkpoints/sac_policy.pth` + `sac_best_policy.pth` + `sac_best_dist.pth` + `sac_checkpoint.pth` + `buffers/sac_checkpoint_buffer.npz` + `buffers/sac_checkpoint_elite_buffer.npz`
+**Output:** `train_set/checkpoints/sac_policy.pth` + `sac_best_policy.pth` + `sac_best_dist.pth` + `sac_best_eval.pth` + `sac_checkpoint.pth` + `buffers/sac_checkpoint_buffer.npz` + `buffers/sac_checkpoint_elite_buffer.npz`
 
 ### 4. Test Deterministico (Inference)
 
-Il test agent auto-rileva i migliori pesi disponibili: `sac_best_policy.pth` → `sac_best_dist.pth` → `sac_policy.pth` → `bc_policy.pth`.
+Il test agent auto-rileva i migliori pesi disponibili: `sac_best_eval.pth` → `sac_best_policy.pth` → `sac_best_dist.pth` → `sac_policy.pth` → `bc_policy.pth`.
 
 ```bash
 # Esecuzione standard con bypass Xvfb (visibile a schermo)
@@ -174,10 +174,10 @@ Durante il training RL, il log stampa metriche fondamentali per diagnosticare la
 * **Valori Sani:** L'Actor Loss **deve diventare negativa**. Non esiste un limite inferiore, più scende sotto lo zero, più punti l'Actor si aspetta di guadagnare.
 * **Diagnosi:** Una discesa dolce e lineare (es. da `0.0` a `-0.8` e oltre) è segno di un apprendimento sanissimo, in cui l'Actor sta capitalizzando sul Q-Value. Salti "positivi" giganteschi in un singolo step denotano un gradiente "sledgehammer" (solitamente causato dall'entropia o dalla BC Penalty) che punisce l'Actor.
 
-### 3. Entropia Autoregolata (`Alpha`)
-* **Cos'è:** Il parametro (Soft Actor-Critic) che regola l'importanza dell'esplorazione stocastica rispetto all'ottimizzazione del Q-value, fungendo anche da freno all'overestimation bias.
-* **Valori Sani:** Si autoregola per raggiungere il target_entropy. I valori tipici si assestano solitamente attorno a scale decrescenti.
-* **Diagnosi:** L'Auto-Tuning dell'entropia assicura che il Critic non sviluppi una fiducia irrealistica verso azioni instabili, tenendo sotto controllo la divergenza della stima di Bellman (Q-Value Explosion). La discesa di Alpha significa che la rete è diventata più sicura nelle sue manovre e sta riducendo gradualmente l'esplorazione, solidificando il comportamento verso l'exploit puro delle azioni vincenti.
+### 3. Entropia (`Alpha`)
+* **Cos'è:** Il parametro che regola l'importanza dell'esplorazione stocastica rispetto all'ottimizzazione del Q-value.
+* **Valori Sani:** Fisso a `0.01`. Non cambia nel tempo.
+* **Diagnosi:** L'auto-tuning è stato **disattivato** perché in un regime di fine-tuning da BC, l'entropia crescente aggiungeva rumore distruttivo ai pesi BC calibrati. Un alpha fisso e basso garantisce stabilità permanente.
 
 ---
 
@@ -210,9 +210,11 @@ Actor (Warm-Start da BC)                    Critic (Twin Q-Network, da zero)
 └─────────────────────────┘                 + Target Q (Polyak τ=0.005)
 ```
 
-**Gradient Freezing:** Il backbone e la gear_head hanno `requires_grad=False`. L'ottimizzatore aggiorna SOLO `continuous_head` e `log_std_head`. Questo previene il *Latent Shift* (distruzione delle feature estratte dal BC).
+**Gradient Freezing:** Il backbone e la gear_head hanno `requires_grad=False`. L'ottimizzatore aggiorna SOLO `continuous_head` (LR=1e-5) e `log_std_head` (LR=1e-4). LR differenziati per proteggere i pesi BC calibrati.
 
 **Critic Warm-Up:** I primi 5000 step aggiornano solo il Critic. Questo protegge i pesi BC dai gradienti randomici di un Critic non ancora calibrato.
+
+**Update Frequency 1:4:** L'aggiornamento avviene ogni 4 step, non ad ogni step. Riduce l'overfitting su transizioni correlate.
 
 ### Reward Reshaping Unificato (SAC-Compatible)
 
@@ -221,8 +223,8 @@ La formula del calcolo della ricompensa per timestep in `gym_torcs.py`:
 $$r_t = \underbrace{\frac{v_x}{50} \cos(\theta)}_{\text{progress}} \underbrace{- 0.1}_{\text{time penalty}} \underbrace{- 0.1|\delta_t - \delta_{t-1}|}_{\text{steer smooth}}$$
 
 - **Progress**: Basato sulla velocità in avanti normalizzata diviso 50.
-- **Time Penalty -0.1**: Costante per incentivare il completamento del tracciato rapido.
-- **Terminali cappati a -10.0**: Danno al veicolo, fuoripista, spin (retromarcia) e stallo, configurando il dizionario `info['crash'] = True`.
+- **Terminali cappati a -10.0**: Danno al veicolo, fuoripista, spin e stallo.
+- **Bonus completamento giro: +50.0**: Segnale esplicito per il Critic.
 - **Nessuna sparse reward**: Reward densa per evitare distorsioni del gradiente del Critic.
 
 ### Replay Buffer Checkpointing
@@ -236,7 +238,8 @@ Il Replay Buffer viene salvato separatamente in formato `np.savez_compressed`:
 
 Nel SAC, il flag `done` nel Replay Buffer è cruciale per la Bellman equation:
 - **done=True** → Solo per terminazioni reali (fuoripista, spin, stallo, collisione)
-- **done=False** → Per il time-limit (`max_steps`), perché il vero state-value non è zero
+- **done=False** → Per il time-limit (`max_steps`) e il completamento giro, perché il vero state-value non è zero
+- **Dati expert** → `mask=1.0` per tutti i campioni (giri completati, non crash)
 
 ### Vettore di Osservazione (29D)
 
@@ -267,11 +270,32 @@ Registrare **5-10 giri aggiuntivi** con:
 3. **Ingressi Curva Alternativi**: Inserimenti larghi a velocità sub-ottimali
 
 ### Bojarski-Style Recovery Augmentation
-Il training BC include perturbazione laterale dello stato (`trackPos ±0.15`) con correzione proporzionale dello sterzo target, implementando una legge di controllo autocentrante neurale.
+Il training BC include perturbazione laterale dello stato (`trackPos ±0.4`) e angolare (`angle ±0.08 rad`) con correzione proporzionale dello sterzo e del freno target, implementando una legge di controllo autocentrante neurale avanzata.
 
 ---
 
 ## 🐛 Bug Risolti (Workflow Tracking)
+
+### [2026-06-03] Risoluzione Definitiva del Collasso della Policy (6 Bug Fix)
+
+**Problema:** La policy collassava dopo 100-1000 episodi di training, entrando in un loop di reward negative e stalli. L'agente "dimenticava come guidare" in modo irreversibile.
+
+**Root Cause:** Catena di 6 bug interconnessi:
+1. LR Actor troppo alto (`3e-4`) distruggeva i pesi BC in 50-100 episodi
+2. BC Penalty con decay esponenziale lasciava la policy senza àncora
+3. Done masking contraddittorio tra dati expert (mask=0.0 per completamento) e dati online (mask=0.0 per crash) — il Critic riceveva segnali opposti
+4. Alpha auto-tuning causava escalation entropica (0.02 → 0.05 → ...) che aggiungeva rumore crescente
+5. Update ratio 1:1 (ogni step) causava overfitting sulle stesse transizioni
+6. Nessun segnale di completamento giro — il Critic non distingueva successo da crash
+
+**Fix applicati:**
+1. **LR Differenziati**: `continuous_head` = `1e-5`, `log_std_head` = `1e-4`. Protegge i pesi BC calibrati.
+2. **BC Weight Fisso = 5.0**: Nessun decay. L'Actor resta permanentemente ancorato al BC (Residual RL).
+3. **Done Masking Corretto**: I dati expert usano `mask=1.0` per tutti i campioni (giri completati ≠ crash).
+4. **Alpha Fisso = 0.01**: Disattivato l'auto-tuning dell'entropia.
+5. **Update Ratio 1:4**: Aggiornamento ogni 4 step per ridurre l'overfitting.
+6. **Bonus Completamento Giro = +50.0**: Segnale esplicito per il Critic.
+7. **Evaluation Periodica Deterministica**: Ogni 25 episodi, checkpoint riproducibile `sac_best_eval.pth`.
 
 ### [2026-05-31] Risoluzione del Collasso della Policy (Stall Trap & Q-Value Explosion)
 

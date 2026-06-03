@@ -8,7 +8,10 @@ Features:
   - Device CPU/CUDA coerente in tutta la pipeline
   - Validation split (80/20) con Early Stopping per evitare overfitting
   - Cosine LR scheduler per convergenza dolce
-  - Bojarski-style data augmentation per anti-covariate shift
+  - Bojarski-style data augmentation per anti-covariate shift:
+      Laterale: perturbazione trackPos ±0.4 (40% della pista)
+      Angolare: perturbazione angle ±0.08 rad (~4.5°)
+      Insegna alla rete il recupero da stati fuori distribuzione
 
 NOTA: I dati HDF5 sono GIÀ normalizzati dal data_collection.flatten_state():
   - track[19]: /200 (via gym_torcs.make_observaton)
@@ -285,9 +288,22 @@ class BehaviorCloningTrainer:
             states = states.view(batch_size, 3, 29)
 
             # ── Data Augmentation: Bojarski-Style Synthetic Recovery ──
-            # Genera offset laterale in trackPos (più leggero: ±0.15)
-            delta_pos = torch.randn(batch_size, device=states.device) * 0.08
-            delta_pos = torch.clamp(delta_pos, -0.15, 0.15)
+            # Simula stati fuori distribuzione (covariate shift) perturbando
+            # la posizione laterale e l'angolo dell'auto, poi insegnando alla
+            # rete la correzione proporzionale per rientrare in traiettoria.
+
+            # --- Perturbazione Laterale (trackPos) ---
+            # ±0.4 copre il 40% della larghezza della pista, simulando errori
+            # realistici che il BC incontrerebbe a test time (prima era ±0.15,
+            # troppo timido per preparare la rete al Corkscrew).
+            delta_pos = torch.randn(batch_size, device=states.device) * 0.20
+            delta_pos = torch.clamp(delta_pos, -0.40, 0.40)
+
+            # --- Perturbazione Angolare (angle) ---
+            # ±0.08 rad (~4.5°) simula l'auto leggermente disallineata rispetto
+            # alla pista — un errore composto tipico del covariate shift.
+            delta_angle = torch.randn(batch_size, device=states.device) * 0.04
+            delta_angle = torch.clamp(delta_angle, -0.08, 0.08)
 
             for f_idx in range(3):
                 frame_states = states[:, f_idx, :]
@@ -308,25 +324,34 @@ class BehaviorCloningTrainer:
                 # 1. Perturbazione trackPos (indice 20)
                 frame_states[:, 20] = frame_states[:, 20] + delta_pos
                 
-                # 2. Perturbazione geometricamente coerente dei 19 sensori track (indici 1:20)
+                # 2. Perturbazione angolare (indice 0)
+                # L'angle è già in radianti — aggiungiamo la perturbazione direttamente
+                frame_states[:, 0] = frame_states[:, 0] + delta_angle
+                
+                # 3. Perturbazione geometricamente coerente dei 19 sensori track (indici 1:20)
                 alpha = torch.tensor([
                     -45.0, -19.0, -12.0, -7.0, -4.0, -2.5, -1.7, -1.0, -0.5, 0.0, 
                     0.5, 1.0, 1.7, 2.5, 4.0, 7.0, 12.0, 19.0, 45.0
                 ], device=states.device) * 3.14159265 / 180.0
                 
-                # Angolo assoluto di ciascun raggio rispetto alla linea mediana
-                beta = angle.unsqueeze(1) + alpha.unsqueeze(0)
+                # Angolo assoluto di ciascun raggio (usa l'angle perturbato)
+                perturbed_angle = frame_states[:, 0]
+                beta = perturbed_angle.unsqueeze(1) + alpha.unsqueeze(0)
                 
-                # Perturbazione lineare sui 19 raggi
+                # Perturbazione lineare sui 19 raggi (combinata: laterale + angolare)
                 dL = - dy.unsqueeze(1) * torch.sin(beta)
                 frame_states[:, 1:20] = torch.clamp(frame_states[:, 1:20] + dL / 200.0, 0.0, 1.0)
                 
-            # 3. Correzione proporzionale target steer (indice 0) (ottimizzata: 0.16 per un rientro più forte)
-            targets[:, 0] = targets[:, 0] - 0.16 * delta_pos
+            # 4. Correzione proporzionale target steer:
+            #    - delta_pos: rientro laterale (0.25 gain — aumentato da 0.16 per match con ±0.4)
+            #    - delta_angle: raddrizzamento angolare (1.5 gain per compensazione reattiva)
+            targets[:, 0] = targets[:, 0] - 0.25 * delta_pos - 1.5 * delta_angle
             targets[:, 0] = torch.clamp(targets[:, 0], -1.0, 1.0)
             
-            # 4. Correzione parzializzazione throttle (indice 1) (più leggera: 15%)
-            targets[:, 1] = targets[:, 1] * (1.0 - 0.15 * delta_pos.abs())
+            # 5. Correzione parzializzazione throttle (indice 1)
+            # Quando l'auto è fuori posizione, il throttle deve calare proporzionalmente
+            combined_perturbation = delta_pos.abs() + delta_angle.abs() * 5.0
+            targets[:, 1] = targets[:, 1] * (1.0 - 0.15 * combined_perturbation)
             targets[:, 1] = torch.clamp(targets[:, 1], 0.0, 1.0)
 
             # ── Data Augmentation: Speed Perturbation Augmentation ──

@@ -277,6 +277,7 @@ def load_best_weights(model, weights_arg, device):
     """
     checkpoint_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'train_set', 'checkpoints')
+    sac_best_eval_path = os.path.join(checkpoint_dir, 'sac_best_eval.pth')
     sac_best_lap_path = os.path.join(checkpoint_dir, 'sac_best_policy.pth')
     sac_best_dist_path = os.path.join(checkpoint_dir, 'sac_best_dist.pth')
     sac_path = os.path.join(checkpoint_dir, 'sac_policy.pth')
@@ -285,6 +286,9 @@ def load_best_weights(model, weights_arg, device):
     # Se l'utente ha specificato un path esplicito, usalo
     if weights_arg:
         load_path = weights_arg
+    elif os.path.exists(sac_best_eval_path):
+        load_path = sac_best_eval_path
+        print(f"  🔍 Auto-detect: trovato sac_best_eval.pth (Miglior checkpoint deterministico!)")
     elif os.path.exists(sac_best_lap_path):
         load_path = sac_best_lap_path
         print(f"  🔍 Auto-detect: trovato sac_best_policy.pth (Record sul giro!)")

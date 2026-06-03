@@ -24,6 +24,9 @@ from datetime import datetime
 from typing import Optional
 from collections import deque
 
+# Forza la visualizzazione della GUI di TORCS per la data collection
+os.environ['SHOW_GUI'] = '1'
+
 # Aggiungo gym_torcs al path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'gym_torcs')))
 

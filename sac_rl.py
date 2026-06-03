@@ -6,25 +6,50 @@ Architettura Ibrida BC-RL per TORCS:
   - Il SAC aggiorna SOLO continuous_head e log_std_head
   - Il Critic (Twin Q-Network) è addestrato da zero
   - Critic Warm-Up: i primi 5000 step aggiornano solo il Critic
-  - Fine-Tuning Conservativo: L'Actor usa un Learning Rate di 1e-6.
-  - Entropia (Alpha): Si usa un Alpha fisso di 0.02 (innalzato per prevenire l'exploration dip). Rimosso l'Adaptive Alpha.
-  - Tanh Explosion Prevention: Il `log_prob` è clippato matematicamente in [-20.0, 10.0] per evitare gradienti infiniti ai bordi della tanh.
+  - Fine-Tuning Conservativo: L'Actor usa Learning Rate differenziati:
+      continuous_head: 1e-5 (micro-LR per preservare i pesi BC)
+      log_std_head: 1e-4 (inizializzata da zero, può muoversi più velocemente)
+  - Entropia (Alpha): Alpha fisso a 0.01. L'auto-tuning è disattivato per
+    prevenire l'escalation entropica che destabilizza i pesi BC calibrati.
+  - BC Penalty: Peso FISSO a 5.0 (nessun decay). L'Actor resta permanentemente
+    ancorato alla policy BC — il SAC agisce come Residual RL.
+  - Tanh Explosion Prevention: Il `log_prob` è clippato in [-20.0, 10.0].
 
 Memory Safety (Gestione Memory Leak di TORCS):
-  - Il noto memory leak del motore C++ di TORCS è bypassato forzando il kill/riavvio completo del processo server (`relaunch=True`) a ogni reset dell'episodio. La porta UDP viene chiusa e ricollegata per prevenire leak di rete.
+  - Il noto memory leak del motore C++ di TORCS è bypassato forzando il
+    kill/riavvio completo del processo server (`relaunch=True`) a ogni reset.
 
 Reward Reshaping (SAC-Compatible):
   - progress = (speedX/50.0) * cos(angle)
-  - Dense Time Penalty e Steer Smoothness penalty per stabilizzare il veicolo
-  - Tutte le penalità terminali (schianto, stallo, fuoripista) valgono -10.0
+  - Steer Smoothness penalty e penalità quadratica di posizione
+  - Penalità terminali (schianto, stallo, fuoripista): -10.0
+  - Bonus completamento giro: +50.0
 
 Replay Buffer:
-  - Salvataggio su disco con np.savez_compressed (separato dal checkpoint PyTorch)
+  - Salvataggio su disco con np.savez_compressed (separato dal checkpoint)
   - Previene catastrophic forgetting durante interruzioni
 
 Done Masking:
-  - done=True SOLO per schianti, fuoripista e spin
-  - Il time-limit (max_steps) NON imposta done=True nel buffer
+  - mask=0.0 (terminale) SOLO per schianti, fuoripista e spin
+  - Il time-limit (max_steps) e il completamento giro NON impostano mask=0.0
+  - I dati expert usano mask=1.0 uniformemente (giri completati, non crash)
+
+Update Frequency:
+  - Il rapporto update/data è ridotto a 1:4 per prevenire l'overfitting sulle
+    stesse transizioni e stabilizzare i gradienti del Critic.
+
+Evaluation Periodica:
+  - Ogni 25 episodi viene eseguito un episodio deterministico (evaluate=True)
+  - Il checkpoint 'sac_best_eval.pth' è salvato solo se la distanza migliora
+  - Questo garantisce checkpoint riproducibili per la presentazione video
+
+Piano B — TD3+BC:
+  Se il SAC dovesse continuare a collassare nonostante i fix, la strategia B
+  prevede di sostituire il SAC con TD3+BC (Fujimoto & Gu, 2021), un algoritmo
+  progettato specificamente per il fine-tuning offline-to-online. TD3+BC è più
+  stabile per natura: ha un solo iperparametro critico (alpha) e non usa entropia,
+  eliminando alla radice il problema dell'escalation entropica. Vedi ARCHITECTURE.md
+  per i dettagli dell'eventuale migrazione.
 """
 
 import os
@@ -147,8 +172,12 @@ class ReplayBuffer:
                         
                     reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
                     
-                    done = (i == length - 2)
-                    mask = 0.0 if done else 1.0
+                    # I dati expert provengono da giri completi — l'auto ha
+                    # superato il traguardo, NON si è schiantata. mask=1.0 per
+                    # tutti i campioni (incluso l'ultimo) per non corrompere
+                    # la Bellman equation del Critic trattando il completamento
+                    # come uno stato terminale negativo.
+                    mask = 1.0
                     
                     self.push(stacked_state, cont_action, reward, next_stacked_state, mask, expert=1.0)
                     loaded += 1
@@ -350,27 +379,26 @@ class SACAgent:
             param.requires_grad = False
 
         # Optimizer: aggiorna SOLO continuous_head e log_std_head
-        # Actor Optimizer (Fase RL: solo continuous e log_std, backbone frozen)
-        # 🛡️ TRUST REGION: LR microscopico (1e-5) per impedire il Policy Drift su stati OOD
+        # 🛡️ TRUST REGION: LR differenziati per preservare i pesi BC calibrati.
+        # continuous_head (1e-5): contiene i pesi critici del BC — passi microscopici.
+        # log_std_head (1e-4): inizializzata da zero, può convergere più velocemente.
         self.actor_optimizer = optim.Adam([
-            {'params': self.actor.continuous_head.parameters()},
-            {'params': self.actor.log_std_head.parameters()}
-        ], lr=3e-4)
+            {'params': self.actor.continuous_head.parameters(), 'lr': 1e-5},
+            {'params': self.actor.log_std_head.parameters(), 'lr': 1e-4}
+        ])
 
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-4)
 
-        # Entropy Auto-Tuning (Alpha)
-        self.target_entropy = -3.0
-        # Inizializziamo log_alpha a -3.91 (che corrisponde a un Alpha iniziale di ~0.02)
-        init_log_alpha = -3.91
-        self.log_alpha = torch.tensor([init_log_alpha], requires_grad=True, device=self.device)
-        # LR standard (3e-4) per permettere ad Alpha di autoregolarsi correttamente
-        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=3e-4)
+        # Alpha FISSO — l'esplorazione SAC deve essere minima per non distruggere
+        # i pesi BC. L'auto-tuning è disattivato perché in regime di fine-tuning
+        # l'entropia crescente (visibile nei log precedenti: 0.02 → 0.05 → ...)
+        # aggiunge rumore distruttivo proprio quando la policy ha bisogno di stabilità.
+        self._fixed_alpha = 0.01
 
     @property
     def alpha(self):
-        # Restituisce l'alpha ottimizzato automaticamente per il bilanciamento esplorazione/exploit
-        return self.log_alpha.exp().detach()
+        # Alpha fisso a 0.01 — esplorazione minima per Residual RL
+        return torch.tensor(self._fixed_alpha, device=self.device)
 
     def select_action(self, state, evaluate=False):
         state_t = torch.FloatTensor(state).to(self.device).unsqueeze(0)
@@ -481,8 +509,11 @@ class SACAgent:
             # Ricomposizione equilibrata
             bc_penalty = directional_loss + (mutual_exclusion_penalty * 0.1)
 
-            # Decay Esponenziale Smorzato del peso BC: Permanent BC Adherence
-            bc_weight = 2.0 + 8.0 * np.exp(-global_step / 150000.0)
+            # BC Weight FISSO — l'Actor non deve MAI dimenticare il BC.
+            # L'intero punto dell'architettura è che il RL fa correzioni residuali.
+            # Se il vincolo BC decade, la policy diventa puro RL → collasso
+            # garantito perché il Critic non è mai sufficientemente accurato.
+            bc_weight = 5.0
 
             # Total Actor Loss
             total_actor_loss = actor_loss_sac + bc_weight * bc_penalty
@@ -493,15 +524,9 @@ class SACAgent:
             self.actor_optimizer.step()
             actor_loss_val = total_actor_loss.item()
 
-            # Alpha (Entropy) Update
-            alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
-
-            # Evita che l'entropia crolli a zero: Alpha limitato a un minimo di ~0.007
-            with torch.no_grad():
-                self.log_alpha.clamp_(min=-5.0)
+            # Alpha è fisso — nessun update necessario.
+            # L'auto-tuning è stato disattivato per prevenire l'escalation
+            # entropica che destabilizzava i pesi BC calibrati.
 
         # Target Soft Update
         for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
@@ -517,8 +542,7 @@ class SACAgent:
             'critic_target': self.critic_target.state_dict(),
             'actor_optimizer': self.actor_optimizer.state_dict(),
             'critic_optimizer': self.critic_optimizer.state_dict(),
-            'log_alpha': self.log_alpha,
-            'alpha_optimizer': self.alpha_optimizer.state_dict(),
+            'fixed_alpha': self._fixed_alpha,
             'episode': episode,
             'global_step': global_step,
         }
@@ -560,20 +584,16 @@ class SACAgent:
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
 
-        if 'log_alpha' in checkpoint:
-            with torch.no_grad():
-                self.log_alpha.copy_(checkpoint['log_alpha'])
-            if 'alpha_optimizer' in checkpoint:
-                self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer'])
+        if 'fixed_alpha' in checkpoint:
+            self._fixed_alpha = checkpoint['fixed_alpha']
 
-        # Forza esplicitamente il Learning Rate a 3e-4 su tutti i param_groups
-        # Altrimenti PyTorch ripristinerebbe il vecchio LR=1e-5 salvato nel file
-        for param_group in self.actor_optimizer.param_groups:
-            param_group['lr'] = 3e-4
+        # Forza esplicitamente i Learning Rate corretti al resume.
+        # param_group[0] = continuous_head (1e-5), param_group[1] = log_std_head (1e-4)
+        if len(self.actor_optimizer.param_groups) >= 2:
+            self.actor_optimizer.param_groups[0]['lr'] = 1e-5
+            self.actor_optimizer.param_groups[1]['lr'] = 1e-4
         for param_group in self.critic_optimizer.param_groups:
             param_group['lr'] = 1e-4
-        for param_group in self.alpha_optimizer.param_groups:
-            param_group['lr'] = 3e-4
 
         # Carica i Replay Buffer dalla sottocartella "buffers"
         buffer_dir = os.path.join(os.path.dirname(filepath), 'buffers')
@@ -689,6 +709,10 @@ def train():
             if last_lap_time > 0.0 and step > 500:
                 done = True  # L'episodio finisce perché hai vinto
                 termination_reason = "SUCCESS"
+                # Bonus significativo per completamento giro: il Critic
+                # deve distinguere "stava andando bene prima del crash" da
+                # "ha effettivamente completato il circuito".
+                reward += 50.0
                 print(f"  🏎️  Giro completato: {last_lap_time:.2f}s!")
                 if last_lap_time < best_lap_time:
                     best_lap_time = last_lap_time
@@ -724,7 +748,9 @@ def train():
             step += 1
             global_step += 1
 
-            if len(memory) > batch_size:
+            # Update ogni 4 step: riduce il rapporto update/data da 1:1 a 1:4,
+            # prevenendo l'overfitting sulle stesse transizioni del buffer.
+            if len(memory) > batch_size and global_step % 4 == 0:
                 critic_loss_val, actor_loss_val, current_alpha = agent.update(memory, elite_memory, batch_size, global_step)
 
             if done or env_done or time_limit_reached:
@@ -767,6 +793,65 @@ def train():
         # Salva i pesi aggiornati e il checkpoint integrale
         agent.save_checkpoint(checkpoint_path, episode + 1, global_step, memory, elite_memory)
         torch.save(agent.actor.state_dict(), 'train_set/checkpoints/sac_policy.pth')
+
+        # ── Evaluation Periodica Deterministica ──
+        # Ogni 25 episodi, esegue un episodio in modalità evaluate=True
+        # (deterministico, zero rumore) e salva il checkpoint solo se la
+        # performance migliora. Questo garantisce che 'sac_best_eval.pth'
+        # sia sempre la policy migliore *riproducibile* per la presentazione.
+        if (episode + 1) % 25 == 0:
+            print(f"\n  🔍 [EVAL] Episodio di valutazione deterministica...")
+            eval_ob = env.reset(relaunch=True)
+            eval_f = flatten_state(eval_ob)
+            eval_stack = deque([eval_f]*13, maxlen=13)
+            eval_stacked = np.concatenate([eval_stack[0], eval_stack[6], eval_stack[12]])
+            eval_dist = 0.0
+            eval_reward = 0.0
+            eval_step = 0
+            eval_lap_time = 0.0
+
+            agent.actor.eval()
+            while eval_step < args.max_steps:
+                eval_step += 1
+                with torch.no_grad():
+                    eval_action, eval_gear = agent.select_action(eval_stacked, evaluate=True)
+                eval_env_action = np.zeros(4)
+                eval_env_action[0:3] = eval_action
+                eval_env_action[3] = max(1, min(6, eval_gear))
+                eval_env_action[1] = np.clip((eval_env_action[1] + 1.0) / 2.0, 0.0, 1.0)
+                eval_env_action[2] = np.clip((eval_env_action[2] + 1.0) / 2.0, 0.0, 1.0)
+
+                eval_next_ob, eval_r, eval_done, eval_info = env.step(eval_env_action)
+                eval_reward += eval_r
+                eval_next_f = flatten_state(eval_next_ob)
+                eval_stack.append(eval_next_f)
+                eval_stacked = np.concatenate([eval_stack[0], eval_stack[6], eval_stack[12]])
+
+                eval_d = float(np.array(eval_next_ob.get('distRaced', 0.0)).flat[0])
+                eval_dist = eval_d
+                eval_llt = float(np.array(eval_next_ob.get('lastLapTime', 0.0)).flat[0])
+                if eval_llt > 0.0 and eval_step > 500:
+                    eval_lap_time = eval_llt
+                    break
+
+                if eval_info.get('crash', False) or eval_done:
+                    break
+
+            agent.actor.train()
+
+            eval_status = f"🏆 LAP {eval_lap_time:.2f}s" if eval_lap_time > 0 else f"Dist: {int(eval_dist)}m"
+            print(f"  🔍 [EVAL] Result: {eval_status} | Reward: {eval_reward:.1f} | Steps: {eval_step}")
+
+            # Salva il checkpoint solo se la distanza migliora
+            if 'best_eval_dist' not in dir():
+                best_eval_dist = 0.0
+            if eval_dist > best_eval_dist or eval_lap_time > 0:
+                best_eval_dist = max(best_eval_dist, eval_dist)
+                torch.save(agent.actor.state_dict(), 'train_set/checkpoints/sac_best_eval.pth')
+                print(f"  🔍 [EVAL] ✅ Nuovo record eval! Checkpoint salvato.")
+
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"[EVAL] Ep {episode+1:03d} | {eval_status} | Reward: {eval_reward:.1f}\n")
 
     env.end()
 

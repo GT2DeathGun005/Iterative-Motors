@@ -57,7 +57,7 @@ log_phase() { echo -e "\n${BOLD}${BLUE}═════════════�
 # ── Gestione flag --clean ──
 if [[ "${1:-}" == "--clean" ]]; then
     log_warn "Flag --clean rilevato: cancellazione checkpoint SAC precedenti..."
-    rm -f "$SAC_CHECKPOINT" "$SAC_BUFFER" "$SAC_ELITE_BUFFER" "$SAC_POLICY" "train_set/checkpoints/sac_best_policy.pth" "train_set/checkpoints/sac_best_dist.pth"
+    rm -f "$SAC_CHECKPOINT" "$SAC_BUFFER" "$SAC_ELITE_BUFFER" "$SAC_POLICY" "train_set/checkpoints/sac_best_policy.pth" "train_set/checkpoints/sac_best_dist.pth" "train_set/checkpoints/sac_best_eval.pth"
     log_ok "Checkpoint SAC cancellati. Ripartenza pulita."
 fi
 
