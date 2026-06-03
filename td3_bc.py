@@ -331,10 +331,16 @@ class TD3BCAgent:
             mutual_exclusion_penalty = (det_accel * det_brake).mean()
             bc_penalty = directional_loss + (mutual_exclusion_penalty * 0.1)
 
-            # Il parametro lambda (alpha nel paper di Fujimoto) è fisso a 5.0 
-            # In alternativa si può usare la normalizzazione dinamica: alpha = 2.5 / abs(q1_pi).mean().detach()
-            bc_weight = 5.0 
-            total_actor_loss = actor_loss_td3 + bc_weight * bc_penalty
+            # --- Implementazione esatta TD3+BC (Fujimoto 2021) ---
+            # lambda_val è l'iperparametro standard del paper (2.5)
+            lambda_val = 2.5 
+            
+            # Calcolo dell'Alpha dinamico normalizzato sui Q-values correnti
+            # Usiamo clamp per evitare divisioni per zero nei primissimi step
+            Q_abs_mean = q1_pi.abs().mean().detach().clamp(min=1e-5)
+            dynamic_alpha = lambda_val / Q_abs_mean
+            
+            total_actor_loss = actor_loss_td3 + dynamic_alpha * bc_penalty
 
             self.actor_optimizer.zero_grad()
             total_actor_loss.backward()
@@ -420,6 +426,8 @@ def train():
     batch_size = 256
     best_lap_time = float('inf')
     elite_threshold = 500.0
+    best_eval_dist = 0.0
+    best_distance = 0.0
 
     print("🚀 Avvio training TD3+BC...")
 
@@ -469,8 +477,7 @@ def train():
             if info.get('crash', False):
                 done, termination_reason = True, "CRASH"
 
-            global best_distance
-            if 'best_distance' not in globals(): best_distance = 0.0
+
             if max_dist > best_distance and max_dist > 500.0:
                 best_distance = max_dist
                 torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_best_dist.pth')
@@ -515,7 +522,7 @@ def train():
         agent.save_checkpoint(checkpoint_path, episode + 1, global_step, memory, elite_memory)
         torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_policy.pth')
 
-        if (episode + 1) % 25 == 0:
+        if (episode + 1) % 5 == 0:
             print(f"\n  🔍 [EVAL] Valutazione deterministica...")
             eval_ob = env.reset(relaunch=True)
             eval_stack = deque([flatten_state(eval_ob)]*13, maxlen=13)
@@ -540,8 +547,11 @@ def train():
                 if eval_info.get('crash', False) or eval_done: break
             agent.actor.train()
 
-            print(f"  🔍 [EVAL] Result: Dist {int(eval_dist)}m | Reward: {eval_reward:.1f}")
-            if 'best_eval_dist' not in dir() or eval_dist > best_eval_dist:
+            eval_msg = f"[{time_str}] 🔍 [EVAL] Result: Dist {int(eval_dist)}m | Reward: {eval_reward:.1f}"
+            print(f"  {eval_msg}")
+            with open(log_file, 'a', encoding='utf-8') as f: f.write(eval_msg + "\n")
+            
+            if eval_dist > best_eval_dist:
                 best_eval_dist = eval_dist
                 torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_best_eval.pth')
 

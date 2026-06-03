@@ -1,6 +1,6 @@
 # AIcar: Architettura Ibrida BC-RL (TORCS)
 
-Questo documento descrive in dettaglio l'architettura del modello e le scelte implementative per il fine-tuning tramite Soft Actor-Critic (SAC) partendo da un modello addestrato via Behavioral Cloning (BC).
+Questo documento descrive in dettaglio l'architettura del modello e le scelte implementative per il fine-tuning tramite TD3+BC (Twin Delayed DDPG con Behavioral Cloning) partendo da un modello addestrato via Behavioral Cloning (BC).
 
 ## 1. Actor (La Policy) e Il Passaggio a TD3+BC
 A causa di persistenti problemi di *Catastrophic Forgetting* ed *Escalation Entropica* riscontrati con il framework SAC, l'architettura è stata migrata al **TD3+BC** (Twin Delayed DDPG con Behavioral Cloning), progettato appositamente per il fine-tuning offline-to-online da Fujimoto & Gu (2021). 
@@ -11,6 +11,13 @@ L'Actor è ora una rete completamente **deterministica**:
 - **Delayed Policy Update**: Per mitigare l'Overestimation Bias, la policy e le reti target vengono aggiornate solo ogni 2 step del Critic (`policy_freq = 2`).
 
 *(Nota: la testa `log_std_head` è mantenuta unicamente disconnessa per retro-compatibilità dei pesi negli script di testing).*
+
+### 1.1 Adattamenti Offline-to-Online vs Paper Originale (Fujimoto & Gu, 2021)
+La nostra implementazione cattura l'essenza matematica del TD3+BC, ma introduce tre variazioni ingegneristiche fondamentali per operare la transizione da un dominio puramente *Offline* (usato nel paper) a un dominio *Online* con esplorazione attiva:
+
+- **Target dell'Azione Esperta**: Nel paper originale l'azione target $a_{expert}$ viene campionata dal dataset. Noi usiamo il backbone congelato `self.bc_policy(state)` per inferire il target. Questo è vitale perché, esplorando online, l'agente incontra stati off-distribution che non esistono nel dataset originale.
+- **Dynamic Alpha Normalization**: Applicata esattamente come da formula originale $\alpha = \frac{2.5}{\frac{1}{N} \sum |Q(s_i, a_i)|}$. Questo ci permette di scalare dinamicamente la forza della BC penalty indipendentemente dall'aumento dei Q-value dovuto al bootstrap online.
+- **Loss di Imitazione Domain-Specific**: Invece del generico MSE su tutto il vettore d'azione, applichiamo una funzione che soppesa doppiamente sterzo e freno e aggiunge una *Mutual Exclusion Penalty* per impedire il blocco dei freni in accelerazione.
 ## 2. Critic (Twin Q-Network)
 Il Critic ha il compito di stimare il valore (Q-value) della coppia (Stato, Azione). Poiché il BC non usa una value-function, il Critic deve essere addestrato da zero.
 - **Architettura Twin**: Usa due reti Q indipendenti per mitigare l'Overestimation Bias tipico del Q-learning. Si prende il minimo tra le due stime durante l'aggiornamento dell'Actor.
@@ -45,11 +52,10 @@ Se l'auto esce di pista (`|trackPos| > 1.5`), si schianta, o va in stallo, l'epi
 > Se impostassimo la penalità a `-1000`, la Mean Squared Error del Critic impazzirebbe (`MSE = 1.2 Milioni`), causando esplosione dei gradienti e *Catastrophic Forgetting*. La penalità di -10 è letale per l'agente, ma "sicura" per i gradienti.
 
 ### C. Bilanciamento Matematico (Gamma, Reward Scale, Alpha)
-L'integrazione di una BC Penalty in un algoritmo SAC ad alta frequenza (50Hz) richiede una calibrazione millimetrica per evitare che una forza matematica sopprima l'altra.
+L'integrazione di una BC Penalty in un algoritmo RL ad alta frequenza (50Hz) richiede una calibrazione millimetrica per evitare che una forza matematica sopprima l'altra.
 - **Gamma = 0.999 (Orizzonte Lungo)**: Aumentato dallo standard `0.99` per estendere la visione del Critic a 1000 step (20 secondi). Senza questo orizzonte lungo, l'agente non "vedeva" in tempo le curve ad alta velocità.
 - **Reward Scale = 0.002**: L'aumento del Gamma decuplica la magnitudo dei Q-Values. Riducendo lo scaling si compensa l'effetto e si ristabilisce un braccio di ferro equo tra BC e RL.
-- **Alpha Fisso = 0.01**: L'alpha è fissato a un valore basso e costante. L'auto-tuning dell'entropia è stato **disattivato** perché in un regime di fine-tuning da BC, l'entropia tende a salire inesorabilmente (nei log: `0.02 → 0.03 → 0.05...`), aggiungendo rumore crescente proprio quando la policy ha bisogno di stabilità. L'esplorazione è gestita nativamente dal campionamento gaussiano minimo del `log_std_head`.
-- **BC Weight Fisso = 5.0**: Il peso della BC Penalty è **costante e permanente** — nessun decay esponenziale. L'intero punto dell'architettura è che l'RL fa *correzioni residuali* al BC. Se il vincolo BC decade, la policy diventa puro RL → collasso garantito perché il Critic non è mai sufficientemente accurato su tutti gli stati del circuito.
+- **Dynamic Alpha Normalization**: Come prescritto da Fujimoto & Gu (2021), la BC penalty viene bilanciata in tempo reale tramite la formula $\alpha = \frac{2.5}{\frac{1}{N} \sum |Q(s_i, a_i)|}$. Questo rende l'algoritmo immune alla magnitudo crescente dei Q-value dovuta all'esplorazione online, mantenendo l'attrazione verso il maestro umano matematicamente invariata.
 - **Bonus Completamento Giro (+50.0)**: Quando l'agente completa un giro, riceve un bonus di `+50.0` reward. Senza questo segnale esplicito, il Critic non distingue "stava andando bene prima del crash" da "ha completato il circuito".
 
 ### D. Ambiente Esplorativo (Anti-Stall Relaxed)
@@ -83,22 +89,22 @@ Durante il training BC, ogni mini-batch viene perturbato sinteticamente per simu
 - **Perturbazione dei Sensori**: I 19 sensori di distanza dalla pista vengono ricalcolati geometricamente in base alla nuova posizione/angolo simulata, mantenendo la coerenza fisica.
 - **Correzione Throttle**: L'acceleratore viene ridotto proporzionalmente alla perturbazione combinata per insegnare cautela in stati anomali.
 
-### Livello 2: Residual RL (sac_rl.py)
-Il SAC esplora naturalmente stati off-distribution e impara correzioni locali tramite i Q-Value del Critic. Con il BC Weight fisso a 5.0, le correzioni restano "residuali" — piccoli aggiustamenti alla policy BC senza distruggerla.
+### Livello 2: Residual RL (td3_bc.py)
+Il TD3 esplora naturalmente stati off-distribution e impara correzioni locali tramite i Q-Value del Critic. Grazie all'Alpha Dinamico, le correzioni restano sempre "residuali" — piccoli aggiustamenti alla policy BC senza mai sfuggire al controllo umano, a prescindere dall'entità dei reward scoperti online.
 
 ## 8. Multimodal Averaging & Permanent BC Adherence (Residual RL)
 Il dataset umano originale del Behavioral Cloning (BC) contiene intrinsecamente traiettorie eterogenee (es. stringere in una curva al giro 1, allargare al giro 2). Quando una rete neurale impara da questi dati minimizzando il Mean Squared Error (MSE), tende ad apprendere la **media matematica** delle manovre. In curve complesse, questo porta spesso al **Multimodal Averaging** (un comportamento indeciso).
 
 Per ovviare a questo problema senza far deragliare l'agente (Extrapolation Error), l'architettura implementa una strategia di **Residual Reinforcement Learning**:
-- **BC Weight Fisso = 5.0**: Il peso della BC Penalty è costante e permanente. L'Actor non diventa mai un agente RL puro — rimane un "imitatore guidato" che usa i Q-Value del Critic solo come piccole correzioni locali (Residuals). Questo garantisce stabilità anche durante sessioni di training prolungate.
-- **Learning Rate Differenziati**: Il `continuous_head` (pesi BC) usa `1e-5`, mentre il `log_std_head` usa `1e-4`. Questa asimmetria protegge i pesi calibrati permettendo alla rete di calibrare l'esplorazione più rapidamente.
+- **Dynamic Alpha Normalization**: Il peso della BC Penalty si calibra dinamicamente sui Q-value del Critic. L'Actor non diventa mai un agente RL puro — rimane un "imitatore guidato" che usa i Q-Value solo come piccole correzioni (Residuals). Questo previene l'oscuramento della loss imitativa (Catastrophic Forgetting) causato dall'aumento naturale dei Q-value nel training prolungato.
+- **Learning Rate Mirato**: L'Actor viene addestrato con un Learning Rate standard di `3e-4`, ma agisce solo ed esclusivamente sul `continuous_head`, lasciando il resto della rete congelato per proteggere i pesi calibrati.
 
 ## 9. Elite Buffer e Self-Imitation Learning (Episodic Prioritization)
 Per mitigare la *Sample Inefficiency* e il *Catastrophic Forgetting* intrinseco nel campionamento casuale uniforme (Uniform Random Sampling), l'architettura sfrutta una strategia di **Self-Imitation Learning** basata su un'architettura a **Doppio Buffer**:
 - **Caching Episodico**: Le transizioni non vengono caricate step-by-step, ma raggruppate per episodio.
 - **Elite Buffer (Monotonic Threshold)**: Se un episodio supera una soglia di eccellenza, viene clonato in un buffer secondario (`20.000` step). La soglia è rigorosamente legata al record globale assoluto (`best_distance * 0.9`), risultando monotonicamente non decrescente. Questo impedisce alla soglia di abbassarsi per colpa di episodi sub-ottimali e previene l'inquinamento del buffer con dati scadenti (avvelenamento dell'Elite Buffer).
 - **Iniezione Expert**: I campioni clonati nell'Elite Buffer vengono flaggati con `expert=1.0`. Questo "inganna" la `bc_penalty` dell'Actor, forzando la rete a trattare i propri record come se fossero dimostrazioni umane ottimali, innescando l'auto-imitazione (Self-Imitation Learning).
-- **Hybrid Sampling (Generalization Balance)**: Durante il training, il SAC estrae il 75% del minibatch dal buffer standard e il 25% dall'Elite Buffer. Sebbene in passato si sia tentato un "Extreme Optimism" (85% Elite), questo portava a un forte **overfitting** sui singoli stati esatti dei record. Poiché la rete aggiunge un rumore Gaussiano esplorativo (`std=0.05`), l'auto si troverà sempre in stati "sporchi" leggermente diversi dalla traiettoria perfetta. Il 75% di Standard Buffer (con la BC_Penalty ancorata al maestro umano) è vitale per insegnare all'agente a **generalizzare** e recuperare la traiettoria quando si verifica una deviazione stocastica.
+- **Hybrid Sampling (Generalization Balance)**: Durante il training, il TD3 estrae il 75% del minibatch dal buffer standard e il 25% dall'Elite Buffer. Sebbene in passato si sia tentato un "Extreme Optimism" (85% Elite), questo portava a un forte **overfitting** sui singoli stati esatti dei record. Poiché la rete aggiunge un rumore Gaussiano esplorativo, l'auto si troverà sempre in stati "sporchi" leggermente diversi dalla traiettoria perfetta. Il 75% di Standard Buffer (con la BC_Penalty ancorata al maestro umano) è vitale per insegnare all'agente a **generalizzare** e recuperare la traiettoria quando si verifica una deviazione stocastica.
 - **Isolamento Dati**: Per mantenere pulita la directory dei checkpoint, entrambi i buffer (principale e elite) vengono serializzati in formato `.npz` e memorizzati in una sottocartella dedicata `train_set/checkpoints/buffers/`.
 
 ## 10. Prevenzione del Collasso (Frozen BC Anchor e Causal Confusion)
@@ -108,19 +114,19 @@ Durante l'addestramento ibrido, l'architettura risolve due problematiche critich
    Nel buffer standard (75% del batch esplorativo), i gradienti RL puri possono degenerare se il Critic si riempie di Q-Value negativi, portando l'Actor a manovre suicide. 
    L'agente istanzia un **Frozen BC Anchor** (`self.bc_policy`), una copia congelata della rete BC.
    La BC Penalty calcola l'MSE tra l'azione umana e l'azione deterministica `torch.tanh(mean)`, con componente direzionale normalizzata e Mutual Exclusion Penalty bilanciata (Soft Shaping).
-   Il peso (`bc_weight = 5.0`) è **fisso e permanente** — nessun decay. Il Learning Rate del Critic è `1e-4` per una discesa simmetrica.
+   La BC Penalty viene ora calibrata tramite la Normalizzazione Dinamica dell'Alpha, garantendo una regolarizzazione proporzionata e permanente.
 
 1. **Terminal State Mimicry (Sgancio Pre-Schianto)**: 
    Quando un episodio record (salvato nell'Elite Buffer) termina con uno schianto, le ultime azioni sono la causa diretta del fallimento. Forzare l'Actor a imitarle (tramite Self-Imitation) indurrebbe una *Causal Confusion*. 
    Il sistema risolve questo paradosso azzerando la maschera di imitazione (`expert=0.0`) negli ultimi 50 step (esattamente 1 secondo a 50Hz) di un record schiantato. In quella "finestra di evasione", l'agente smette di imitare il suo vecchio errore e torna istantaneamente sotto l'influenza del Reinforcement Learning puro e del Frozen BC Anchor, riuscendo così a frenare e a sopravvivere per estendere ulteriormente il record.
 
 ## 11. Evaluation Periodica Deterministica
-Ogni 25 episodi di training, il sistema esegue automaticamente un **episodio di valutazione deterministica** (`evaluate=True`, zero rumore). Se la distanza percorsa o il tempo sul giro migliorano, il checkpoint viene salvato come `sac_best_eval.pth`. Questo garantisce che il checkpoint usato per la presentazione video sia sempre la policy migliore *riprod ucibile* — non quella del miglior episodio esplorativo (che potrebbe essere un outlier fortunato con rumore stocastico).
+Ogni 5 episodi di training, il sistema esegue automaticamente un **episodio di valutazione deterministica** (`evaluate=True`, zero rumore). Se la distanza percorsa o il tempo sul giro migliorano, il checkpoint viene salvato come `td3_best_eval.pth`. Questo garantisce che il checkpoint usato per la presentazione video sia sempre la policy migliore *riproducibile* — non quella del miglior episodio esplorativo (che potrebbe essere un outlier fortunato con rumore stocastico).
 
 ## 12. Offline RL Warm-Start (Safe Restart)
 Durante le lunghe sessioni di RL, il Critic può saturarsi irrimediabilmente di Q-Value negativi a causa della continua esplorazione stocastica.
 
 Per risolvere questo stallo, l'architettura implementa un caricamento **disaccoppiato** tra i pesi neurali e i Replay Buffer:
 - I file `.npz` vengono caricati in memoria **indipendentemente** dall'esistenza di un checkpoint valido.
-- Questo consente il **Safe Restart**: cancellare i pesi della rete SAC (`.pth`), ripartendo con un Actor immacolato (clonato dal BC) e un Critic a zero, ma fornendo un Elite Buffer già popolato.
+- Questo consente il **Safe Restart**: cancellare i pesi della rete TD3 (`.pth`), ripartendo con un Actor immacolato (clonato dal BC) e un Critic a zero, ma fornendo un Elite Buffer già popolato.
 

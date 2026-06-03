@@ -1,11 +1,11 @@
 import argparse
 import os
-from sac_rl import ReplayBuffer
+from td3_bc import ReplayBuffer
 
 def main():
-    parser = argparse.ArgumentParser(description="Inietta dataset umano nel Replay Buffer del SAC (Offline-to-Online RL)")
+    parser = argparse.ArgumentParser(description="Inietta dataset umano nel Replay Buffer del TD3+BC (Offline-to-Online RL)")
     parser.add_argument("--dataset", type=str, default="train_set/laps", help="Path al dataset HDF5 (file singolo o directory)")
-    parser.add_argument("--buffer", type=str, default="train_set/checkpoints/replay_buffer.npz", help="Path al buffer .npz da aggiornare")
+    parser.add_argument("--buffer", type=str, default="train_set/checkpoints/buffers/td3_checkpoint_buffer.npz", help="Path al buffer .npz da aggiornare")
     parser.add_argument("--capacity", type=int, default=100000, help="Capacità massima del Replay Buffer")
     args = parser.parse_args()
 
@@ -13,7 +13,7 @@ def main():
     print(f"  💉 EXPERT BUFFER INJECTION UTILITY")
     print(f"{'=' * 60}\n")
 
-    # Inizializza il buffer usando la classe di sac_rl.py
+    # Inizializza il buffer usando la classe di td3_bc.py
     memory = ReplayBuffer(args.capacity)
     
     # Carica i dati precedenti se esistono (in modo da NON sovrascrivere l'esperienza RL accumulata)

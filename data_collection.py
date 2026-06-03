@@ -10,7 +10,7 @@ Interrompere con Ctrl+C. Il giro corrente incompleto NON viene salvato.
 
 Formato output (se il giro è valido e completato):
     lap_001.h5, lap_002.h5, ...              (un file per giro valido)
-    session_logs/session_YYYYMMDD.log        (log di sessione testuale)
+    session_logs/giri/session_YYYYMMDD.log   (log di sessione testuale)
 """
 
 import os
@@ -376,7 +376,7 @@ def main():
     os.makedirs(laps_dir, exist_ok=True)
 
     # ── Session log ──
-    log_dir = os.path.join(output_dir, "session_logs")
+    log_dir = os.path.join(output_dir, "session_logs", "giri")
     os.makedirs(log_dir, exist_ok=True)
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(log_dir, f"session_{session_id}.log")

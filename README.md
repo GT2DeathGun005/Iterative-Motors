@@ -1,6 +1,6 @@
 # 🏎️ AIcar — Hybrid BC-RL Architecture (IBM AI Racing League 2026)
 
-**Agente autonomo che impara a guidare tramite Behavioral Cloning (BC) e Soft Actor-Critic (SAC).**
+**Agente autonomo che impara a guidare tramite Behavioral Cloning (BC) e Twin Delayed DDPG (TD3+BC).**
 
 Questo repository implementa una pipeline end-to-end per addestrare un agente di guida autonoma nell'ambiente di simulazione **TORCS** (The Open Racing Car Simulator). L'obiettivo: **fittare perfettamente i dati esperti** e poi **affinare la policy tramite RL** per sconfiggere il Covariate Shift e ottimizzare il tempo sul giro sul circuito **Corkscrew** con una vettura **F1**.
 
@@ -8,9 +8,9 @@ Questo repository implementa una pipeline end-to-end per addestrare un agente di
 
 ## 🧠 Filosofia del Progetto: Architettura Ibrida BC-RL
 
-Questo progetto supera il classico Behavioral Cloning tramite un'architettura **Ibrida BC-RL**. L'agente parte con una **Deep Policy Network Multi-Head** addestrata offline per imitare l'esperto umano. Per sconfiggere il temuto *Covariate Shift* (che fa deragliare l'agente non appena si discosta millimetricamente dalla traiettoria ottimale), la pipeline prosegue con un **Soft Actor-Critic (SAC) Fine-Tuning**.
+Questo progetto supera il classico Behavioral Cloning tramite un'architettura **Ibrida BC-RL**. L'agente parte con una **Deep Policy Network Multi-Head** addestrata offline per imitare l'esperto umano. Per sconfiggere il temuto *Covariate Shift* (che fa deragliare l'agente non appena si discosta millimetricamente dalla traiettoria ottimale), la pipeline prosegue con un **TD3+BC Fine-Tuning**.
 
-Questa fase RL sfrutta la tecnica del **Warm-Start** e il **Gradient Freezing**: il backbone estratto dal BC viene congelato (per prevenire il *Latent Shift*), mentre il SAC esplora l'ambiente penalizzando duramente gli errori di traiettoria e massimizzando la velocità longitudinale.
+Questa fase RL sfrutta la tecnica del **Warm-Start** e il **Gradient Freezing**: il backbone estratto dal BC viene congelato (per prevenire il *Latent Shift*), mentre il TD3 esplora l'ambiente penalizzando duramente gli errori di traiettoria e massimizzando la velocità longitudinale.
 
 ### Punti di forza della pipeline Ibrida BC-RL:
 1. **Sample Efficiency**: Il BC fornisce un ottimo punto di partenza, abbattendo drasticamente i tempi di esplorazione del RL.
@@ -26,13 +26,13 @@ La pipeline si compone di quattro fasi sequenziali:
 ```
 ┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
 │  Fase 1              │     │  Fase 2              │     │  Fase 3              │     │  Fase 4              │
-│  DATA COLLECTION     │────▶│  BC TRAINING         │────▶│  SAC RL FINE-TUNING  │────▶│  TEST / INFERENCE    │
+│  DATA COLLECTION     │────▶│  BC TRAINING         │────▶│  TD3 RL FINE-TUNING  │────▶│  TEST / INFERENCE    │
 │                      │     │                      │     │                      │     │                      │
-│  🎮 PS5 / Tastiera   │     │  behavioral_cloning  │     │  sac_rl.py           │     │  test_agent.py       │
+│  🎮 PS5 / Tastiera   │     │  behavioral_cloning  │     │  td3_bc.py           │     │  test_agent.py       │
 │  data_collection.py  │     │  .py                 │     │  (Warm-Start)        │     │  Deterministico      │
 │                      │     │                      │     │                      │     │                      │
 │  Output:             │     │  Output:             │     │  Output:             │     │  Valutazione live    │
-│  train_set/laps/     │     │  bc_policy.pth       │     │  sac_policy.pth      │     │  su TORCS            │
+│  train_set/laps/     │     │  bc_policy.pth       │     │  td3_policy.pth      │     │  su TORCS            │
 └──────────────────────┘     └──────────────────────┘     └──────────────────────┘     └──────────────────────┘
 ```
 
@@ -40,7 +40,7 @@ La pipeline si compone di quattro fasi sequenziali:
 |------|--------|-------------|
 | 1. Data Collection | `data_collection.py` | Raccolta di giri guidati da umano con controller PS5 o tastiera WASD. Salva solo i giri puliti. |
 | 2. BC Training | `behavioral_cloning.py` | Addestramento della PolicyNetwork sui dati esperti. Produce una policy che imita l'esperto (`bc_policy.pth`). |
-| 3. SAC RL | `sac_rl.py` | Fine-tuning del modello tramite Soft Actor-Critic con Alpha fisso e Residual RL. Massimizza la velocità, salva il *Best Lap* (`sac_best_policy.pth`) e il *Best Eval* deterministico (`sac_best_eval.pth`). |
+| 3. TD3 RL | `td3_bc.py` | Fine-tuning del modello tramite TD3+BC e Residual RL. Massimizza la velocità, salva il *Best Lap* (`td3_best_policy.pth`) e il *Best Eval* deterministico (`td3_best_eval.pth`). |
 | 4. Test & Eval | `test_agent.py` | Esecuzione deterministica del modello finale su TORCS per valutare la capacità di completare giri autonomi. |
 
 ---
@@ -51,10 +51,10 @@ La pipeline si compone di quattro fasi sequenziali:
 AIcar/
 ├── data_collection.py         # Fase 1: Raccolta dati umani (PS5 / Tastiera)
 ├── behavioral_cloning.py      # Fase 2: Training della Deep Policy Network
-├── sac_rl.py                  # Fase 3: SAC Fine-Tuning (Warm-Start da BC)
-├── test_agent.py              # Fase 4: Inferenza deterministica (BC o SAC)
+├── td3_bc.py                  # Fase 3: TD3 Fine-Tuning (Warm-Start da BC)
+├── test_agent.py              # Fase 4: Inferenza deterministica (BC o RL)
 ├── train_all.sh               # 🚀 Script per lanciare il training BC
-├── train_rl.sh                # 🚀 Script per lanciare il training SAC
+├── train_rl.sh                # 🚀 Script per lanciare il training TD3
 ├── stop_training.sh           # 🛑 Ferma i processi di training/TORCS
 ├── README.md
 ├── gym_torcs/                 # Wrapper Python per TORCS
@@ -64,10 +64,10 @@ AIcar/
 ├── telemetry/                 # Telemetria CSV dei test agent (auto-generata)
 └── train_set/                 # Dati e Checkpoint
     ├── laps/                  #   File HDF5 dei giri registrati (lap_001.h5 ...)
-    ├── checkpoints/           #   Pesi: bc_policy.pth, sac_policy.pth, sac_best_policy.pth, sac_best_dist.pth, sac_best_eval.pth, sac_checkpoint.pth
+    ├── checkpoints/           #   Pesi: bc_policy.pth, td3_policy.pth, td3_best_policy.pth, td3_best_dist.pth, td3_best_eval.pth
     │   └── buffers/
-    │       ├── sac_checkpoint_buffer.npz        # Replay Buffer standard compresso (numpy)
-    │       └── sac_checkpoint_elite_buffer.npz  # Elite Buffer compresso (numpy)
+    │       ├── td3_checkpoint_buffer.npz        # Replay Buffer standard compresso (numpy)
+    │       └── td3_checkpoint_elite_buffer.npz  # Elite Buffer compresso (numpy)
     └── session_logs/          #   Log delle sessioni di training
 ```
 
@@ -204,7 +204,7 @@ Actor (Warm-Start da BC)                    Critic (Twin Q-Network, da zero)
 │  backbone [FROZEN]      │                 │  Q1: (state+action) → 1 │
 │  4×512 LayerNorm+ReLU   │                 │  512 → 512 → 1          │
 │                         │                 ├──────────────────────────┤
-│  continuous_head [TRAIN] │ ←── SAC ───→  │  Q2: (state+action) → 1 │
+│  continuous_head [TRAIN] │ ←── TD3 ───→  │  Q2: (state+action) → 1 │
 │  log_std_head   [TRAIN] │    updates     │  512 → 512 → 1          │
 │  gear_head      [FROZEN]│                 └──────────────────────────┘
 └─────────────────────────┘                 + Target Q (Polyak τ=0.005)

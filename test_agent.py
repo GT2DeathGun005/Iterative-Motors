@@ -1,17 +1,18 @@
 """
-Test Agent — Guida Autonoma su TORCS (Compatibile BC + SAC)
+Test Agent — Guida Autonoma su TORCS (Compatibile BC + RL)
 
-Carica i pesi del modello (BC o SAC) e fa guidare l'agente in modalità
+Carica i pesi del modello (BC o TD3/SAC) e fa guidare l'agente in modalità
 rigorosamente deterministica.
 
 La classe BCActor è compatibile con entrambi i formati:
   - bc_policy.pth  (senza log_std_head) — caricato con strict=False
-  - sac_policy.pth (con log_std_head)   — caricato con strict=True
+  - td3_policy.pth (con log_std_head)   — caricato con strict=True
 
 Priorità di caricamento automatica:
-  1. sac_policy.pth  (se esiste e --weights non è specificato)
-  2. bc_policy.pth   (fallback)
-  3. --weights path   (override esplicito)
+  1. td3_policy.pth  (se esiste e --weights non è specificato)
+  2. sac_policy.pth  (fallback RL legacy)
+  3. bc_policy.pth   (fallback supervisionato)
+  4. --weights path   (override esplicito)
 
 Determinismo:
   - Seeding globale (torch, numpy, random) a 42
@@ -20,7 +21,6 @@ Determinismo:
 
 Uso:
   python test_agent.py --weights train_set/checkpoints/td3_policy.pth
-  python test_agent.py --weights train_set/checkpoints/sac_policy.pth
   python test_agent.py --weights train_set/checkpoints/bc_policy.pth
   python test_agent.py  # auto-detect migliore checkpoint
 """
@@ -61,9 +61,9 @@ os.environ['PYTHONHASHSEED'] = str(SEED)
 # ──────────────────────────────────────────────────────────────────────
 
 class BCActor(nn.Module):
-    """Actor ibrido BC-RL con architettura identica all'Actor SAC.
+    """Actor ibrido BC-RL con architettura identica all'Actor TD3/SAC.
 
-    Include log_std_head per compatibilità con sac_policy.pth.
+    Include log_std_head per compatibilità con vecchi pesi.
     In modalità evaluate=True (usata per il test), la log_std_head
     viene completamente ignorata: si usa solo tanh(mean).
 
@@ -72,7 +72,7 @@ class BCActor(nn.Module):
     all'indietro.
 
     sample(state, evaluate=True) restituisce (tanh_action, None, gear_idx)
-    per l'inferenza deterministica SAC-style.
+    per l'inferenza deterministica RL-style.
     """
 
     def __init__(self, state_dim: int = 87, hidden_size: int = 512):
@@ -102,7 +102,7 @@ class BCActor(nn.Module):
         # Testa discreta per la marcia (7 classi: 0, 1, 2, 3, 4, 5, 6)
         self.gear_head = nn.Linear(hidden_size, 7)
 
-        # Testa log_std per compatibilità SAC (ignorata in evaluate mode)
+        # Testa log_std per compatibilità pesi RL (ignorata in evaluate mode)
         self.log_std_head = nn.Linear(hidden_size, 3)
 
     def forward(self, state: torch.Tensor):
@@ -125,7 +125,7 @@ class BCActor(nn.Module):
         return continuous, gear_logits
 
     def sample(self, state: torch.Tensor, evaluate: bool = False):
-        """Campionamento SAC-compatible. Con evaluate=True: determinismo assoluto.
+        """Campionamento RL-compatible. Con evaluate=True: determinismo assoluto.
 
         Restituisce (action, log_prob, gear_idx):
           - evaluate=True:  action = tanh(mean), log_prob = None
@@ -205,8 +205,8 @@ def denormalize_action_bc(cont_action: np.ndarray, gear: int) -> np.ndarray:
     return env_action
 
 
-def denormalize_action_sac(cont_action: np.ndarray, gear: int) -> np.ndarray:
-    """Converte l'output SAC (tutto Tanh [-1, 1]) nel formato TORCS.
+def denormalize_action_rl(cont_action: np.ndarray, gear: int) -> np.ndarray:
+    """Converte l'output RL (tutto Tanh [-1, 1]) nel formato TORCS.
 
     Mappatura:
       - steer: [-1, 1] → [-1, 1]  (diretto)
@@ -268,13 +268,13 @@ def load_best_weights(model, weights_arg, device):
     """Carica i migliori pesi disponibili con auto-detect del formato.
 
     Priorità (se --weights non è specificato):
-      1. sac_policy.pth  (pesi SAC — formato Actor con log_std_head)
-      2. bc_policy.pth   (pesi BC — formato PolicyNetwork senza log_std_head)
+      1. td3_best_eval.pth (pesi TD3/RL deterministici)
+      2. sac_policy.pth  (fallback)
 
     Se --weights è specificato, usa quello direttamente.
 
     Returns:
-        (model, is_sac_weights: bool)
+        (model, is_rl_weights: bool)
     """
     checkpoint_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'train_set', 'checkpoints')
@@ -332,14 +332,14 @@ def load_best_weights(model, weights_arg, device):
     except Exception:
         state_dict = torch.load(load_path, map_location=device, weights_only=False)
 
-    # Determina se sono pesi SAC (contengono log_std_head) o BC (non lo contengono)
+    # Determina se sono pesi RL (contengono log_std_head) o BC (non lo contengono)
     has_log_std = any('log_std_head' in k for k in state_dict.keys())
 
     # Carica con strict=False per gestire la chiave mancante log_std_head nei pesi BC
     model.load_state_dict(state_dict, strict=has_log_std)
     model.eval()
 
-    weight_type = "SAC" if has_log_std else "BC"
+    weight_type = "RL (TD3/SAC)" if has_log_std else "BC"
     print(f"  ✅ Pesi [{weight_type}] caricati da: {load_path}")
 
     return model, has_log_std
@@ -350,7 +350,7 @@ def load_best_weights(model, weights_arg, device):
 # ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Test Agent Autonomo (BC/SAC) — TORCS")
+    parser = argparse.ArgumentParser(description="Test Agent Autonomo (BC/RL) — TORCS")
     parser.add_argument("--weights", type=str, default=None,
                         help="Path ai pesi del modello (.pth). Se omesso, auto-detect.")
     parser.add_argument("--laps", type=int, default=3,
@@ -362,7 +362,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"\n{'=' * 64}")
-    print(f"  🏁 TEST AGENTE AUTONOMO (BC/SAC) — TORCS")
+    print(f"  🏁 TEST AGENTE AUTONOMO (BC/RL) — TORCS")
     print(f"  Device: {device}")
     print(f"  Stride Type: static (k=6, 0.24s)")
     print(f"  🎯 Modalità: DETERMINISTICA (evaluate=True, Zero Noise)")
@@ -370,11 +370,11 @@ def main():
 
     # ── Carica modello con auto-detect ──
     model = BCActor().to(device)
-    model, is_sac = load_best_weights(model, args.weights, device)
+    model, is_rl = load_best_weights(model, args.weights, device)
 
     # Seleziona la funzione di denormalizzazione corretta
-    denormalize_fn = denormalize_action_sac if is_sac else denormalize_action_bc
-    inference_mode = "SAC (sample evaluate=True)" if is_sac else "BC (forward diretto)"
+    denormalize_fn = denormalize_action_rl if is_rl else denormalize_action_bc
+    inference_mode = "RL (sample evaluate=True)" if is_rl else "BC (forward diretto)"
     print(f"  📐 Inference mode: {inference_mode}")
 
     # ── Ambiente ──
@@ -426,8 +426,8 @@ def main():
                 with torch.no_grad():
                     state_t = torch.FloatTensor(stacked_state).to(device).unsqueeze(0)
 
-                    if is_sac:
-                        # SAC: usa sample(evaluate=True) per determinismo assoluto
+                    if is_rl:
+                        # RL: usa sample(evaluate=True) per determinismo assoluto
                         tanh_action, _, gear_idx = model.sample(state_t, evaluate=True)
                         cont_action = tanh_action.cpu().numpy()[0]
                         raw_gear = int(gear_idx.item())
@@ -447,15 +447,15 @@ def main():
 
                 # ── Mutual exclusion accel/brake (come l'esperto umano) ──
                 # Per i pesi BC, cont_action[1:3] sono già [0,1] (Sigmoid)
-                # Per i pesi SAC, cont_action[1:3] sono [-1,1] (Tanh) — denormalize_fn li converte
-                if not is_sac and cont_action[2] > 0.05:
+                # Per i pesi RL, cont_action[1:3] sono [-1,1] (Tanh) — denormalize_fn li converte
+                if not is_rl and cont_action[2] > 0.05:
                     cont_action[1] = 0.0  # Se freno, niente gas (solo per BC)
 
                 # ── Step nell'ambiente ──
                 env_action = denormalize_fn(cont_action, current_gear)
 
-                # Mutual exclusion post-denormalize per SAC
-                if is_sac and env_action[2] > 0.05:
+                # Mutual exclusion post-denormalize per RL
+                if is_rl and env_action[2] > 0.05:
                     env_action[1] = 0.0
 
                 next_obs, _, env_done, _ = env.step(env_action)
