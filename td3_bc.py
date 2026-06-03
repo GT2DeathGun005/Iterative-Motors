@@ -386,14 +386,21 @@ class TD3BCAgent:
             bc_penalty = directional_loss + (mutual_exclusion_penalty * 0.1)
 
             # ── Dynamic Alpha Normalization (Fujimoto & Gu, 2021) ──
-            # Alpha = lambda / mean(|Q|) rende la BC Penalty auto-bilanciante:
-            # - Quando i Q-value sono piccoli (Critic acerbo), Alpha è grande
-            #   → la BC Penalty domina, proteggendo l'Actor dal Catastrophic Forgetting.
-            # - Quando i Q-value crescono (Critic esperto), Alpha si riduce
-            #   → il termine RL (-Q) prende il sopravvento per ottimizzare la traiettoria.
-            lambda_val = 2.5 
+            # Alpha = lambda / mean(|Q|) rende la BC Penalty auto-bilanciante.
+            # FIX MATEMATICO: Nel paper originale lambda = 2.5, ma noi usiamo
+            # un reward_scale di 0.002, il che rende i Q-value ~500 volte più piccoli.
+            # Dobbiamo scalare il lambda proporzionalmente al quadrato per non
+            # rendere l'Alpha 500x più grande del dovuto (il che distruggerebbe il RL).
+            # lambda_val = 2.5 * reward_scale = 0.005. Usiamo un lambda di 0.01
+            # per avere un Alpha ragionevole (~0.05 / 0.1).
+            lambda_val = 0.01
             Q_abs_mean = q1_pi.abs().mean().detach().clamp(min=1e-5)
             dynamic_alpha = lambda_val / Q_abs_mean
+            
+            # HARD CLAMP: se l'agente crasha molte volte, i Q crollano e l'Alpha
+            # esploderebbe, forzando un puro Behavioral Cloning subottimale (Policy Collapse).
+            # Limitiamo Alpha tra 0.01 (minima imitazione) e 0.5 (massima imitazione sicura).
+            dynamic_alpha = torch.clamp(dynamic_alpha, min=0.01, max=0.5)
             
             total_actor_loss = actor_loss_td3 + dynamic_alpha * bc_penalty
 
