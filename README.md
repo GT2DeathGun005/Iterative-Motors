@@ -113,20 +113,20 @@ python behavioral_cloning.py \
 
 **Output:** `train_set/checkpoints/bc_policy.pth`
 
-### 3. SAC Fine-Tuning (Reinforcement Learning)
+### 3. TD3+BC Fine-Tuning (Reinforcement Learning)
 
 ```bash
 # Metodo rapido (1000 episodi, Warm-Start automatico dal BC)
 ./train_rl.sh
 
 # Override del numero di episodi
-SAC_EPISODES=500 ./train_rl.sh
+TD3_EPISODES=500 ./train_rl.sh
 
-# Ripartenza pulita (cancella checkpoint SAC precedenti)
+# Ripartenza pulita (cancella checkpoint TD3 precedenti)
 ./train_rl.sh --clean
 
 # Lancio diretto
-python sac_rl.py \
+python td3_bc.py \
     --bc_weights train_set/checkpoints/bc_policy.pth \
     --episodes 1000 \
     --max_steps 5000 \
@@ -137,18 +137,18 @@ Il training è **resume-safe**: il checkpoint viene salvato ad ogni episodio. Pu
 
 Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per prevenire problemi di focus con il desktop dell'host. 
 
-**Output:** `train_set/checkpoints/sac_policy.pth` + `sac_best_policy.pth` + `sac_best_dist.pth` + `sac_best_eval.pth` + `sac_checkpoint.pth` + `buffers/sac_checkpoint_buffer.npz` + `buffers/sac_checkpoint_elite_buffer.npz`
+**Output:** `train_set/checkpoints/td3_policy.pth` + `td3_best_policy.pth` + `td3_best_dist.pth` + `td3_best_eval.pth` + `td3_checkpoint.pth` + `buffers/td3_checkpoint_buffer.npz` + `buffers/td3_checkpoint_elite_buffer.npz`
 
 ### 4. Test Deterministico (Inference)
 
-Il test agent auto-rileva i migliori pesi disponibili: `sac_best_eval.pth` → `sac_best_policy.pth` → `sac_best_dist.pth` → `sac_policy.pth` → `bc_policy.pth`.
+Il test agent auto-rileva i migliori pesi disponibili: `td3_best_eval.pth` → `td3_best_policy.pth` → `td3_best_dist.pth` → `td3_policy.pth` → `sac_best_eval.pth` → `bc_policy.pth`.
 
 ```bash
 # Esecuzione standard con bypass Xvfb (visibile a schermo)
 SHOW_GUI=1 python test_agent.py
 
 # Specificare esplicitamente i pesi
-SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/sac_best_policy.pth --laps 3
+SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_best_eval.pth --laps 3
 SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 1
 ```
 
@@ -160,7 +160,7 @@ SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/bc_policy.pth --
 
 ---
 
-## 📊 Interpretazione dei Log di Addestramento SAC
+## 📊 Interpretazione dei Log di Addestramento TD3+BC
 
 Durante il training RL, il log stampa metriche fondamentali per diagnosticare la salute dell'addestramento. Ecco i valori corretti da aspettarsi:
 
@@ -174,10 +174,10 @@ Durante il training RL, il log stampa metriche fondamentali per diagnosticare la
 * **Valori Sani:** L'Actor Loss **deve diventare negativa**. Non esiste un limite inferiore, più scende sotto lo zero, più punti l'Actor si aspetta di guadagnare.
 * **Diagnosi:** Una discesa dolce e lineare (es. da `0.0` a `-0.8` e oltre) è segno di un apprendimento sanissimo, in cui l'Actor sta capitalizzando sul Q-Value. Salti "positivi" giganteschi in un singolo step denotano un gradiente "sledgehammer" (solitamente causato dall'entropia o dalla BC Penalty) che punisce l'Actor.
 
-### 3. Entropia (`Alpha`)
-* **Cos'è:** Il parametro che regola l'importanza dell'esplorazione stocastica rispetto all'ottimizzazione del Q-value.
-* **Valori Sani:** Fisso a `0.01`. Non cambia nel tempo.
-* **Diagnosi:** L'auto-tuning è stato **disattivato** perché in un regime di fine-tuning da BC, l'entropia crescente aggiungeva rumore distruttivo ai pesi BC calibrati. Un alpha fisso e basso garantisce stabilità permanente.
+### 3. Nessuna Entropia (Differenza con SAC)
+* In TD3+BC non c'è più il parametro `Alpha` (entropia) nei log. 
+* L'Actor usa azioni completamente deterministiche per la backpropagation, riducendo drasticamente il Catastrophic Forgetting.
+* La componente BC è gestita strutturalmente e regolata dal moltiplicatore del reward.
 
 ---
 
@@ -193,10 +193,10 @@ La rete adotta un'architettura **Multi-Head** per elaborare lo storico temporale
 | Hidden Layers (Backbone) | 4 × 512 neuroni con LayerNorm + ReLU |
 | Continuous Head | 3 neuroni (steer, accel, brake) |
 | Gear Head (Discreta) | 7 neuroni (logits marcia per CrossEntropy) |
-| Log Std Head (SAC) | 3 neuroni (deviazione standard per campionamento gaussiano) |
+| Log Std Head (Legacy) | 3 neuroni (mantenuta per retrocompatibilità coi vecchi test_agent, ma isolata in TD3) |
 | Parametri totali | ~843,000 |
 
-### SAC Architecture
+### TD3+BC Architecture
 
 ```
 Actor (Warm-Start da BC)                    Critic (Twin Q-Network, da zero)

@@ -91,10 +91,10 @@ fi
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Prossimo Step: SAC Reinforcement Learning
+#  Prossimo Step: TD3+BC Reinforcement Learning
 # ═══════════════════════════════════════════════════════════════════════
 log_info ""
-log_info "Per avviare il Fine-Tuning SAC (Warm-Start dal BC appena addestrato):"
+log_info "Per avviare il Fine-Tuning TD3+BC (Warm-Start dal BC appena addestrato):"
 log_info "${BOLD}./train_rl.sh${NC}"
 log_info ""
 log_ok "${BOLD}Pipeline BC completata!${NC}"

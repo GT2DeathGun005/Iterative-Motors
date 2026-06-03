@@ -12,8 +12,9 @@ pkill -f "train_rl.sh" || echo "Nessun processo train_rl.sh attivo."
 # Ferma Behavioral Cloning
 pkill -f "behavioral_cloning.py" || echo "Nessun processo behavioral_cloning.py attivo."
 
-# Ferma SAC Reinforcement Learning
+# Ferma SAC Reinforcement Learning e TD3
 pkill -f "sac_rl.py" || echo "Nessun processo sac_rl.py attivo."
+pkill -f "td3_bc.py" || echo "Nessun processo td3_bc.py attivo."
 
 # Ferma agenti di inferenza
 pkill -f "test_agent.py" || echo "Nessun processo test_agent.py attivo."

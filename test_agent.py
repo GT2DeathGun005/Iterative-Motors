@@ -19,6 +19,7 @@ Determinismo:
   - actor.sample(state, evaluate=True) bypassa il campionamento gaussiano
 
 Uso:
+  python test_agent.py --weights train_set/checkpoints/td3_policy.pth
   python test_agent.py --weights train_set/checkpoints/sac_policy.pth
   python test_agent.py --weights train_set/checkpoints/bc_policy.pth
   python test_agent.py  # auto-detect migliore checkpoint
@@ -277,6 +278,11 @@ def load_best_weights(model, weights_arg, device):
     """
     checkpoint_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'train_set', 'checkpoints')
+    td3_best_eval_path = os.path.join(checkpoint_dir, 'td3_best_eval.pth')
+    td3_best_lap_path = os.path.join(checkpoint_dir, 'td3_best_policy.pth')
+    td3_best_dist_path = os.path.join(checkpoint_dir, 'td3_best_dist.pth')
+    td3_path = os.path.join(checkpoint_dir, 'td3_policy.pth')
+
     sac_best_eval_path = os.path.join(checkpoint_dir, 'sac_best_eval.pth')
     sac_best_lap_path = os.path.join(checkpoint_dir, 'sac_best_policy.pth')
     sac_best_dist_path = os.path.join(checkpoint_dir, 'sac_best_dist.pth')
@@ -286,18 +292,30 @@ def load_best_weights(model, weights_arg, device):
     # Se l'utente ha specificato un path esplicito, usalo
     if weights_arg:
         load_path = weights_arg
+    elif os.path.exists(td3_best_eval_path):
+        load_path = td3_best_eval_path
+        print(f"  🔍 Auto-detect: trovato td3_best_eval.pth (Miglior checkpoint deterministico TD3!)")
+    elif os.path.exists(td3_best_lap_path):
+        load_path = td3_best_lap_path
+        print(f"  🔍 Auto-detect: trovato td3_best_policy.pth (Record sul giro TD3!)")
+    elif os.path.exists(td3_best_dist_path):
+        load_path = td3_best_dist_path
+        print(f"  🔍 Auto-detect: trovato td3_best_dist.pth (Record di distanza TD3!)")
+    elif os.path.exists(td3_path):
+        load_path = td3_path
+        print(f"  🔍 Auto-detect: trovato td3_policy.pth (Ultimo step TD3)")
     elif os.path.exists(sac_best_eval_path):
         load_path = sac_best_eval_path
-        print(f"  🔍 Auto-detect: trovato sac_best_eval.pth (Miglior checkpoint deterministico!)")
+        print(f"  🔍 Auto-detect: trovato sac_best_eval.pth (Miglior checkpoint deterministico SAC!)")
     elif os.path.exists(sac_best_lap_path):
         load_path = sac_best_lap_path
-        print(f"  🔍 Auto-detect: trovato sac_best_policy.pth (Record sul giro!)")
+        print(f"  🔍 Auto-detect: trovato sac_best_policy.pth (Record sul giro SAC!)")
     elif os.path.exists(sac_best_dist_path):
         load_path = sac_best_dist_path
-        print(f"  🔍 Auto-detect: trovato sac_best_dist.pth (Record di distanza!)")
+        print(f"  🔍 Auto-detect: trovato sac_best_dist.pth (Record di distanza SAC!)")
     elif os.path.exists(sac_path):
         load_path = sac_path
-        print(f"  🔍 Auto-detect: trovato sac_policy.pth (Ultimo step)")
+        print(f"  🔍 Auto-detect: trovato sac_policy.pth (Ultimo step SAC)")
     elif os.path.exists(bc_path):
         load_path = bc_path
         print(f"  🔍 Auto-detect: fallback su bc_policy.pth")
