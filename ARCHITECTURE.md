@@ -139,3 +139,12 @@ Durante l'esecuzione di `td3_bc.py`, l'analisi dei log è fondamentale per compr
 - **ActorL non più inchiodato a plateau**: A differenza delle architetture precedenti che esibivano una ActorL fissa a `2.516` durante i crash, il nuovo Masking Rigoroso libera l'Actor dalla componente imitativa durante le fasi off-distribution. Ci aspetteremo di vedere valori di ActorL progressivamente variabili e decrescenti nel lungo periodo.
 - **Transizione del Lambda**: Nel log non sarà più presente l'iperparametro statico a `0.1` ma vedremo un valore di `Lambda` (se loggato) o un calo dell'impatto della BC penalty che accompagna la formula del decadimento esponenziale da 2.5 a 0.25 (nei 100k step). La componente RL pura dominerà progressivamente l'equazione.
 - **Spike della CriticL associato all'Elite Buffer**: Quando l'agente stabilisce una traiettoria record prolungata (es. una corsa da `2.400m`), questa viene iniettata nell'Elite Buffer. Nelle iterazioni successive, il *Self-Imitation Learning* espone il Critic a questa traiettoria inedita e iper-performante: questo spiazza le vecchie credenze del Critic, provocando un leggero picco temporaneo nella CriticL (es. a `0.004`). Subito dopo l'assimilazione, l'ActorL sprofonda per allinearsi al nuovo record e le distanze dell'agente subiscono un forte balzo in avanti.
+
+## 14. Nomenclatura dei Checkpoint Salvati
+La pipeline di training genera diversi file di checkpoint per scopi differenti, salvati nella cartella `train_set/checkpoints/`:
+
+- **`td3_best_lap.pth` (Best Lap)**: Rappresenta la policy con il **tempo sul giro più veloce in assoluto** (lap time minimo su un giro completato con successo). Viene salvato quando l'episodio si conclude con `SUCCESS` e il tempo sul giro è inferiore a tutti i precedenti.
+- **`td3_best_dist.pth` (Best Distance)**: Rappresenta la policy con la **distanza percorsa più lunga** registrata durante gli episodi di addestramento stocastici (esplorativi) prima di un crash (se superiore a 500m).
+- **`td3_best_eval.pth` (Best Eval)**: Rappresenta la policy con la **migliore performance di distanza** ottenuta esclusivamente durante le valutazioni deterministiche (senza rumore di esplorazione).
+- **`td3_policy.pth`**: Pesi correnti della rete Actor salvati alla fine di ogni episodio.
+- **`td3_checkpoint.pth`**: Contiene lo stato globale del training (ottimizzatori di Actor e Critic, contatori globali di step, ecc.) per supportare il ripristino sicuro (`--resume`) senza perdita di avanzamento.

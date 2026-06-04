@@ -40,7 +40,7 @@ La pipeline si compone di quattro fasi sequenziali:
 |------|--------|-------------|
 | 1. Data Collection | `data_collection.py` | Raccolta di giri guidati da umano con controller PS5 o tastiera WASD. Salva solo i giri puliti. |
 | 2. BC Training | `behavioral_cloning.py` | Addestramento della PolicyNetwork sui dati esperti. Produce una policy che imita l'esperto (`bc_policy.pth`). |
-| 3. TD3 RL | `td3_bc.py` | Fine-tuning del modello tramite TD3+BC e Residual RL. Massimizza la velocità, salva il *Best Lap* (`td3_best_policy.pth`) e il *Best Eval* deterministico (`td3_best_eval.pth`). |
+| 3. TD3 RL | `td3_bc.py` | Fine-tuning del modello tramite TD3+BC e Residual RL. Massimizza la velocità, salva il *Best Lap* (`td3_best_lap.pth`) e il *Best Eval* deterministico (`td3_best_eval.pth`). |
 | 4. Test & Eval | `test_agent.py` | Esecuzione deterministica del modello finale su TORCS per valutare la capacità di completare giri autonomi. |
 
 ---
@@ -64,7 +64,7 @@ AIcar/
 ├── telemetry/                 # Telemetria CSV dei test agent (auto-generata)
 └── train_set/                 # Dati e Checkpoint
     ├── laps/                  #   File HDF5 dei giri registrati (lap_001.h5 ...)
-    ├── checkpoints/           #   Pesi: bc_policy.pth, td3_policy.pth, td3_best_policy.pth, td3_best_dist.pth, td3_best_eval.pth
+    ├── checkpoints/           #   Pesi: bc_policy.pth, td3_policy.pth, td3_best_lap.pth, td3_best_dist.pth, td3_best_eval.pth
     │   └── buffers/
     │       ├── td3_checkpoint_buffer.npz        # Replay Buffer standard compresso (numpy)
     │       └── td3_checkpoint_elite_buffer.npz  # Elite Buffer compresso (numpy)
@@ -137,11 +137,11 @@ Il training è **resume-safe**: il checkpoint viene salvato ad ogni episodio. Pu
 
 Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per prevenire problemi di focus con il desktop dell'host. 
 
-**Output:** `train_set/checkpoints/td3_policy.pth` + `td3_best_policy.pth` + `td3_best_dist.pth` + `td3_best_eval.pth` + `td3_checkpoint.pth` + `buffers/td3_checkpoint_buffer.npz` + `buffers/td3_checkpoint_elite_buffer.npz`
+**Output:** `train_set/checkpoints/td3_policy.pth` + `td3_best_lap.pth` + `td3_best_dist.pth` + `td3_best_eval.pth` + `td3_checkpoint.pth` + `buffers/td3_checkpoint_buffer.npz` + `buffers/td3_checkpoint_elite_buffer.npz`
 
 ### 4. Test Deterministico (Inference)
 
-Il test agent auto-rileva i migliori pesi disponibili: `td3_best_eval.pth` → `td3_best_policy.pth` → `td3_best_dist.pth` → `td3_policy.pth` → `sac_best_eval.pth` → `bc_policy.pth`.
+Il test agent auto-rileva i migliori pesi disponibili: `td3_best_eval.pth` → `td3_best_lap.pth` → `td3_best_dist.pth` → `td3_policy.pth` → `sac_best_eval.pth` → `bc_policy.pth`.
 
 ```bash
 # Esecuzione standard con bypass Xvfb (visibile a schermo)

@@ -10,7 +10,7 @@ La classe BCActor è compatibile con entrambi i formati:
 
 Priorità di caricamento automatica:
   1. td3_best_eval.pth   (miglior checkpoint deterministico TD3)
-  2. td3_best_policy.pth (record sul giro TD3)
+  2. td3_best_lap.pth    (record sul giro TD3)
   3. td3_best_dist.pth   (record di distanza TD3)
   4. td3_policy.pth      (ultimo step TD3)
   5. bc_policy.pth       (fallback supervisionato)
@@ -281,7 +281,7 @@ def load_best_weights(model, weights_arg, device):
     checkpoint_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'train_set', 'checkpoints')
     td3_best_eval_path = os.path.join(checkpoint_dir, 'td3_best_eval.pth')
-    td3_best_lap_path = os.path.join(checkpoint_dir, 'td3_best_policy.pth')
+    td3_best_lap_path = os.path.join(checkpoint_dir, 'td3_best_lap.pth')
     td3_best_dist_path = os.path.join(checkpoint_dir, 'td3_best_dist.pth')
     td3_path = os.path.join(checkpoint_dir, 'td3_policy.pth')
 
@@ -296,7 +296,7 @@ def load_best_weights(model, weights_arg, device):
         print(f"  🔍 Auto-detect: trovato td3_best_eval.pth (Miglior checkpoint deterministico TD3!)")
     elif os.path.exists(td3_best_lap_path):
         load_path = td3_best_lap_path
-        print(f"  🔍 Auto-detect: trovato td3_best_policy.pth (Record sul giro TD3!)")
+        print(f"  🔍 Auto-detect: trovato td3_best_lap.pth (Record sul giro TD3!)")
     elif os.path.exists(td3_best_dist_path):
         load_path = td3_best_dist_path
         print(f"  🔍 Auto-detect: trovato td3_best_dist.pth (Record di distanza TD3!)")

@@ -549,7 +549,7 @@ def train():
                 if last_lap_time < best_lap_time:
                     best_lap_time = last_lap_time
                     new_record = True
-                    torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_best_policy.pth')
+                    torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_best_lap.pth')
                 
             if info.get('crash', False):
                 done, termination_reason = True, "CRASH"

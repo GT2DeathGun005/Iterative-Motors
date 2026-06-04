@@ -57,7 +57,7 @@ log_phase() { echo -e "\n${BOLD}${BLUE}═════════════�
 # ── Gestione flag --clean ──
 if [[ "${1:-}" == "--clean" ]]; then
     log_warn "Flag --clean rilevato: cancellazione checkpoint TD3 precedenti..."
-    rm -f "$TD3_CHECKPOINT" "$TD3_BUFFER" "$TD3_ELITE_BUFFER" "$TD3_POLICY" "train_set/checkpoints/td3_best_policy.pth" "train_set/checkpoints/td3_best_dist.pth" "train_set/checkpoints/td3_best_eval.pth"
+    rm -f "$TD3_CHECKPOINT" "$TD3_BUFFER" "$TD3_ELITE_BUFFER" "$TD3_POLICY" "train_set/checkpoints/td3_best_lap.pth" "train_set/checkpoints/td3_best_dist.pth" "train_set/checkpoints/td3_best_eval.pth"
     log_ok "Checkpoint TD3 cancellati. Ripartenza pulita."
 fi
 
