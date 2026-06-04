@@ -147,9 +147,14 @@ Il test agent auto-rileva i migliori pesi disponibili: `td3_best_eval.pth` → `
 # Esecuzione standard con bypass Xvfb (visibile a schermo)
 SHOW_GUI=1 python test_agent.py
 
-# Specificare esplicitamente i pesi
+# Vedere a schermo il MIGLIOR GIRO in assoluto (best lap storico)
+SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_best_lap.pth --laps 1
+
+# Vedere la policy con la distanza maggiore raggiunta in addestramento
+SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_best_dist.pth --laps 1
+
+# Vedere la policy migliore ottenuta in fase di valutazione deterministica
 SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_best_eval.pth --laps 3
-SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/bc_policy.pth --laps 1
 ```
 
 ### Script di Supporto

@@ -389,19 +389,22 @@ class TD3BCAgent:
             mutual_exclusion_penalty = (det_accel * det_brake).mean()
             bc_penalty = bc_penalty + (mutual_exclusion_penalty * 0.1)
 
-            # ── Relaxed Policy Constraint (Beeson & Montana, 2022) ──
-            # Decadimento esponenziale di lambda dopo i 15k step di warm-up.
-            # Transizione da lambda=2.5 a lambda=0.25 su un orizzonte di 100k step.
-            if global_step <= 15000:
-                lambda_val = 2.5
-            else:
-                progress = min(1.0, (global_step - 15000) / 100000.0)
-                lambda_val = 2.5 * (0.1 ** progress)
-
+            # ── Relaxed Policy Constraint Corretto (Beeson & Montana, 2022) ──
+            # Manteniamo lambda FISSO a 2.5 per garantire che il gradiente RL
+            # mantenga una spinta costante verso la massimizzazione di Q.
+            lambda_val = 2.5
             Q_abs_mean = q1_pi.abs().mean().detach().clamp(min=1e-5)
             dynamic_alpha = lambda_val / Q_abs_mean
-            
-            total_actor_loss = dynamic_alpha * actor_loss_td3 + bc_penalty
+
+            # Decadimento esponenziale applicato ESCLUSIVAMENTE al peso della BC Penalty.
+            # Da 1.0 (forte imitazione per warm-up) scende a 0.1 (RL dominante) su 100k step.
+            if global_step <= 15000:
+                bc_weight = 1.0
+            else:
+                progress = min(1.0, (global_step - 15000) / 100000.0)
+                bc_weight = 1.0 * (0.1 ** progress)
+
+            total_actor_loss = dynamic_alpha * actor_loss_td3 + (bc_weight * bc_penalty)
 
             self.actor_optimizer.zero_grad()
             total_actor_loss.backward()
@@ -452,25 +455,38 @@ class TD3BCAgent:
         if not os.path.exists(filepath): return 0, 0, float('inf'), 0.0, 0.0
 
         checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
-        self.actor.load_state_dict(checkpoint['actor'])
-        if 'actor_target' in checkpoint: self.actor_target.load_state_dict(checkpoint['actor_target'])
-        self.critic.load_state_dict(checkpoint['critic'])
-        self.critic_target.load_state_dict(checkpoint['critic_target'])
-        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
-        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+        if isinstance(checkpoint, dict) and 'actor' in checkpoint:
+            self.actor.load_state_dict(checkpoint['actor'])
+            if 'actor_target' in checkpoint: self.actor_target.load_state_dict(checkpoint['actor_target'])
+            self.critic.load_state_dict(checkpoint['critic'])
+            self.critic_target.load_state_dict(checkpoint['critic_target'])
+            self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+            self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
 
-        best_lap_time = checkpoint.get('best_lap_time', float('inf'))
-        best_eval_dist = checkpoint.get('best_eval_dist', 0.0)
-        best_distance = checkpoint.get('best_distance', 0.0)
+            best_lap_time = checkpoint.get('best_lap_time', float('inf'))
+            best_eval_dist = checkpoint.get('best_eval_dist', 0.0)
+            best_distance = checkpoint.get('best_distance', 0.0)
+            episode = checkpoint['episode']
+            global_step = checkpoint['global_step']
+            print(f"✅ Checkpoint caricato: ripresa dall'Episodio {episode}")
+        else:
+            # È un file di soli pesi dell'actor (come td3_best_dist.pth)
+            print("ℹ️ Checkpoint contiene solo pesi dell'Actor (formato weights-only). Inizializzazione degli altri componenti.")
+            self.actor.load_state_dict(checkpoint)
+            self.actor_target.load_state_dict(self.actor.state_dict())
+            best_lap_time = float('inf')
+            best_eval_dist = 0.0
+            best_distance = 0.0
+            episode = 0
+            global_step = 0
 
         # Fallback all'avvio da checkpoint legacy se c'è un miglior giro storico td3_best_lap.pth
-        if 'best_lap_time' not in checkpoint and os.path.exists('train_set/checkpoints/td3_best_lap.pth'):
+        if (best_lap_time == float('inf') or best_lap_time is None) and os.path.exists('train_set/checkpoints/td3_best_lap.pth'):
             best_lap_time = 84.3
             best_eval_dist = 3619.0
             best_distance = 3619.0
 
-        print(f"✅ Checkpoint caricato: ripresa dall'Episodio {checkpoint['episode']}")
-        return checkpoint['episode'], checkpoint['global_step'], best_lap_time, best_eval_dist, best_distance
+        return episode, global_step, best_lap_time, best_eval_dist, best_distance
 
 def train():
     parser = argparse.ArgumentParser()
