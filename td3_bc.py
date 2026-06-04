@@ -122,7 +122,7 @@ class ReplayBuffer:
                     stacked_state = np.concatenate([states_np[idx_t12], states_np[idx_t6], states_np[i]])
                     next_stacked_state = np.concatenate([states_np[n_idx_t12], states_np[n_idx_t6], states_np[next_i]])
                     
-                    cont_action = actions_np[i, 0:3]
+                    cont_action = actions_np[i, 0:3].copy()
                     cont_action[1] = (cont_action[1] * 2.0) - 1.0
                     cont_action[2] = (cont_action[2] * 2.0) - 1.0
                     
@@ -225,8 +225,12 @@ class Actor(nn.Module):
     def load_bc_weights(self, bc_path):
         if not os.path.exists(bc_path): return
         bc_state = torch.load(bc_path, map_location='cpu', weights_only=True)
+        if 'continuous_head.weight' in bc_state:
+            bc_state['continuous_head.weight'][1:3] = bc_state['continuous_head.weight'][1:3] * 0.5
+        if 'continuous_head.bias' in bc_state:
+            bc_state['continuous_head.bias'][1:3] = bc_state['continuous_head.bias'][1:3] * 0.5
         self.load_state_dict(bc_state, strict=False)
-        print(f"✅ Pesi BC caricati con successo da {bc_path}.")
+        print(f"✅ Pesi BC caricati con successo da {bc_path} (compensato scaling 0.5 per accel/brake).")
 
 class Critic(nn.Module):
     """Twin Q-Network: due reti Q indipendenti per mitigare l'Overestimation Bias.
@@ -292,8 +296,9 @@ class TD3BCAgent:
         # L'Elite Buffer contiene solo i giri da record (Self-Imitation Learning),
         # che forzano l'Actor a imitare le proprie migliori performance.
         # Il rapporto 75/25 bilancia generalizzazione vs ottimizzazione.
-        if len(elite_memory.buffer) >= 64:
-            b1, b2 = int(batch_size * 0.75), batch_size - int(batch_size * 0.75)
+        b1 = int(batch_size * 0.75)
+        b2 = batch_size - b1
+        if len(elite_memory.buffer) >= b2:
             s1, a1, r1, ns1, m1, em1 = memory.sample(b1)
             s2, a2, r2, ns2, m2, em2 = elite_memory.sample(b2)
             state_b = np.concatenate([s1, s2], axis=0)
@@ -527,6 +532,10 @@ def train():
             torcs_action[1] = np.clip((torcs_action[1] + 1.0) / 2.0, 0.0, 1.0)  # accel: [-1,1] → [0,1]
             torcs_action[2] = np.clip((torcs_action[2] + 1.0) / 2.0, 0.0, 1.0)  # brake: [-1,1] → [0,1]
             
+            # Mutual exclusion post-denormalizzazione coerente con test_agent.py
+            if torcs_action[2] > 0.05:
+                torcs_action[1] = 0.0
+                
             next_ob, reward, env_done, info = env.step(torcs_action)
             next_f_state = flatten_state(next_ob)
             state_stack.append(next_f_state)
