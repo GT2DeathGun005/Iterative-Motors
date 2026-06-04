@@ -348,11 +348,11 @@ class TD3BCAgent:
         actor_loss_val = 0.0
 
         # ── Delayed Policy Update (TD3: ogni 2 step del Critic) ──
-        # Nei primi 5000 step il Critic si addestra da solo (Warm-Up),
+        # Nei primi 15000 step il Critic si addestra da solo (Warm-Up),
         # proteggendo l'Actor dai gradienti casuali di un Critic immaturo.
         # Dopo il warm-up, l'Actor viene aggiornato ogni 2 step (policy_freq=2)
         # per dare al Critic il tempo di stabilizzare le sue stime.
-        if global_step >= 5000 and global_step % self.policy_freq == 0:
+        if global_step >= 15000 and global_step % self.policy_freq == 0:
             pi, _ = self.actor(state_b)
             q1_pi, _ = self.critic(state_b, pi)
             
@@ -386,23 +386,16 @@ class TD3BCAgent:
             bc_penalty = directional_loss + (mutual_exclusion_penalty * 0.1)
 
             # ── Dynamic Alpha Normalization (Fujimoto & Gu, 2021) ──
-            # Alpha = lambda / mean(|Q|) rende la BC Penalty auto-bilanciante.
-            # FIX MATEMATICO: Nel paper originale lambda = 2.5, ma noi usiamo
-            # un reward_scale di 0.002, il che rende i Q-value ~500 volte più piccoli.
-            # Dobbiamo scalare il lambda proporzionalmente al quadrato per non
-            # rendere l'Alpha 500x più grande del dovuto (il che distruggerebbe il RL).
-            # lambda_val = 2.5 * reward_scale = 0.005. Usiamo un lambda di 0.01
-            # per avere un Alpha ragionevole (~0.05 / 0.1).
-            lambda_val = 0.01
+            # Alpha = lambda / mean(|Q|) rende il gradiente RL auto-bilanciante.
+            # L'equazione originale del paper applica l'Alpha al termine RL (-Q), NON alla BC Penalty!
+            # L_actor = - (lambda / |Q_mean|) * Q + BC_penalty
+            # Questa formulazione è matematicamente invariante alla scala dei reward.
+            # Riduciamo lambda a 0.1 per proteggere l'Actor dai gradienti del Critic inesperti.
+            lambda_val = 0.1
             Q_abs_mean = q1_pi.abs().mean().detach().clamp(min=1e-5)
             dynamic_alpha = lambda_val / Q_abs_mean
             
-            # HARD CLAMP: se l'agente crasha molte volte, i Q crollano e l'Alpha
-            # esploderebbe, forzando un puro Behavioral Cloning subottimale (Policy Collapse).
-            # Limitiamo Alpha tra 0.01 (minima imitazione) e 0.5 (massima imitazione sicura).
-            dynamic_alpha = torch.clamp(dynamic_alpha, min=0.01, max=0.5)
-            
-            total_actor_loss = actor_loss_td3 + dynamic_alpha * bc_penalty
+            total_actor_loss = dynamic_alpha * actor_loss_td3 + bc_penalty
 
             self.actor_optimizer.zero_grad()
             total_actor_loss.backward()

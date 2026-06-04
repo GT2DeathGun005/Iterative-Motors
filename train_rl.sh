@@ -29,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ── Configurazione ──
-BC_WEIGHTS="train_set/checkpoints/bc_policy.pth"
+BC_WEIGHTS="${BC_WEIGHTS:-train_set/checkpoints/bc_policy.pth}"
 TD3_CHECKPOINT="train_set/checkpoints/td3_checkpoint.pth"
 TD3_BUFFER="train_set/checkpoints/buffers/td3_checkpoint_buffer.npz"
 TD3_ELITE_BUFFER="train_set/checkpoints/buffers/td3_checkpoint_elite_buffer.npz"

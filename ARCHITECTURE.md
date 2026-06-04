@@ -16,19 +16,19 @@ L'Actor è ora una rete completamente **deterministica**:
 La nostra implementazione cattura l'essenza matematica del TD3+BC, ma introduce tre variazioni ingegneristiche fondamentali per operare la transizione da un dominio puramente *Offline* (usato nel paper) a un dominio *Online* con esplorazione attiva:
 
 - **Target dell'Azione Esperta**: Nel paper originale l'azione target $a_{expert}$ viene campionata dal dataset. Noi usiamo il backbone congelato `self.bc_policy(state)` per inferire il target. Questo è vitale perché, esplorando online, l'agente incontra stati off-distribution che non esistono nel dataset originale.
-- **Dynamic Alpha Normalization**: Applicata la formula originale $\alpha = \frac{\lambda}{\frac{1}{N} \sum |Q(s_i, a_i)|}$. Tuttavia, essendoci un *reward_scaling* di 0.002, il coefficiente $\lambda$ (originalmente 2.5) è stato scalato a `0.01`. Inoltre, per prevenire *policy collapse* durante esplorazioni sfavorevoli, è stato introdotto un Hard Clamp $\alpha \in [0.01, 0.5]$.
+- **Dynamic Alpha Normalization Invariante**: Applicata la formula originale $\alpha = \frac{2.5}{\frac{1}{N} \sum |Q(s_i, a_i)|}$. Tuttavia, l'Alpha non moltiplica la BC Penalty, ma normalizza il gradiente del RL: $\mathcal{L}_{actor} = -\alpha \cdot Q(s,a) + \text{BC\_Penalty}$. Questa formulazione è matematicamente invariante al nostro `reward_scale` di 0.002, in quanto la divisione per la magnitudo di Q annulla lo scale factor.
 - **Loss di Imitazione Domain-Specific**: Invece del generico MSE su tutto il vettore d'azione, applichiamo una funzione che soppesa doppiamente sterzo e freno e aggiunge una *Mutual Exclusion Penalty* per impedire il blocco dei freni in accelerazione.
 ## 2. Critic (Twin Q-Network)
 Il Critic ha il compito di stimare il valore (Q-value) della coppia (Stato, Azione). Poiché il BC non usa una value-function, il Critic deve essere addestrato da zero.
 - **Architettura Twin**: Usa due reti Q indipendenti per mitigare l'Overestimation Bias tipico del Q-learning. Si prende il minimo tra le due stime durante l'aggiornamento dell'Actor.
-- **Critic Warm-Up**: Per i primi `5000` step, viene aggiornato SOLO il Critic. L'Actor non viene toccato. Questo protegge l'Actor dall'essere distrutto da stime casuali di un Critic non ancora addestrato.
+- **Critic Warm-Up Exteso (15.000 step)**: Poiché nel nostro setup Offline-to-Online il Critic viene inizializzato da zero (a differenza del paper dove è pre-addestrato offline), l'Actor viene congelato per i primi `15.000` step. Questo permette al Critic di apprendere una Value Function solida e previene la *Critic Warmup Degradation*, ovvero la distruzione dei pesi BC perfetti da parte di gradienti casuali o sproporzionati inviati da un Critic immaturo.
 
 ## 3. Parametri TD3+BC e Il Sistema di Loss (Anti-Drift)
 L'integrazione di una BC Penalty in un algoritmo TD3 richiede una calibrazione millimetrica per bilanciare l'imitazione dell'esperto e la massimizzazione del Reward.
 
-- **Equazione Actor Loss (TD3+BC)**: $L_{actor} = -Q(s,a) + \alpha \cdot \text{BC\_Penalty}(a, a_{expert})$.
+- **Equazione Actor Loss (TD3+BC)**: $\mathcal{L}_{actor} = - \alpha \cdot Q(s,a) + \text{BC\_Penalty}(a, a_{expert})$.
 - L'Actor viene costretto a massimizzare il Q-Value (derivato dal RL) **senza** abbandonare la traccia dei dati estratti dal Behavioral Cloning.
-- **Dynamic Alpha Normalization**: Il coefficiente $\alpha$ viene calcolato dinamicamente come $\frac{\lambda}{\frac{1}{N} \sum |Q|}$ (con $\lambda=0.01$) e limitato da un clamp, rendendo la BC Penalty bilanciata ed evintando gradienti distruttivi (cfr. Sezione 1.1).
+- **Dynamic Alpha Normalization**: Il coefficiente $\alpha$ viene calcolato dinamicamente come $\frac{0.1}{\frac{1}{N} \sum |Q|}$. Il parametro originale $\lambda=2.5$ è stato ridotto a `0.1` per depotenziare la forza del gradiente RL e proteggere la *BC\_Penalty* (che ha gradienti deboli) durante l'apprendimento esplorativo. Essendo applicato al termine Q, rende il gradiente RL auto-bilanciante e totalmente invariato a eventuali *reward scaling*.
 
 ### A. Reward per Singolo Step (Dense Reward & Soft Shaping)
 A ogni istante `t`, l'agente riceve una ricompensa così calcolata:
@@ -55,7 +55,7 @@ Se l'auto esce di pista (`|trackPos| > 1.5`), si schianta, o va in stallo, l'epi
 L'integrazione di una BC Penalty in un algoritmo RL ad alta frequenza (50Hz) richiede una calibrazione millimetrica per evitare che una forza matematica sopprima l'altra.
 - **Gamma = 0.999 (Orizzonte Lungo)**: Aumentato dallo standard `0.99` per estendere la visione del Critic a 1000 step (20 secondi). Senza questo orizzonte lungo, l'agente non "vedeva" in tempo le curve ad alta velocità.
 - **Reward Scale = 0.002**: L'aumento del Gamma decuplica la magnitudo dei Q-Values. Riducendo lo scaling si compensa l'effetto e si evitano gradienti esplosivi.
-- **Dynamic Alpha Normalization**: Come prescritto da Fujimoto & Gu (2021), la BC penalty è bilanciata dalla formula $\alpha = \frac{\lambda}{\frac{1}{N} \sum |Q|}$. Per compensare il Reward Scale di 0.002, $\lambda$ è scalato quadraticamente da 2.5 a **`0.01`**. È stato inoltre applicato un **Hard Clamp** $\alpha \in [0.01, 0.5]$ per impedire che l'agente regredisca in puro BC qualora i Q-value crollino per una serie di crash.
+- **Dynamic Alpha Normalization**: Il gradiente RL è bilanciato dalla formula $\alpha = \frac{\lambda}{\frac{1}{N} \sum |Q|}$. Nel paper originale si usa $\lambda = 2.5$, ma noi lo abbiamo ridotto a **`0.1`**. Questa drastica riduzione è essenziale nell'Offline-to-Online fine-tuning per impedire che l'Actor riceva gradienti RL 25 volte più forti della `BC_Penalty`, prevenendo il collasso immediato della policy di imitazione. L'invarianza allo scale è comunque mantenuta.
 - **Bonus Completamento Giro (+50.0)**: Quando l'agente completa un giro, riceve un bonus di `+50.0` reward. Senza questo segnale esplicito, il Critic non distingue "stava andando bene prima del crash" da "ha completato il circuito".
 
 ### D. Ambiente Esplorativo (Anti-Stall Relaxed)
