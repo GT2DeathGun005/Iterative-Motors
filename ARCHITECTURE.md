@@ -15,8 +15,8 @@ L'Actor è ora una rete completamente **deterministica**:
 ### 1.1 Adattamenti Offline-to-Online vs Paper Originale (Fujimoto & Gu, 2021)
 La nostra implementazione cattura l'essenza matematica del TD3+BC, ma introduce tre variazioni ingegneristiche fondamentali per operare la transizione da un dominio puramente *Offline* (usato nel paper) a un dominio *Online* con esplorazione attiva:
 
-- **Target dell'Azione Esperta**: Nel paper originale l'azione target $a_{expert}$ viene campionata dal dataset. Noi usiamo il backbone congelato `self.bc_policy(state)` per inferire il target. Questo è vitale perché, esplorando online, l'agente incontra stati off-distribution che non esistono nel dataset originale.
-- **Dynamic Alpha Normalization Invariante**: Applicata la formula originale $\alpha = \frac{2.5}{\frac{1}{N} \sum |Q(s_i, a_i)|}$. Tuttavia, l'Alpha non moltiplica la BC Penalty, ma normalizza il gradiente del RL: $\mathcal{L}_{actor} = -\alpha \cdot Q(s,a) + \text{BC\_Penalty}$. Questa formulazione è matematicamente invariante al nostro `reward_scale` di 0.002, in quanto la divisione per la magnitudo di Q annulla lo scale factor.
+- **Target dell'Azione Esperta**: Nel paper originale l'azione target $a_{expert}$ viene campionata dal dataset. Anche noi applichiamo il **masking rigoroso**, sfruttando l'azione empirica registrata in memoria per gli stati dell'Elite Buffer e azzerando la BC Penalty per i campioni esplorativi online. Questo impedisce all'agente di subire il covariate shift su stati OOD.
+- **Relaxed Policy Constraint (Alpha Dinamico con Decay)**: Invece dell'Alpha statico proposto in TD3+BC, implementiamo il *Relaxed Policy Constraint* di Beeson & Montana (2022). $\alpha = \frac{\lambda}{\frac{1}{N} \sum |Q(s_i, a_i)|}$, ma $\lambda$ decae in modo esponenziale da 2.5 (forte imitazione nel warm-up) a 0.25 su un orizzonte di 100.000 step. L'Alpha non moltiplica la BC Penalty, ma normalizza il gradiente del RL: $\mathcal{L}_{actor} = \alpha \cdot (-Q(s,a)) + \text{BC\_Penalty}$.
 - **Loss di Imitazione Domain-Specific**: Invece del generico MSE su tutto il vettore d'azione, applichiamo una funzione che soppesa doppiamente sterzo e freno e aggiunge una *Mutual Exclusion Penalty* per impedire il blocco dei freni in accelerazione.
 ## 2. Critic (Twin Q-Network)
 Il Critic ha il compito di stimare il valore (Q-value) della coppia (Stato, Azione). Poiché il BC non usa una value-function, il Critic deve essere addestrato da zero.
@@ -28,7 +28,7 @@ L'integrazione di una BC Penalty in un algoritmo TD3 richiede una calibrazione m
 
 - **Equazione Actor Loss (TD3+BC)**: $\mathcal{L}_{actor} = - \alpha \cdot Q(s,a) + \text{BC\_Penalty}(a, a_{expert})$.
 - L'Actor viene costretto a massimizzare il Q-Value (derivato dal RL) **senza** abbandonare la traccia dei dati estratti dal Behavioral Cloning.
-- **Dynamic Alpha Normalization**: Il coefficiente $\alpha$ viene calcolato dinamicamente come $\frac{0.1}{\frac{1}{N} \sum |Q|}$. Il parametro originale $\lambda=2.5$ è stato ridotto a `0.1` per depotenziare la forza del gradiente RL e proteggere la *BC\_Penalty* (che ha gradienti deboli) durante l'apprendimento esplorativo. Essendo applicato al termine Q, rende il gradiente RL auto-bilanciante e totalmente invariato a eventuali *reward scaling*.
+- **Dynamic Alpha Normalization**: Il coefficiente $\alpha$ viene calcolato dinamicamente come $\frac{\lambda}{\frac{1}{N} \sum |Q|}$. Il parametro $\lambda$ parte da 2.5 durante i primi 15.000 step di warm-up (per massimizzare la fedeltà e proteggere l'Actor), per poi decadere esponenzialmente verso un *floor* di 0.25 nei 100.000 step successivi. Essendo applicato al termine Q, rende il gradiente RL auto-bilanciante e totalmente invariato a eventuali *reward scaling*.
 
 ### A. Reward per Singolo Step (Dense Reward & Soft Shaping)
 A ogni istante `t`, l'agente riceve una ricompensa così calcolata:
@@ -89,8 +89,8 @@ Durante il training BC, ogni mini-batch viene perturbato sinteticamente per simu
 - **Perturbazione dei Sensori**: I 19 sensori di distanza dalla pista vengono ricalcolati geometricamente in base alla nuova posizione/angolo simulata, mantenendo la coerenza fisica.
 - **Correzione Throttle**: L'acceleratore viene ridotto proporzionalmente alla perturbazione combinata per insegnare cautela in stati anomali.
 
-### Livello 2: Residual RL (td3_bc.py)
-Il TD3 esplora naturalmente stati off-distribution e impara correzioni locali tramite i Q-Value del Critic. Grazie all'Alpha Dinamico, le correzioni restano sempre "residuali" — piccoli aggiustamenti alla policy BC senza mai sfuggire al controllo umano, a prescindere dall'entità dei reward scoperti online.
+### Livello 2: Relaxed Policy Constraint (td3_bc.py)
+Il TD3 esplora naturalmente stati off-distribution. Grazie all'implementazione del Masking Rigoroso della BC Penalty, per gli stati online (esplorativi) il peso dell'imitazione viene azzerato. L'Actor è quindi **completamente libero** di imparare correzioni locali (come frenare e raddrizzarsi per evitare il muro) basate esclusivamente sui Q-Value del Critic, senza che nessuna rete BC interferisca tentando di suggerire azioni OOD "allucinate".
 
 ## 8. Multimodal Averaging & Permanent BC Adherence (Residual RL)
 Il dataset umano originale del Behavioral Cloning (BC) contiene intrinsecamente traiettorie eterogenee (es. stringere in una curva al giro 1, allargare al giro 2). Quando una rete neurale impara da questi dati minimizzando il Mean Squared Error (MSE), tende ad apprendere la **media matematica** delle manovre. In curve complesse, questo porta spesso al **Multimodal Averaging** (un comportamento indeciso).
@@ -110,11 +110,10 @@ Per mitigare la *Sample Inefficiency* e il *Catastrophic Forgetting* intrinseco 
 ## 10. Prevenzione del Collasso (Frozen BC Anchor e Causal Confusion)
 Durante l'addestramento ibrido, l'architettura risolve due problematiche critiche intrinseche al Self-Imitation Learning:
 
-1. **Frozen BC Anchor (Prevenzione Extrapolation Error)**: 
-   Nel buffer standard (75% del batch esplorativo), i gradienti RL puri possono degenerare se il Critic si riempie di Q-Value negativi, portando l'Actor a manovre suicide. 
-   L'agente istanzia un **Frozen BC Anchor** (`self.bc_policy`), una copia congelata della rete BC.
-   La BC Penalty calcola l'MSE tra l'azione umana e l'azione deterministica `torch.tanh(mean)`, con componente direzionale normalizzata e Mutual Exclusion Penalty bilanciata (Soft Shaping).
-   La BC Penalty viene ora calibrata tramite la Normalizzazione Dinamica dell'Alpha, garantendo una regolarizzazione proporzionata e permanente.
+1. **Masking Rigoroso per Prevenire il Covariate Shift**: 
+   Nel buffer standard (75% del batch esplorativo), i gradienti RL puri possono degenerare se affiancati ad un'imitazione impropria.
+   L'agente sfrutta una **Maschera Esperta** (`expert_mask=1.0` per Elite, `0.0` per Online). La BC Penalty calcola l'MSE tra l'azione umana e l'azione deterministica **solo sui campioni esperti**, azzerandosi per quelli online. 
+   Questo elimina la necessità di interrogare una rete BC per gli stati OOD, annullando le allucinazioni e rimuovendo i milioni di parametri extra del vecchio *Frozen BC Anchor*.
 
 2. **Terminal State Mimicry (Sgancio Pre-Schianto)**: 
    Quando un episodio record (salvato nell'Elite Buffer) termina con uno schianto, le ultime azioni sono la causa diretta del fallimento. Forzare l'Actor a imitarle (tramite Self-Imitation) indurrebbe una *Causal Confusion*. 
@@ -134,6 +133,6 @@ Per risolvere questo stallo, l'architettura implementa un caricamento **disaccop
 Durante l'esecuzione di `td3_bc.py`, l'analisi dei log è fondamentale per comprendere la salute del sistema e il corretto funzionamento delle dinamiche ibride implementate:
 
 - **CriticL microscopico (`0.000` - `0.004`)**: L'errore del Critic appare irrisorio a causa del forte *Reward Scaling* (`0.002`). Poiché i Q-Value sono numericamente compressi in partenza, il loro Errore Quadratico Medio (MSE) in fase di apprendimento scende spesso sotto la soglia del millesimo, venendo arrotondato a `0.000` in console. Questo è il segno di un Critic sano: gradienti così piccoli evitano la *Gradient Explosion* e proteggono la rete dal collasso. Quando compare uno `0.001`, significa semplicemente che il Critic sta affinando una precisione estrema.
-- **ActorL positivo in fase di avvio**: Durante i primi episodi, i Q-Value sono piccoli. La formula dell'*Alpha Dinamico* ($2.5 / |Q|$) compensa questa piccolezza generando un peso enorme per la *BC Penalty*. Finché il Critic è "acerbo", l'ActorL si mantiene alta e positiva, forzando l'Actor a ignorare le scorribande stocastiche per ancorarsi rigidamente alla traiettoria umana.
-- **ActorL progressivamente negativo**: Con il procedere del training, i Q-Value calcolati dal Critic crescono in magnitudo (l'agente massimizza i punti per la velocità). L'Alpha decresce fisiologicamente per via del denominatore più grande, e la componente RL pura (che minimizza $-Q$) domina l'equazione. Una loss a `-0.600` indica che la rete ha allentato le redini imitative per abbracciare l'ottimizzazione del tempo sul giro.
+- **ActorL non più inchiodato a plateau**: A differenza delle architetture precedenti che esibivano una ActorL fissa a `2.516` durante i crash, il nuovo Masking Rigoroso libera l'Actor dalla componente imitativa durante le fasi off-distribution. Ci aspetteremo di vedere valori di ActorL progressivamente variabili e decrescenti nel lungo periodo.
+- **Transizione del Lambda**: Nel log non sarà più presente l'iperparametro statico a `0.1` ma vedremo un valore di `Lambda` (se loggato) o un calo dell'impatto della BC penalty che accompagna la formula del decadimento esponenziale da 2.5 a 0.25 (nei 100k step). La componente RL pura dominerà progressivamente l'equazione.
 - **Spike della CriticL associato all'Elite Buffer**: Quando l'agente stabilisce una traiettoria record prolungata (es. una corsa da `2.400m`), questa viene iniettata nell'Elite Buffer. Nelle iterazioni successive, il *Self-Imitation Learning* espone il Critic a questa traiettoria inedita e iper-performante: questo spiazza le vecchie credenze del Critic, provocando un leggero picco temporaneo nella CriticL (es. a `0.004`). Subito dopo l'assimilazione, l'ActorL sprofonda per allinearsi al nuovo record e le distanze dell'agente subiscono un forte balzo in avanti.

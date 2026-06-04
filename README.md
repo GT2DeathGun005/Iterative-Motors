@@ -170,14 +170,13 @@ Durante il training RL, il log stampa metriche fondamentali per diagnosticare la
 * **Diagnosi:** Un valore stabilmente basso significa che il Critic comprende perfettamente la fisica del gioco e sta fornendo valutazioni accurate. Se la `CriticL` schizza permanentemente a centinaia, c'è un'esplosione dei gradienti (o mancano i dati BC nel replay buffer).
 
 ### 2. Actor Loss (`ActorL`)
-* **Cos'è:** Misura quanto l'Actor sta massimizzando le reward stimate dal Critic. Essendo calcolata in PyTorch (che sa solo minimizzare) come `ActorL = BC_Penalty - Q_Value`, invertire il segno è necessario.
-* **Valori Sani:** L'Actor Loss **deve diventare negativa**. Non esiste un limite inferiore, più scende sotto lo zero, più punti l'Actor si aspetta di guadagnare.
-* **Diagnosi:** Una discesa dolce e lineare (es. da `0.0` a `-0.8` e oltre) è segno di un apprendimento sanissimo, in cui l'Actor sta capitalizzando sul Q-Value. Salti "positivi" giganteschi in un singolo step denotano un gradiente "sledgehammer" (solitamente causato dall'entropia o dalla BC Penalty) che punisce l'Actor.
+* **Cos'è:** Misura quanto l'Actor sta massimizzando le reward stimate dal Critic. 
+* **Valori Sani:** Grazie al *Masking Rigoroso*, l'ActorL non rimarrà più incastrata in un plateau a `2.5` durante i crash o fasi OOD. La loss deve assumere valori variabili e scendere dolcemente man mano che il *Lambda* decade.
+* **Diagnosi:** Una discesa progressiva della loss è segno che l'Actor sta abbandonando l'imitazione forte iniziale per capitalizzare sul Q-Value. 
 
-### 3. Nessuna Entropia (Differenza con SAC)
-* In TD3+BC non c'è più il parametro `Alpha` (entropia) nei log. 
-* L'Actor usa azioni completamente deterministiche per la backpropagation, riducendo drasticamente il Catastrophic Forgetting.
-* La componente BC è gestita strutturalmente e regolata dal moltiplicatore del reward.
+### 3. Dinamiche TD3+BC (Decay di Lambda)
+* In TD3+BC l'entropia del SAC è rimossa, l'agente è completamente deterministico.
+* **Lambda Decay:** La forza dell'imitazione (parametro $\lambda$) decae esponenzialmente da `2.5` a `0.25` durante i primi 115k step (inclusi 15k di warm-up). Questo permette un transito stabile da *Behavioral Cloning* (imitazione forte) a *Reinforcement Learning* puro (massimizzazione reward).
 
 ---
 
@@ -277,6 +276,17 @@ Il training BC include perturbazione laterale dello stato (`trackPos ±0.4`) e a
 ---
 
 ## 🐛 Bug Risolti (Workflow Tracking)
+
+### [2026-06-04] Risoluzione OOD BC Bug e Relaxed Policy Constraint
+
+**Problema:** L'Actor dimenticava come guidare in modo deterministico (Catastrophic Forgetting), esibendo un plateau fisso della `ActorL` a ~2.516 durante i crash.
+
+**Root Cause:** Il *Frozen BC Anchor* (la `bc_policy` congelata) veniva interrogato per calcolare la penalità imitativa anche durante gli stati OOD (fuoripista, muri). La rete restituiva azioni allucinate, bloccando l'apprendimento delle manovre di recupero.
+
+**Fix applicati:**
+1. **Masking Rigoroso**: La BC Penalty è calcolata esclusivamente sui campioni empirici registrati nell'Elite Buffer (dove `expert_mask=1.0`). È azzerata durante le fasi esplorative online, liberando l'Actor.
+2. **Rimozione bc_policy**: Eliminato del tutto il clone congelato dell'Actor (-2.3M parametri in VRAM).
+3. **Relaxed Policy Constraint (Decay Esponenziale)**: Transizione del coefficiente imitativo $\lambda$ da 2.5 a 0.25 su 100k step, ispirato a Beeson & Montana (2022).
 
 ### [2026-06-03] Risoluzione Definitiva del Collasso della Policy (6 Bug Fix)
 

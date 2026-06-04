@@ -264,10 +264,8 @@ class TD3BCAgent:
         self.actor_target = Actor().to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         
-        # Frozen BC Anchor: copia congelata della policy BC usata come
-        # target di imitazione. Non viene mai aggiornata durante il training.
-        self.bc_policy = Actor().to(self.device)
-        for p in self.bc_policy.parameters(): p.requires_grad = False
+        # Rimuoviamo il Frozen BC Anchor: il target d'imitazione sarà
+        # solo l'azione empirica (expert_mask=1.0) e non la predizione OOD.
         
         self.critic = Critic().to(self.device)
         self.critic_target = Critic().to(self.device)
@@ -359,39 +357,44 @@ class TD3BCAgent:
             # Componente RL: l'Actor massimizza il Q-Value stimato dal Critic
             actor_loss_td3 = -q1_pi.mean()
             
-            # ── BC Penalty (Imitazione Esperta) ──
-            # Per i campioni dell'Elite Buffer (expert_mask=1.0), il target è
-            # l'azione registrata nel buffer (la traiettoria record dell'agente).
-            # Per gli altri campioni, il target è il Frozen BC Anchor (maestro umano).
-            with torch.no_grad():
-                bc_action, _ = self.bc_policy(state_b)
+            # ── BC Penalty (Masking Rigoroso: Solo su stati Expert) ──
+            # Per i campioni con expert_mask=1.0 (elite buffer + expert data),
+            # il target è l'azione empirica registrata nel buffer.
+            # Per i campioni con expert_mask=0.0 (esplorazione online),
+            # la BC Penalty è azzerata: l'agente è libero di imparare manovre
+            # di recupero tramite il solo gradiente RL.
+            # Questo risolve il bug OOD: la bc_policy congelata non viene più
+            # consultata per stati fuori distribuzione.
+            det_steer = pi[:, 0]
+            det_accel = (pi[:, 1] + 1.0) / 2.0
+            det_brake = (pi[:, 2] + 1.0) / 2.0
+            target_steer = action_b[:, 0]
+            target_accel = (action_b[:, 1] + 1.0) / 2.0
+            target_brake = (action_b[:, 2] + 1.0) / 2.0
 
-            target_action = torch.where(expert_mask_b == 1.0, action_b, bc_action)
+            # Loss calcolata senza reduction per applicare il masking individuale
+            steer_loss = F.mse_loss(det_steer, target_steer, reduction='none')
+            accel_loss = F.mse_loss(det_accel, target_accel, reduction='none')
+            brake_loss = F.mse_loss(det_brake, target_brake, reduction='none')
 
-            # Ri-mappatura [-1,1] → [0,1] per accel/brake (coerenza con lo spazio fisico)
-            det_steer, det_accel, det_brake = pi[:, 0], (pi[:, 1] + 1.0) / 2.0, (pi[:, 2] + 1.0) / 2.0
-            target_steer, target_accel, target_brake = target_action[:, 0], (target_action[:, 1] + 1.0) / 2.0, (target_action[:, 2] + 1.0) / 2.0
-
-            steer_loss = F.mse_loss(det_steer, target_steer)
-            accel_loss = F.mse_loss(det_accel, target_accel)
-            brake_loss = F.mse_loss(det_brake, target_brake)
-
-            # Loss direzionale pesata: sterzo e freno contano il doppio
-            # perché errori su questi assi causano crash immediati,
-            # mentre un errore sull'acceleratore degrada solo la velocità.
+            # Loss direzionale di shape (batch_size,)
             directional_loss = (steer_loss * 2.0 + accel_loss + brake_loss * 2.0) / 5.0
-            # Mutual Exclusion: penalizza la pressione simultanea di gas e freno,
-            # un comportamento fisicamente impossibile per un pilota umano.
             mutual_exclusion_penalty = (det_accel * det_brake).mean()
-            bc_penalty = directional_loss + (mutual_exclusion_penalty * 0.1)
 
-            # ── Dynamic Alpha Normalization (Fujimoto & Gu, 2021) ──
-            # Alpha = lambda / mean(|Q|) rende il gradiente RL auto-bilanciante.
-            # L'equazione originale del paper applica l'Alpha al termine RL (-Q), NON alla BC Penalty!
-            # L_actor = - (lambda / |Q_mean|) * Q + BC_penalty
-            # Questa formulazione è matematicamente invariante alla scala dei reward.
-            # Riduciamo lambda a 0.1 per proteggere l'Actor dai gradienti del Critic inesperti.
-            lambda_val = 0.1
+            # MASKING: La mask (B, 1) viene appiattita a (B,) per il broadcasting.
+            # Il BC viene calcolato SOLO per i campioni con expert_mask == 1.0
+            expert_mask_flat = expert_mask_b.squeeze(1)
+            bc_penalty = (directional_loss * expert_mask_flat).mean() + (mutual_exclusion_penalty * 0.1)
+
+            # ── Relaxed Policy Constraint (Beeson & Montana, 2022) ──
+            # Decadimento esponenziale di lambda dopo i 15k step di warm-up.
+            # Transizione da lambda=2.5 a lambda=0.25 su un orizzonte di 100k step.
+            if global_step <= 15000:
+                lambda_val = 2.5
+            else:
+                progress = min(1.0, (global_step - 15000) / 100000.0)
+                lambda_val = 2.5 * (0.1 ** progress)
+
             Q_abs_mean = q1_pi.abs().mean().detach().clamp(min=1e-5)
             dynamic_alpha = lambda_val / Q_abs_mean
             
@@ -469,7 +472,7 @@ def train():
 
     # ── Inizializzazione Agent ──
     agent = TD3BCAgent()
-    agent.bc_policy.load_bc_weights(args.bc_weights)  # Carica il maestro umano congelato
+    agent.actor.load_bc_weights(args.bc_weights)  # Carica il backbone dal modello BC
     checkpoint_path = 'train_set/checkpoints/td3_checkpoint.pth'
     start_episode, global_step = agent.load_checkpoint(checkpoint_path, memory, elite_memory)
 
