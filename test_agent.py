@@ -270,8 +270,11 @@ def load_best_weights(model, weights_arg, device):
     """Carica i migliori pesi disponibili con auto-detect del formato.
 
     Priorità (se --weights non è specificato):
-      1. td3_best_eval.pth (pesi TD3 deterministici)
-      2. bc_policy.pth     (fallback supervisionato)
+      1. td3_best_eval.pth (miglior checkpoint deterministico TD3)
+      2. td3_best_lap.pth  (record sul giro TD3)
+      3. td3_best_dist.pth (record di distanza TD3)
+      4. td3_policy.pth    (ultimo step TD3)
+      5. bc_policy.pth     (fallback supervisionato)
 
     Se --weights è specificato, usa quello direttamente.
 
@@ -320,17 +323,27 @@ def load_best_weights(model, weights_arg, device):
     except Exception:
         state_dict = torch.load(load_path, map_location=device, weights_only=False)
 
-    # Determina se sono pesi RL (contengono log_std_head) o BC (non lo contengono)
+    # strict=True solo se il file contiene già log_std_head (evita errori sui BC puliti)
     has_log_std = any('log_std_head' in k for k in state_dict.keys())
-
-    # Carica con strict=False per gestire la chiave mancante log_std_head nei pesi BC
     model.load_state_dict(state_dict, strict=has_log_std)
     model.eval()
 
-    weight_type = "RL (TD3)" if has_log_std else "BC"
+    # BC vs RL NON si decide dalla presenza di log_std_head: sia i vecchi
+    # checkpoint BC (legacy) sia gli Actor TD3 possono contenerla. La differenza
+    # vera è la mappatura delle azioni (RL: tanh→[0,1]; BC: sigmoid). La si
+    # determina dal nome del file, con la presenza di log_std come fallback.
+    fname = os.path.basename(load_path).lower()
+    if 'td3' in fname or 'sac' in fname:
+        is_rl = True
+    elif 'bc' in fname:
+        is_rl = False
+    else:
+        is_rl = has_log_std
+
+    weight_type = "RL (TD3)" if is_rl else "BC"
     print(f"  ✅ Pesi [{weight_type}] caricati da: {load_path}")
 
-    return model, has_log_std
+    return model, is_rl
 
 
 # ──────────────────────────────────────────────────────────────────────

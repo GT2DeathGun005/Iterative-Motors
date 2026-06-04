@@ -41,6 +41,38 @@ import math
 
 
 # ──────────────────────────────────────────────────────────────────────
+#  Corner Emphasis (Idea #1) — oversampling pesato per zona del tracciato
+# ──────────────────────────────────────────────────────────────────────
+# I campioni la cui posizione (distFromStart in metri) cade in una zona
+# ricevono un peso maggiore nella loss BC, per rinforzare manovre critiche.
+# Bersaglio attuale: staccata + tornante stretto ~680-810m, dove l'agente
+# arriva troppo veloce e esce di pista (trackPos +1.5).
+# NB: la posizione è SOLO un'etichetta per pesare — NON entra nella rete (resta 29D).
+# Zona staccata stretta (680-715m: l'umano frena 62-80% qui) col peso più alto,
+# + zona curva-sterzo (715-810m) con peso lieve per la linea.
+CORNER_EMPHASIS_ZONES = [(675.0, 720.0, 6.0), (720.0, 810.0, 2.0)]  # (start_m, end_m, peso)
+DIST_NORM_DIVISOR = 4012.0  # backup col[29] normalizzato: metri = col * D (track ~3619m)
+
+
+def _lap_positions(file_path, states_tensor):
+    """Posizione (distFromStart, metri) per ogni step del giro.
+
+    Preferisce il backup 30D (dataset_backup/.../<nome>) se presente e allineato
+    per numero di step; altrimenti ritorna None (nessuna enfasi, peso uniforme).
+    """
+    base = os.path.basename(file_path)
+    for c in glob.glob(os.path.join('dataset_backup', '**', base), recursive=True):
+        try:
+            with h5py.File(c, 'r') as h:
+                bs = h['states'][:]
+            if bs.shape[1] >= 30 and bs.shape[0] == states_tensor.shape[0]:
+                return bs[:, 29].astype(np.float32) * DIST_NORM_DIVISOR
+        except Exception:
+            pass
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────
 #  Dataset HDF5
 # ──────────────────────────────────────────────────────────────────────
 
@@ -91,6 +123,14 @@ class TorcsHDF5Dataset(Dataset):
 
         self.length = self.states.shape[0]
 
+        # ── Corner Emphasis: peso per campione in base alla posizione sul tracciato ──
+        w = np.ones(self.length, dtype=np.float32)
+        pos = _lap_positions(file_path, self.states)
+        if pos is not None:
+            for (a, b, wz) in CORNER_EMPHASIS_ZONES:
+                w[(pos >= a) & (pos <= b)] = wz
+        self.weight = torch.tensor(w, dtype=torch.float32)
+
     def __len__(self) -> int:
         return self.length
 
@@ -104,7 +144,7 @@ class TorcsHDF5Dataset(Dataset):
             self.states[idx_t6],
             self.states[idx]
         ])
-        return stacked, self.actions[idx]
+        return stacked, self.actions[idx], self.weight[idx]
 
 
 def load_dataset(path: str) -> Dataset:
@@ -241,47 +281,55 @@ class BehaviorCloningTrainer:
 
         print(f"  Dataset split: {train_size} train / {val_size} val")
 
-    def _combined_loss(self, pred_continuous, pred_gear_logits, target_actions):
+    def _combined_loss(self, pred_continuous, pred_gear_logits, target_actions, sample_weight=None):
         # target_actions ha dimensione: [batch_size, 4]
         # [0] steer, [1] accel, [2] brake, [3] gear (float)
-        
+
         # 1. Loss Continua (Weighted MSE)
         targets_cont = target_actions[:, 0:3]
         sq_error = (pred_continuous - targets_cont) ** 2
-        
+
         # Pesi per canale continuo: [steer, accel, brake]
         channel_weights = torch.tensor([1.0, 1.0, 5.0], device=pred_continuous.device)
-        
+
         # Boost freno dinamico: se l'umano frena (target > 0.05), aumentiamo il peso del freno di 25x!
         brake_target = targets_cont[:, 2]
         brake_boost = 1.0 + 24.0 * (brake_target > 0.05).float()
-        
+
         # Boost sterzo in curva (3x)
         steer_target = targets_cont[:, 0].abs()
         is_curve = (steer_target > self.STEER_CURVE_THRESHOLD).float()
         steer_boost = 1.0 + 2.0 * is_curve  # 1x rettilineo, 3x curva
-        
+
         weighted_sq = sq_error * channel_weights.unsqueeze(0)
         weighted_sq[:, 0] = weighted_sq[:, 0] * steer_boost
         weighted_sq[:, 2] = weighted_sq[:, 2] * brake_boost
-        loss_cont = weighted_sq.mean()
-        
-        # 2. Loss Discreta (CrossEntropy per il Gear)
+        cont_ps = weighted_sq.mean(dim=1)  # loss continua per-campione [B]
+
+        # 2. Loss Discreta (CrossEntropy per il Gear), per-campione
         # Il target della marcia deve essere di tipo Long per CrossEntropy
         targets_gear = target_actions[:, 3].long()
-        loss_gear = nn.functional.cross_entropy(pred_gear_logits, targets_gear)
-        
+        gear_ps = nn.functional.cross_entropy(pred_gear_logits, targets_gear, reduction='none')  # [B]
+
         # Combinazione bilanciata: la CrossEntropy ha un peso di 2.0 per allinearsi alla scala del MSE
-        total_loss = loss_cont + 2.0 * loss_gear
+        per_sample = cont_ps + 2.0 * gear_ps
+
+        # Corner Emphasis: media pesata per campione (con sample_weight=1 ovunque
+        # coincide esattamente con la media semplice → scala/val-loss invariati).
+        if sample_weight is not None:
+            total_loss = (per_sample * sample_weight).sum() / sample_weight.sum().clamp(min=1e-6)
+        else:
+            total_loss = per_sample.mean()
         return total_loss
 
     def train_epoch(self) -> float:
         self.model.train()
         total_loss = 0.0
 
-        for states, targets in self.train_loader:
+        for states, targets, weights in self.train_loader:
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
+            weights = weights.to(self.device, non_blocking=True)
 
             # Reshape temporaneo per applicare l'augmentation su ciascuno dei 3 frame in modo coerente
             batch_size = states.size(0)
@@ -304,6 +352,16 @@ class BehaviorCloningTrainer:
             # alla pista — un errore composto tipico del covariate shift.
             delta_angle = torch.randn(batch_size, device=states.device) * 0.04
             delta_angle = torch.clamp(delta_angle, -0.08, 0.08)
+
+            # --- Gating dell'augmentation (50%) ---
+            # Bojarski AGGIUNGE traiettorie di recupero, non sostituisce i dati
+            # puliti: applicando la perturbazione a OGNI campione la rete non
+            # vede mai lo stato ideale (delta=0) e perde fedeltà sulla linea
+            # ottimale (steer wandering). Azzeriamo le perturbazioni su ~50%
+            # del batch: metà impara la guida precisa, metà il recupero OOD.
+            aug_mask = (torch.rand(batch_size, device=states.device) < 0.5).float()
+            delta_pos = delta_pos * aug_mask
+            delta_angle = delta_angle * aug_mask
 
             for f_idx in range(3):
                 frame_states = states[:, f_idx, :]
@@ -388,7 +446,7 @@ class BehaviorCloningTrainer:
 
             self.optimizer.zero_grad()
             pred_cont, pred_gear = self.model(states)
-            loss = self._combined_loss(pred_cont, pred_gear, targets)
+            loss = self._combined_loss(pred_cont, pred_gear, targets, sample_weight=weights)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
@@ -402,10 +460,11 @@ class BehaviorCloningTrainer:
         self.model.eval()
         total_loss = 0.0
 
-        for states, targets in self.val_loader:
+        for states, targets, _weights in self.val_loader:
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
+            # Val-loss uniforme (sample_weight=None) per restare comparabile tra run
             pred_cont, pred_gear = self.model(states)
             loss = self._combined_loss(pred_cont, pred_gear, targets)
             total_loss += loss.item()
@@ -491,7 +550,7 @@ def main():
     dataset, total_samples = load_dataset(args.dataset)
 
     # ── Rileva dimensioni ──
-    sample_state, sample_action = dataset[0]
+    sample_state, sample_action, _sample_w = dataset[0]
     state_dim = sample_state.shape[0]
     print(f"  Dimensioni: state={state_dim}, action_dim=4 (steer, accel, brake, gear)")
 

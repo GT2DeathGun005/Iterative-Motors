@@ -21,3 +21,6 @@ telemetry/**
 !telemetry/**/.gitkeep
 
 dataset_backup/**
+
+# Note di lavoro locali (non tracciate)
+todo.md

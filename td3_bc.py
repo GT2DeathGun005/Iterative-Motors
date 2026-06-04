@@ -396,13 +396,17 @@ class TD3BCAgent:
             Q_abs_mean = q1_pi.abs().mean().detach().clamp(min=1e-5)
             dynamic_alpha = lambda_val / Q_abs_mean
 
-            # Decadimento esponenziale applicato ESCLUSIVAMENTE al peso della BC Penalty.
-            # Da 1.0 (forte imitazione per warm-up) scende a 0.1 (RL dominante) su 100k step.
+            # Decadimento esponenziale del peso della BC Penalty con FLOOR permanente.
+            # Da 1.0 (warm-up) scende asintoticamente a 0.5 su 200k step, SENZA mai
+            # azzerare l'ancora. Motivazione empirica: nei run precedenti la policy
+            # regrediva proprio quando bc_weight scendeva sotto ~0.4 (termine RL -2.5
+            # che domina su una BC penalty applicata solo al ~25% di campioni expert).
+            # Il floor a 0.5 realizza la "Permanent BC Adherence" del Residual RL.
             if global_step <= 15000:
                 bc_weight = 1.0
             else:
-                progress = min(1.0, (global_step - 15000) / 100000.0)
-                bc_weight = 1.0 * (0.1 ** progress)
+                progress = min(1.0, (global_step - 15000) / 200000.0)
+                bc_weight = 0.5 + 0.5 * (0.1 ** progress)
 
             total_actor_loss = dynamic_alpha * actor_loss_td3 + (bc_weight * bc_penalty)
 
@@ -565,6 +569,15 @@ def train():
         termination_reason = "TIMEOUT"
         new_record = False
 
+        # Vincolo sequenziale del gear (±1 per step): identico a test_agent.py.
+        # Garantisce che la dinamica del cambio in training/eval coincida con
+        # quella di deployment, rendendo i checkpoint (best_lap/best_eval)
+        # esattamente riproducibili in inferenza.
+        current_gear = 1
+        # Rilevamento robusto del completamento giro: confrontiamo lastLapTime
+        # con il valore iniziale invece di assumere che il relaunch lo azzeri.
+        prev_last_lap = float(np.array(ob.get('lastLapTime', 0.0)).flat[0])
+
         while True:
             agent.actor.eval()
             cont_action, raw_gear = agent.select_action(stacked_state, evaluate=False)
@@ -575,7 +588,14 @@ def train():
             # preserva la simmetria del tanh per la backpropagation.
             env_action = np.zeros(4)
             env_action[0:3] = cont_action
-            env_action[3] = max(1, min(6, raw_gear))  # Marcia: clamp a [1,6]
+            # Vincolo sequenziale ±1 sul gear (coerente con test_agent.py)
+            predicted_gear = raw_gear
+            if predicted_gear > current_gear + 1:
+                predicted_gear = current_gear + 1
+            elif predicted_gear < current_gear - 1:
+                predicted_gear = current_gear - 1
+            current_gear = max(1, min(6, predicted_gear))
+            env_action[3] = current_gear
             
             torcs_action = env_action.copy()
             torcs_action[1] = np.clip((torcs_action[1] + 1.0) / 2.0, 0.0, 1.0)  # accel: [-1,1] → [0,1]
@@ -593,7 +613,7 @@ def train():
             max_dist = max(max_dist, current_dist)
 
             done = False
-            if last_lap_time > 0.0 and step > 500:
+            if last_lap_time > 0.0 and abs(last_lap_time - prev_last_lap) > 0.01 and step > 500:
                 done, termination_reason = True, "SUCCESS"
                 reward += 50.0
                 if last_lap_time < best_lap_time:
@@ -665,6 +685,7 @@ def train():
             eval_stack = deque([flatten_state(eval_ob)]*13, maxlen=13)
             eval_stacked = np.concatenate([eval_stack[0], eval_stack[6], eval_stack[12]])
             eval_dist, eval_step, eval_reward = 0.0, 0, 0.0
+            eval_current_gear = 1  # Vincolo sequenziale gear anche in eval
 
             agent.actor.eval()
             while eval_step < args.max_steps:
@@ -672,7 +693,13 @@ def train():
                 with torch.no_grad():
                     eval_action, eval_gear = agent.select_action(eval_stacked, evaluate=True)
                 eval_env = np.zeros(4)
-                eval_env[0:3], eval_env[3] = eval_action, max(1, min(6, eval_gear))
+                eval_pred_gear = eval_gear
+                if eval_pred_gear > eval_current_gear + 1:
+                    eval_pred_gear = eval_current_gear + 1
+                elif eval_pred_gear < eval_current_gear - 1:
+                    eval_pred_gear = eval_current_gear - 1
+                eval_current_gear = max(1, min(6, eval_pred_gear))
+                eval_env[0:3], eval_env[3] = eval_action, eval_current_gear
                 eval_env[1], eval_env[2] = np.clip((eval_env[1]+1)/2, 0, 1), np.clip((eval_env[2]+1)/2, 0, 1)
                 
                 # Mutual exclusion continua/moltiplicativa per EVAL

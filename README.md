@@ -15,7 +15,7 @@ Questa fase RL sfrutta la tecnica del **Warm-Start** e il **Gradient Freezing**:
 ### Punti di forza della pipeline Ibrida BC-RL:
 1. **Sample Efficiency**: Il BC fornisce un ottimo punto di partenza, abbattendo drasticamente i tempi di esplorazione del RL.
 2. **Prevenzione del Latent Shift**: Il backbone e il cambio marce rimangono quelli perfetti del BC. Il RL affina unicamente sterzo, acceleratore e freno.
-3. **Determinismo Assoluto**: La policy finale, e l'inferenza, godono di seed statici e reset fisici per una riproducibilità matematica esatta.
+3. **Determinismo della Policy**: La policy di inferenza è rigorosamente deterministica (output `tanh(mean)` senza rumore, `LayerNorm` indipendente dal batch, nessun dropout, seed fissati). L'**ambiente** TORCS, comunicando via UDP real-time con relaunch ad ogni episodio, è *near-deterministico* (stessa griglia di partenza, ma soggetto a jitter di timing): la riproducibilità è praticamente alta ma **non bit-esatta**.
 
 ---
 
@@ -141,7 +141,9 @@ Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per preve
 
 ### 4. Test Deterministico (Inference)
 
-Il test agent auto-rileva i migliori pesi disponibili: `td3_best_eval.pth` → `td3_best_lap.pth` → `td3_best_dist.pth` → `td3_policy.pth` → `sac_best_eval.pth` → `bc_policy.pth`.
+Il test agent auto-rileva i migliori pesi disponibili: `td3_best_eval.pth` → `td3_best_lap.pth` → `td3_best_dist.pth` → `td3_policy.pth` → `bc_policy.pth`.
+
+> ⚠️ **BC vs RL — rilevamento per nome file**: la mappatura azioni (RL: `tanh→[0,1]`; BC: `sigmoid`) viene scelta in base al **nome del file** (`td3_*`/`sac_*` = RL, `bc_*` = BC), **non** dalla presenza di `log_std_head` (che i vecchi checkpoint BC possono contenere). Caricare un BC come se fosse RL applicherebbe la de-normalizzazione sbagliata su gas/freno.
 
 ```bash
 # Esecuzione standard con bypass Xvfb (visibile a schermo)
@@ -181,7 +183,7 @@ Durante il training RL, il log stampa metriche fondamentali per diagnosticare la
 
 ### 3. Dinamiche TD3+BC (Decay di Lambda)
 * In TD3+BC l'entropia del SAC è rimossa, l'agente è completamente deterministico.
-* **Lambda Decay:** La forza dell'imitazione (parametro $\lambda$) decae esponenzialmente da `2.5` a `0.25` durante i primi 115k step (inclusi 15k di warm-up). Questo permette un transito stabile da *Behavioral Cloning* (imitazione forte) a *Reinforcement Learning* puro (massimizzazione reward).
+* **BC Weight Decay (con floor):** $\lambda$ resta **fisso a `2.5`** (normalizzazione di Fujimoto & Gu, 2021). A decadere è il **peso della BC Penalty** $w_{BC}$, da `1.0` verso un **floor permanente di `0.5`** sui 200k step successivi ai 15k di warm-up — **non scende mai a zero** (Permanent BC Adherence). Motivazione: la BC penalty agisce solo sul ~25% di campioni expert mentre il termine Q agisce su tutto il batch; un floor alto evita che l'ancora venga sopraffatta e che la policy regredisca (osservato nei run con floor 0.1).
 
 ---
 
@@ -275,8 +277,18 @@ Registrare **5-10 giri aggiuntivi** con:
 2. **Correzioni in Rettilineo**: Oscillare dolcemente a destra e sinistra
 3. **Ingressi Curva Alternativi**: Inserimenti larghi a velocità sub-ottimali
 
-### Bojarski-Style Recovery Augmentation
-Il training BC include perturbazione laterale dello stato (`trackPos ±0.4`) e angolare (`angle ±0.08 rad`) con correzione proporzionale dello sterzo e del freno target, implementando una legge di controllo autocentrante neurale avanzata.
+### Bojarski-Style Recovery Augmentation (con gating 50%)
+Il training BC include perturbazione laterale dello stato (`trackPos ±0.4`) e angolare (`angle ±0.08 rad`) con correzione proporzionale dello sterzo e del freno target. **La perturbazione è applicata solo al 50% di ogni batch** (gating per-campione): l'altra metà resta pulita, così la rete impara *sia* la guida precisa sulla linea ideale *sia* il recupero da stati OOD. Senza il gating (perturbazione al 100%) la fedeltà di sterzo degradava (steer MAE 0.116 → 0.062 col gating).
+
+### Corner Emphasis — Oversampling Pesato per Posizione
+Per rinforzare un settore critico (es. una staccata dove l'agente esce sempre di pista) senza nuovi dati, il BC pesa di più i campioni in **intervalli di `distFromStart`** (la curva si identifica per *posizione*, non per tempo). Config in `behavioral_cloning.py`:
+
+```python
+CORNER_EMPHASIS_ZONES = [(675.0, 720.0, 6.0),   # staccata → peso 6× (frenata)
+                         (720.0, 810.0, 2.0)]    # tornante → peso 2× (linea)
+```
+
+La posizione esatta viene letta dal **backup 30D** (`dataset_backup/laps/`, col 29), allineato per indice ai giri 29D; fallback uniforme per i giri senza backup. ⚠️ `distFromStart` è **solo un'etichetta di pesatura**: NON entra nella rete, che resta **29D**.
 
 ---
 
