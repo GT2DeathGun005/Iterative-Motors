@@ -55,7 +55,7 @@ Se l'auto esce di pista (`|trackPos| > 1.5`), si schianta, o va in stallo, l'epi
 L'integrazione di una BC Penalty in un algoritmo RL ad alta frequenza (50Hz) richiede una calibrazione millimetrica per evitare che una forza matematica sopprima l'altra.
 - **Gamma = 0.999 (Orizzonte Lungo)**: Aumentato dallo standard `0.99` per estendere la visione del Critic a 1000 step (20 secondi). Senza questo orizzonte lungo, l'agente non "vedeva" in tempo le curve ad alta velocità.
 - **Reward Scale = 0.002**: L'aumento del Gamma decuplica la magnitudo dei Q-Values. Riducendo lo scaling si compensa l'effetto e si evitano gradienti esplosivi.
-- **Dynamic Alpha Normalization**: Il gradiente RL è bilanciato dalla formula $\alpha = \frac{\lambda}{\frac{1}{N} \sum |Q|}$. Nel paper originale si usa $\lambda = 2.5$, ma noi lo abbiamo ridotto a **`0.1`**. Questa drastica riduzione è essenziale nell'Offline-to-Online fine-tuning per impedire che l'Actor riceva gradienti RL 25 volte più forti della `BC_Penalty`, prevenendo il collasso immediato della policy di imitazione. L'invarianza allo scale è comunque mantenuta.
+- **Dynamic Alpha Normalization con Relaxed Constraint**: Il gradiente RL è bilanciato dalla formula $\alpha = \frac{\lambda}{\frac{1}{N} \sum |Q|}$. Il parametro $\lambda$ parte da `2.5` (forte imitazione) e decae esponenzialmente fino a `0.25` su 100k step post-warm-up (Beeson & Montana, 2022). L'invarianza allo scale è comunque mantenuta.
 - **Bonus Completamento Giro (+50.0)**: Quando l'agente completa un giro, riceve un bonus di `+50.0` reward. Senza questo segnale esplicito, il Critic non distingue "stava andando bene prima del crash" da "ha completato il circuito".
 
 ### D. Ambiente Esplorativo (Anti-Stall Relaxed)
@@ -95,8 +95,8 @@ Il TD3 esplora naturalmente stati off-distribution. Grazie all'implementazione d
 ## 8. Multimodal Averaging & Permanent BC Adherence (Residual RL)
 Il dataset umano originale del Behavioral Cloning (BC) contiene intrinsecamente traiettorie eterogenee (es. stringere in una curva al giro 1, allargare al giro 2). Quando una rete neurale impara da questi dati minimizzando il Mean Squared Error (MSE), tende ad apprendere la **media matematica** delle manovre. In curve complesse, questo porta spesso al **Multimodal Averaging** (un comportamento indeciso).
 
-Per ovviare a questo problema senza far deragliare l'agente (Extrapolation Error), l'architettura implementa una strategia di **Residual Reinforcement Learning**:
-- **Dynamic Alpha Normalization**: Il peso della BC Penalty si calibra dinamicamente sui Q-value del Critic. L'Actor non diventa mai un agente RL puro — rimane un "imitatore guidato" che usa i Q-Value solo come piccole correzioni (Residuals). Questo previene l'oscuramento della loss imitativa (Catastrophic Forgetting) causato dall'aumento naturale dei Q-value nel training prolungato.
+Per ovviare a questo problema senza far deragliare l'agente (Extrapolation Error), l'architettura implementa una strategia di **Residual Reinforcement Learning con Relaxed Constraint**:
+- **Dynamic Alpha Normalization con Decay**: Il peso della BC Penalty si calibra dinamicamente sui Q-value del Critic. Grazie al Masking Rigoroso e al decadimento esponenziale di $\lambda$ (da 2.5 a 0.25), l'Actor parte come "imitatore guidato" e transita gradualmente verso l'ottimizzazione RL pura sugli stati esplorativi, mantenendo solo un ancoraggio leggero sui dati expert.
 - **Learning Rate Mirato**: L'Actor viene addestrato con un Learning Rate standard di `3e-4`, ma agisce solo ed esclusivamente sul `continuous_head`, lasciando il resto della rete congelato per proteggere i pesi calibrati.
 
 ## 9. Elite Buffer e Self-Imitation Learning (Episodic Prioritization)
@@ -107,7 +107,7 @@ Per mitigare la *Sample Inefficiency* e il *Catastrophic Forgetting* intrinseco 
 - **Hybrid Sampling (Generalization Balance)**: Durante il training, il TD3 estrae il 75% del minibatch dal buffer standard e il 25% dall'Elite Buffer. Sebbene in passato si sia tentato un "Extreme Optimism" (85% Elite), questo portava a un forte **overfitting** sui singoli stati esatti dei record. Poiché la rete aggiunge un rumore Gaussiano esplorativo, l'auto si troverà sempre in stati "sporchi" leggermente diversi dalla traiettoria perfetta. Il 75% di Standard Buffer (con la BC_Penalty ancorata al maestro umano) è vitale per insegnare all'agente a **generalizzare** e recuperare la traiettoria quando si verifica una deviazione stocastica.
 - **Isolamento Dati**: Per mantenere pulita la directory dei checkpoint, entrambi i buffer (principale e elite) vengono serializzati in formato `.npz` e memorizzati in una sottocartella dedicata `train_set/checkpoints/buffers/`.
 
-## 10. Prevenzione del Collasso (Frozen BC Anchor e Causal Confusion)
+## 10. Prevenzione del Collasso (Masking Rigoroso e Causal Confusion)
 Durante l'addestramento ibrido, l'architettura risolve due problematiche critiche intrinseche al Self-Imitation Learning:
 
 1. **Masking Rigoroso per Prevenire il Covariate Shift**: 
@@ -117,7 +117,7 @@ Durante l'addestramento ibrido, l'architettura risolve due problematiche critich
 
 2. **Terminal State Mimicry (Sgancio Pre-Schianto)**: 
    Quando un episodio record (salvato nell'Elite Buffer) termina con uno schianto, le ultime azioni sono la causa diretta del fallimento. Forzare l'Actor a imitarle (tramite Self-Imitation) indurrebbe una *Causal Confusion*. 
-   Il sistema risolve questo paradosso azzerando la maschera di imitazione (`expert=0.0`) negli ultimi 50 step (esattamente 1 secondo a 50Hz) di un record schiantato. In quella "finestra di evasione", l'agente smette di imitare il suo vecchio errore e torna istantaneamente sotto l'influenza del Reinforcement Learning puro e del Frozen BC Anchor, riuscendo così a frenare e a sopravvivere per estendere ulteriormente il record.
+   Il sistema risolve questo paradosso azzerando la maschera di imitazione (`expert=0.0`) negli ultimi 50 step (esattamente 1 secondo a 50Hz) di un record schiantato. In quella "finestra di evasione", l'agente smette di imitare il suo vecchio errore e torna istantaneamente sotto l'influenza del Reinforcement Learning puro, riuscendo così a frenare e a sopravvivere per estendere ulteriormente il record.
 
 ## 11. Evaluation Periodica Deterministica
 Ogni 5 episodi di training, il sistema esegue automaticamente un **episodio di valutazione deterministica** (`evaluate=True`, zero rumore). Se la distanza percorsa o il tempo sul giro migliorano, il checkpoint viene salvato come `td3_best_eval.pth`. Questo garantisce che il checkpoint usato per la presentazione video sia sempre la policy migliore *riproducibile* — non quella del miglior episodio esplorativo (che potrebbe essere un outlier fortunato con rumore stocastico).

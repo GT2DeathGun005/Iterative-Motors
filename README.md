@@ -211,7 +211,7 @@ Actor (Warm-Start da BC)                    Critic (Twin Q-Network, da zero)
 
 **Gradient Freezing:** Il backbone e la gear_head hanno `requires_grad=False`. L'ottimizzatore aggiorna SOLO `continuous_head` (LR=3e-4). La `log_std_head` è mantenuta con `requires_grad=False` per retro-compatibilità, ma è completamente isolata dal training TD3.
 
-**Critic Warm-Up:** I primi 5000 step aggiornano solo il Critic. Questo protegge i pesi BC dai gradienti randomici di un Critic non ancora calibrato.
+**Critic Warm-Up (15.000 step):** I primi 15.000 step aggiornano solo il Critic. Questo protegge i pesi BC dai gradienti randomici di un Critic non ancora calibrato.
 
 **Update Frequency 1:4:** L'aggiornamento avviene ogni 4 step, non ad ogni step. Riduce l'overfitting su transizioni correlate.
 

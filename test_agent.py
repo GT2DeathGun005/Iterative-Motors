@@ -1,7 +1,7 @@
 """
-Test Agent — Guida Autonoma su TORCS (Compatibile BC + RL)
+Test Agent — Guida Autonoma su TORCS (Compatibile BC + TD3)
 
-Carica i pesi del modello (BC o TD3/SAC) e fa guidare l'agente in modalità
+Carica i pesi del modello (BC o TD3) e fa guidare l'agente in modalità
 rigorosamente deterministica.
 
 La classe BCActor è compatibile con entrambi i formati:
@@ -9,10 +9,12 @@ La classe BCActor è compatibile con entrambi i formati:
   - td3_policy.pth (con log_std_head)   — caricato con strict=True
 
 Priorità di caricamento automatica:
-  1. td3_policy.pth  (se esiste e --weights non è specificato)
-  2. sac_policy.pth  (fallback RL legacy)
-  3. bc_policy.pth   (fallback supervisionato)
-  4. --weights path   (override esplicito)
+  1. td3_best_eval.pth   (miglior checkpoint deterministico TD3)
+  2. td3_best_policy.pth (record sul giro TD3)
+  3. td3_best_dist.pth   (record di distanza TD3)
+  4. td3_policy.pth      (ultimo step TD3)
+  5. bc_policy.pth       (fallback supervisionato)
+  6. --weights path      (override esplicito)
 
 Determinismo:
   - Seeding globale (torch, numpy, random) a 42
@@ -57,11 +59,11 @@ os.environ['PYTHONHASHSEED'] = str(SEED)
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  BCActor — Rete compatibile con BC e SAC
+#  BCActor — Rete compatibile con BC e TD3
 # ──────────────────────────────────────────────────────────────────────
 
 class BCActor(nn.Module):
-    """Actor ibrido BC-RL con architettura identica all'Actor TD3/SAC.
+    """Actor ibrido BC-RL con architettura identica all'Actor TD3.
 
     Include log_std_head per compatibilità con vecchi pesi.
     In modalità evaluate=True (usata per il test), la log_std_head
@@ -268,8 +270,8 @@ def load_best_weights(model, weights_arg, device):
     """Carica i migliori pesi disponibili con auto-detect del formato.
 
     Priorità (se --weights non è specificato):
-      1. td3_best_eval.pth (pesi TD3/RL deterministici)
-      2. sac_policy.pth  (fallback)
+      1. td3_best_eval.pth (pesi TD3 deterministici)
+      2. bc_policy.pth     (fallback supervisionato)
 
     Se --weights è specificato, usa quello direttamente.
 
@@ -283,10 +285,7 @@ def load_best_weights(model, weights_arg, device):
     td3_best_dist_path = os.path.join(checkpoint_dir, 'td3_best_dist.pth')
     td3_path = os.path.join(checkpoint_dir, 'td3_policy.pth')
 
-    sac_best_eval_path = os.path.join(checkpoint_dir, 'sac_best_eval.pth')
-    sac_best_lap_path = os.path.join(checkpoint_dir, 'sac_best_policy.pth')
-    sac_best_dist_path = os.path.join(checkpoint_dir, 'sac_best_dist.pth')
-    sac_path = os.path.join(checkpoint_dir, 'sac_policy.pth')
+
     bc_path = os.path.join(checkpoint_dir, 'bc_policy.pth')
 
     # Se l'utente ha specificato un path esplicito, usalo
@@ -304,18 +303,7 @@ def load_best_weights(model, weights_arg, device):
     elif os.path.exists(td3_path):
         load_path = td3_path
         print(f"  🔍 Auto-detect: trovato td3_policy.pth (Ultimo step TD3)")
-    elif os.path.exists(sac_best_eval_path):
-        load_path = sac_best_eval_path
-        print(f"  🔍 Auto-detect: trovato sac_best_eval.pth (Miglior checkpoint deterministico SAC!)")
-    elif os.path.exists(sac_best_lap_path):
-        load_path = sac_best_lap_path
-        print(f"  🔍 Auto-detect: trovato sac_best_policy.pth (Record sul giro SAC!)")
-    elif os.path.exists(sac_best_dist_path):
-        load_path = sac_best_dist_path
-        print(f"  🔍 Auto-detect: trovato sac_best_dist.pth (Record di distanza SAC!)")
-    elif os.path.exists(sac_path):
-        load_path = sac_path
-        print(f"  🔍 Auto-detect: trovato sac_policy.pth (Ultimo step SAC)")
+
     elif os.path.exists(bc_path):
         load_path = bc_path
         print(f"  🔍 Auto-detect: fallback su bc_policy.pth")
@@ -339,7 +327,7 @@ def load_best_weights(model, weights_arg, device):
     model.load_state_dict(state_dict, strict=has_log_std)
     model.eval()
 
-    weight_type = "RL (TD3/SAC)" if has_log_std else "BC"
+    weight_type = "RL (TD3)" if has_log_std else "BC"
     print(f"  ✅ Pesi [{weight_type}] caricati da: {load_path}")
 
     return model, has_log_std
@@ -350,7 +338,7 @@ def load_best_weights(model, weights_arg, device):
 # ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Test Agent Autonomo (BC/RL) — TORCS")
+    parser = argparse.ArgumentParser(description="Test Agent Autonomo (BC/TD3) — TORCS")
     parser.add_argument("--weights", type=str, default=None,
                         help="Path ai pesi del modello (.pth). Se omesso, auto-detect.")
     parser.add_argument("--laps", type=int, default=3,
@@ -362,7 +350,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"\n{'=' * 64}")
-    print(f"  🏁 TEST AGENTE AUTONOMO (BC/RL) — TORCS")
+    print(f"  🏁 TEST AGENTE AUTONOMO (BC/TD3) — TORCS")
     print(f"  Device: {device}")
     print(f"  Stride Type: static (k=6, 0.24s)")
     print(f"  🎯 Modalità: DETERMINISTICA (evaluate=True, Zero Noise)")
