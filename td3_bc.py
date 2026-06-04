@@ -599,7 +599,7 @@ def train():
         agent.save_checkpoint(checkpoint_path, episode + 1, global_step, memory, elite_memory)
         torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_policy.pth')
 
-        if (episode + 1) % 5 == 0:
+        if (episode + 1) % 5 == 0 and global_step > 15000:
             print(f"\n  🔍 [EVAL] Valutazione deterministica...")
             eval_ob = env.reset(relaunch=True)
             eval_stack = deque([flatten_state(eval_ob)]*13, maxlen=13)
