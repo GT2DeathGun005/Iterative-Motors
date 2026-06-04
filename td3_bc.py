@@ -362,14 +362,10 @@ class TD3BCAgent:
             # Componente RL: l'Actor massimizza il Q-Value stimato dal Critic
             actor_loss_td3 = -q1_pi.mean()
             
-            # ── BC Penalty (Masking Rigoroso: Solo su stati Expert) ──
-            # Per i campioni con expert_mask=1.0 (elite buffer + expert data),
-            # il target è l'azione empirica registrata nel buffer.
-            # Per i campioni con expert_mask=0.0 (esplorazione online),
-            # la BC Penalty è azzerata: l'agente è libero di imparare manovre
-            # di recupero tramite il solo gradiente RL.
-            # Questo risolve il bug OOD: la bc_policy congelata non viene più
-            # consultata per stati fuori distribuzione.
+            # ── BC Penalty (Masking Rigoroso: Solo su sotto-batch Expert) ──
+            # Isola i campioni esperti nel batch per evitare la diluizione della loss.
+            # La BC penalty è calcolata esclusivamente su questi campioni, garantendo
+            # un corretto ancoraggio al comportamento umano indipendentemente dalla quota di campioni online.
             det_steer = pi[:, 0]
             det_accel = (pi[:, 1] + 1.0) / 2.0
             det_brake = (pi[:, 2] + 1.0) / 2.0
@@ -377,19 +373,21 @@ class TD3BCAgent:
             target_accel = (action_b[:, 1] + 1.0) / 2.0
             target_brake = (action_b[:, 2] + 1.0) / 2.0
 
-            # Loss calcolata senza reduction per applicare il masking individuale
-            steer_loss = F.mse_loss(det_steer, target_steer, reduction='none')
-            accel_loss = F.mse_loss(det_accel, target_accel, reduction='none')
-            brake_loss = F.mse_loss(det_brake, target_brake, reduction='none')
-
-            # Loss direzionale di shape (batch_size,)
-            directional_loss = (steer_loss * 2.0 + accel_loss + brake_loss * 2.0) / 5.0
-            mutual_exclusion_penalty = (det_accel * det_brake).mean()
-
-            # MASKING: La mask (B, 1) viene appiattita a (B,) per il broadcasting.
-            # Il BC viene calcolato SOLO per i campioni con expert_mask == 1.0
             expert_mask_flat = expert_mask_b.squeeze(1)
-            bc_penalty = (directional_loss * expert_mask_flat).mean() + (mutual_exclusion_penalty * 0.1)
+            expert_indices = torch.where(expert_mask_flat > 0.5)[0]
+
+            if len(expert_indices) > 0:
+                steer_loss = F.mse_loss(det_steer[expert_indices], target_steer[expert_indices])
+                accel_loss = F.mse_loss(det_accel[expert_indices], target_accel[expert_indices])
+                brake_loss = F.mse_loss(det_brake[expert_indices], target_brake[expert_indices])
+                # Somma i contributi senza dividere per la somma dei pesi per mantenere
+                # la magnitudo corretta contro la costante lambda del paper.
+                bc_penalty = (steer_loss * 2.0 + accel_loss + brake_loss * 2.0)
+            else:
+                bc_penalty = torch.tensor(0.0, device=self.device)
+
+            mutual_exclusion_penalty = (det_accel * det_brake).mean()
+            bc_penalty = bc_penalty + (mutual_exclusion_penalty * 0.1)
 
             # ── Relaxed Policy Constraint (Beeson & Montana, 2022) ──
             # Decadimento esponenziale di lambda dopo i 15k step di warm-up.
