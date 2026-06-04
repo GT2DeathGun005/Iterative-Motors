@@ -9,6 +9,7 @@
 #    ./train_rl.sh                      # 1000 episodi (default)
 #    TD3_EPISODES=500 ./train_rl.sh     # Override episodi
 #    ./train_rl.sh --clean              # Riparte da zero (cancella checkpoint TD3)
+#    ./train_rl.sh --rollback           # Forza il rollback al miglior giro storico e lo congela per 10 ep
 #
 #  Per interrompere il training in sicurezza:
 #    Ctrl+C  oppure  ./stop_training.sh
@@ -61,6 +62,14 @@ if [[ "${1:-}" == "--clean" ]]; then
     log_ok "Checkpoint TD3 cancellati. Ripartenza pulita."
 fi
 
+# Filtra gli argomenti per python (rimuove --clean)
+PY_ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" != "--clean" ]]; then
+        PY_ARGS+=("$arg")
+    fi
+done
+
 # ── Pre-check ──
 log_phase "🧠  AIcar TD3+BC Training (Reinforcement Learning)"
 
@@ -112,7 +121,8 @@ python -u td3_bc.py \
     --bc_weights "$BC_WEIGHTS" \
     --episodes "$TD3_EPISODES" \
     --max_steps "$TD3_MAX_STEPS" \
-    --seed "$TD3_SEED"
+    --seed "$TD3_SEED" \
+    ${PY_ARGS[@]:+"${PY_ARGS[@]}"}
 
 if [[ $? -eq 0 ]] && [[ -f "$TD3_POLICY" ]]; then
     TD3_SIZE=$(du -h "$TD3_POLICY" | cut -f1)

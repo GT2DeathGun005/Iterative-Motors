@@ -478,6 +478,7 @@ def train():
     parser.add_argument('--episodes', type=int, default=1000)
     parser.add_argument('--max_steps', type=int, default=5000)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--rollback', action='store_true', help="Forza il rollback dell'Actor all'ultimo miglior giro storico e lo congela per 10 episodi")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -501,17 +502,22 @@ def train():
         agent.actor_target.load_state_dict(agent.actor.state_dict())
         memory.load_expert_data('train_set/laps', max_samples=50000)
     else:
-        # Rollback Actor: se esiste il miglior giro storico, forziamo l'Actor a ripartire da quello
-        best_lap_path = 'train_set/checkpoints/td3_best_lap.pth'
-        if os.path.exists(best_lap_path):
-            print(f"♻️  Rollback Actor: caricamento dei pesi del miglior giro storico da {best_lap_path}")
-            agent.actor.load_state_dict(torch.load(best_lap_path, map_location=agent.device))
-            agent.actor_target.load_state_dict(agent.actor.state_dict())
-            import torch.optim as optim
-            agent.actor_optimizer = optim.Adam(agent.actor.continuous_head.parameters(), lr=3e-4)
-            # Attiviamo il congelamento temporaneo dell'Actor post-rollback
-            agent.actor_frozen = True
-            print("🧊 Actor congelato temporaneamente per stabilizzazione post-rollback.")
+        # Rollback Actor: solo se esplicitamente richiesto da riga di comando
+        if args.rollback:
+            best_lap_path = 'train_set/checkpoints/td3_best_lap.pth'
+            if os.path.exists(best_lap_path):
+                print(f"♻️  Rollback Actor: caricamento dei pesi del miglior giro storico da {best_lap_path}")
+                agent.actor.load_state_dict(torch.load(best_lap_path, map_location=agent.device))
+                agent.actor_target.load_state_dict(agent.actor.state_dict())
+                import torch.optim as optim
+                agent.actor_optimizer = optim.Adam(agent.actor.continuous_head.parameters(), lr=3e-4)
+                # Attiviamo il congelamento temporaneo dell'Actor post-rollback
+                agent.actor_frozen = True
+                print("🧊 Actor congelato temporaneamente per stabilizzazione post-rollback.")
+            else:
+                print("⚠️  Rollback richiesto ma train_set/checkpoints/td3_best_lap.pth non trovato! Avvio ripresa normale.")
+        else:
+            print("▶️  Ripresa regolare dal checkpoint (nessun rollback o congelamento Actor).")
 
     os.makedirs('train_set/checkpoints', exist_ok=True)
     os.makedirs('train_set/session_logs', exist_ok=True)

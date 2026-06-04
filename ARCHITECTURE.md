@@ -20,6 +20,7 @@ La nostra implementazione cattura l'essenza matematica del TD3+BC, ma introduce 
 - **Loss di Imitazione Domain-Specific (Prevenzione della Diluizione)**: Invece del generico MSE su tutto il vettore d'azione, applichiamo una loss pesata (sterzo e freno pesati doppiamente) calcolata **esclusivamente sul sotto-batch di campioni esperti** per evitare la diluizione causata dall'inserimento di campioni online nel batch ibrido. Inoltre, la loss viene sommata direttamente (senza dividere per la somma dei pesi) per allineare l'intensità del gradiente BC con i coefficienti del paper originale, controbilanciando la costante $\lambda = 2.5$. Viene aggiunta una *Mutual Exclusion Penalty* per impedire il blocco simultaneo di freno e acceleratore.
 - **Compensazione dell'Attivazione per l'Inizializzazione (BC Weight Scaling)**: Per risolvere la discrepanza tra l'attivazione `Sigmoid` (usata nel BC per acceleratore e freno) e l'attivazione `Tanh` (usata nell'Actor del TD3), i pesi e i bias caricati da `bc_policy.pth` per i canali di accelerazione e freno vengono dimezzati (`0.5`) al caricamento. Questo compensa perfettamente la relazione algebrica $\frac{\tanh(0.5x)+1}{2} = \sigma(x)$, rendendo l'inizializzazione al warm-start matematicamente indistinguibile dal modello BC originale.
 - **Mutual Exclusion Fisica Unificata (Formula Moltiplicativa)**: Per ripristinare uno spazio d'azione liscio e differenziabile (evitando discontinuità a gradiente nullo/causal-confusion alla linea di partenza), abbiamo sostituito l'esclusione a soglia rigida con la formula moltiplicativa continua: $\text{accel}_{\text{final}} = \text{accel} \times (1.0 - \text{brake})$. Questa logica è unificata in `td3_bc.py` (training/eval) e `test_agent.py` (BC/RL), garantendo partenze senza stalli.
+
 ## 2. Critic (Twin Q-Network)
 Il Critic ha il compito di stimare il valore (Q-value) della coppia (Stato, Azione). Poiché il BC non usa una value-function, il Critic deve essere addestrato da zero.
 - **Architettura Twin**: Usa due reti Q indipendenti per mitigare l'Overestimation Bias tipico del Q-learning. Si prende il minimo tra le due stime durante l'aggiornamento dell'Actor.
@@ -150,10 +151,11 @@ La pipeline di training genera diversi file di checkpoint per scopi differenti, 
 - **`td3_checkpoint.pth`**: Contiene lo stato globale del training (ottimizzatori di Actor e Critic, contatori globali di step, record storici, ecc.) per supportare il ripristino sicuro (`--resume`) senza perdita di avanzamento.
 
 ## 15. Stabilizzazione del Critic e Prevenzione della Degradazione (Actor Freezing)
-Durante le sessioni di fine-tuning online o post-rollback della policy, l'agente può andare incontro a repentini collassi a causa del disallineamento temporaneo tra la policy dell'Actor (che viene caricata da uno stato ad alta prestazione come `td3_best_lap.pth`) e il valore Q stimato dal Critic (che può essere impreciso o calibrato su vecchie dinamiche).
+Durante le sessioni di fine-tuning online o post-rollback della policy, l'agente può andare incontro a repentini collassi a causa del disallineamento temporaneo tra la policy dell'Actor e il valore Q stimato dal Critic (che può essere impreciso o calibrato su vecchie dinamiche).
 
-Per prevenire questo fenomeno denominato *Critic Shock*, l'architettura implementa:
-- **Actor Freezing Temporaneo**: All'avvio post-rollback, l'Actor viene congelato (`agent.actor_frozen = True`) per un periodo stabilito di 10 episodi.
+Per prevenire questo fenomeno denominato *Critic Shock*, l'architettura implementa un meccanismo opzionale attivabile all'avvio:
+- **Attivazione Manuale (`--rollback`)**: L'operatore può forzare il recupero eseguendo `./train_rl.sh --rollback`. Questo carica i pesi del miglior giro storico (`td3_best_lap.pth`), reimposta l'ottimizzatore dell'Actor e abilita il congelamento.
+- **Actor Freezing Temporaneo**: L'Actor viene congelato (`agent.actor_frozen = True`) per un periodo stabilito di 10 episodi dal momento del ripristino.
 - **Warm-Up del Critic**: Durante questa finestra di congelamento, solo i parametri del Critic vengono aggiornati sulle nuove traiettorie generate dall'Actor. Questo permette al Critic di "assimilare" e allineare la sua Value Function alla policy ottimale sotto la nuova fisica del sistema (ad esempio la mutual exclusion moltiplicativa).
 - **Scongelamento Sicuro**: Trascorsi i 10 episodi di stabilizzazione, l'Actor viene sbloccato (`agent.actor_frozen = False`), riprendendo l'addestramento TD3+BC con gradienti stabili e costruttivi.
 
