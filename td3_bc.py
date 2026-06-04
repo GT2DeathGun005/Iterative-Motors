@@ -355,7 +355,7 @@ class TD3BCAgent:
         # proteggendo l'Actor dai gradienti casuali di un Critic immaturo.
         # Dopo il warm-up, l'Actor viene aggiornato ogni 2 step (policy_freq=2)
         # per dare al Critic il tempo di stabilizzare le sue stime.
-        if global_step >= 15000 and global_step % self.policy_freq == 0:
+        if global_step >= 15000 and global_step % self.policy_freq == 0 and not getattr(self, 'actor_frozen', False):
             pi, _ = self.actor(state_b)
             q1_pi, _ = self.critic(state_b, pi)
             
@@ -420,7 +420,7 @@ class TD3BCAgent:
 
         return critic_loss.item(), actor_loss_val, 0.0
 
-    def save_checkpoint(self, filepath, episode, global_step, memory, elite_memory=None):
+    def save_checkpoint(self, filepath, episode, global_step, memory, elite_memory=None, best_lap_time=float('inf'), best_eval_dist=0.0, best_distance=0.0):
         checkpoint = {
             'actor': self.actor.state_dict(),
             'actor_target': self.actor_target.state_dict(),
@@ -430,6 +430,9 @@ class TD3BCAgent:
             'critic_optimizer': self.critic_optimizer.state_dict(),
             'episode': episode,
             'global_step': global_step,
+            'best_lap_time': best_lap_time,
+            'best_eval_dist': best_eval_dist,
+            'best_distance': best_distance,
         }
         torch.save(checkpoint, filepath)
         buffer_dir = os.path.join(os.path.dirname(filepath), 'buffers')
@@ -446,7 +449,7 @@ class TD3BCAgent:
         if elite_memory and os.path.exists(os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz")):
             elite_memory.load(os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz"))
 
-        if not os.path.exists(filepath): return 0, 0
+        if not os.path.exists(filepath): return 0, 0, float('inf'), 0.0, 0.0
 
         checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
         self.actor.load_state_dict(checkpoint['actor'])
@@ -456,8 +459,18 @@ class TD3BCAgent:
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
 
+        best_lap_time = checkpoint.get('best_lap_time', float('inf'))
+        best_eval_dist = checkpoint.get('best_eval_dist', 0.0)
+        best_distance = checkpoint.get('best_distance', 0.0)
+
+        # Fallback all'avvio da checkpoint legacy se c'è un miglior giro storico td3_best_lap.pth
+        if 'best_lap_time' not in checkpoint and os.path.exists('train_set/checkpoints/td3_best_lap.pth'):
+            best_lap_time = 84.3
+            best_eval_dist = 3619.0
+            best_distance = 3619.0
+
         print(f"✅ Checkpoint caricato: ripresa dall'Episodio {checkpoint['episode']}")
-        return checkpoint['episode'], checkpoint['global_step']
+        return checkpoint['episode'], checkpoint['global_step'], best_lap_time, best_eval_dist, best_distance
 
 def train():
     parser = argparse.ArgumentParser()
@@ -477,7 +490,9 @@ def train():
     agent = TD3BCAgent()
     agent.actor.load_bc_weights(args.bc_weights)  # Carica il backbone dal modello BC
     checkpoint_path = 'train_set/checkpoints/td3_checkpoint.pth'
-    start_episode, global_step = agent.load_checkpoint(checkpoint_path, memory, elite_memory)
+    start_episode, global_step, best_lap_time, best_eval_dist, best_distance = agent.load_checkpoint(checkpoint_path, memory, elite_memory)
+
+    agent.actor_frozen = False
 
     # Warm-Start: se è il primo avvio (nessun checkpoint), inizializza
     # l'Actor con i pesi BC e inietta 50k campioni esperti nel buffer.
@@ -485,20 +500,34 @@ def train():
         agent.actor.load_bc_weights(args.bc_weights)
         agent.actor_target.load_state_dict(agent.actor.state_dict())
         memory.load_expert_data('train_set/laps', max_samples=50000)
+    else:
+        # Rollback Actor: se esiste il miglior giro storico, forziamo l'Actor a ripartire da quello
+        best_lap_path = 'train_set/checkpoints/td3_best_lap.pth'
+        if os.path.exists(best_lap_path):
+            print(f"♻️  Rollback Actor: caricamento dei pesi del miglior giro storico da {best_lap_path}")
+            agent.actor.load_state_dict(torch.load(best_lap_path, map_location=agent.device))
+            agent.actor_target.load_state_dict(agent.actor.state_dict())
+            import torch.optim as optim
+            agent.actor_optimizer = optim.Adam(agent.actor.continuous_head.parameters(), lr=3e-4)
+            # Attiviamo il congelamento temporaneo dell'Actor post-rollback
+            agent.actor_frozen = True
+            print("🧊 Actor congelato temporaneamente per stabilizzazione post-rollback.")
 
     os.makedirs('train_set/checkpoints', exist_ok=True)
     os.makedirs('train_set/session_logs', exist_ok=True)
     log_file = 'train_set/session_logs/td3_training.log'
 
     batch_size = 256
-    best_lap_time = float('inf')
     elite_threshold = 500.0
-    best_eval_dist = 0.0
-    best_distance = 0.0
 
     print("🚀 Avvio training TD3+BC...")
 
     for episode in range(start_episode, args.episodes):
+        # Gestione dello scongelamento dell'Actor dopo la fase di stabilizzazione post-rollback
+        if agent.actor_frozen and episode >= start_episode + 10:
+            agent.actor_frozen = False
+            print("🔥 Actor scongelato: riavvio aggiornamenti Actor con gradienti del Critic stabilizzati.")
+
         ob = env.reset(relaunch=True)
         episode_transitions = []
 
@@ -530,9 +559,8 @@ def train():
             torcs_action[1] = np.clip((torcs_action[1] + 1.0) / 2.0, 0.0, 1.0)  # accel: [-1,1] → [0,1]
             torcs_action[2] = np.clip((torcs_action[2] + 1.0) / 2.0, 0.0, 1.0)  # brake: [-1,1] → [0,1]
             
-            # Mutual exclusion post-denormalizzazione coerente con test_agent.py
-            if torcs_action[2] > 0.05:
-                torcs_action[1] = 0.0
+            # Mutual exclusion continua/moltiplicativa per prevenire stalli repentini
+            torcs_action[1] = torcs_action[1] * (1.0 - torcs_action[2])
                 
             next_ob, reward, env_done, info = env.step(torcs_action)
             next_f_state = flatten_state(next_ob)
@@ -603,7 +631,10 @@ def train():
 
         with open(log_file, 'a', encoding='utf-8') as f: f.write(log_msg + "\n")
 
-        agent.save_checkpoint(checkpoint_path, episode + 1, global_step, memory, elite_memory)
+        agent.save_checkpoint(checkpoint_path, episode + 1, global_step, memory, elite_memory,
+                              best_lap_time=best_lap_time,
+                              best_eval_dist=best_eval_dist,
+                              best_distance=best_distance)
         torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_policy.pth')
 
         if (episode + 1) % 5 == 0 and global_step > 15000:
@@ -621,6 +652,9 @@ def train():
                 eval_env = np.zeros(4)
                 eval_env[0:3], eval_env[3] = eval_action, max(1, min(6, eval_gear))
                 eval_env[1], eval_env[2] = np.clip((eval_env[1]+1)/2, 0, 1), np.clip((eval_env[2]+1)/2, 0, 1)
+                
+                # Mutual exclusion continua/moltiplicativa per EVAL
+                eval_env[1] = eval_env[1] * (1.0 - eval_env[2])
 
                 eval_ob, eval_r, eval_done, eval_info = env.step(eval_env)
                 eval_reward += eval_r

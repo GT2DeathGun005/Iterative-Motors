@@ -436,15 +436,15 @@ def main():
                 # ── Mutual exclusion accel/brake (come l'esperto umano) ──
                 # Per i pesi BC, cont_action[1:3] sono già [0,1] (Sigmoid)
                 # Per i pesi RL, cont_action[1:3] sono [-1,1] (Tanh) — denormalize_fn li converte
-                if not is_rl and cont_action[2] > 0.05:
-                    cont_action[1] = 0.0  # Se freno, niente gas (solo per BC)
+                if not is_rl:
+                    cont_action[1] = cont_action[1] * (1.0 - cont_action[2])
 
                 # ── Step nell'ambiente ──
                 env_action = denormalize_fn(cont_action, current_gear)
 
                 # Mutual exclusion post-denormalize per RL
-                if is_rl and env_action[2] > 0.05:
-                    env_action[1] = 0.0
+                if is_rl:
+                    env_action[1] = env_action[1] * (1.0 - env_action[2])
 
                 next_obs, _, env_done, _ = env.step(env_action)
                 next_state = flatten_state(next_obs)
