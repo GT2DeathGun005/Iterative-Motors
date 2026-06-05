@@ -48,24 +48,42 @@ import math
 # Bersaglio attuale: staccata + tornante stretto ~680-810m, dove l'agente
 # arriva troppo veloce e esce di pista (trackPos +1.5).
 # NB: la posizione è SOLO un'etichetta per pesare — NON entra nella rete (resta 29D).
-# Zona staccata stretta (680-715m: l'umano frena 62-80% qui) col peso più alto,
-# + zona curva-sterzo (715-810m) con peso lieve per la linea.
-CORNER_EMPHASIS_ZONES = [(675.0, 720.0, 6.0), (720.0, 810.0, 2.0)]  # (start_m, end_m, peso)
+# DISATTIVATO di default (lista vuota → tutti i pesi = 1.0).
+# Decisione: NON applichiamo un peso artificiale ai campioni in curva. Il ripeso
+# della loss ha mostrato di degradare il comportamento closed-loop (la policy
+# regrediva, uscendo prima). Il bilanciamento curva/resto-pista va ottenuto in modo
+# naturale, con la QUANTITÀ di dati reali raccolti sulla curva (data_collection
+# --segment_only), non con un moltiplicatore. L'infrastruttura resta disponibile:
+# per riattivarla basta popolare la lista con tuple (start_m, end_m, peso).
+CORNER_EMPHASIS_ZONES = []  # es. [(675.0, 720.0, 2.0)] per riattivare
 DIST_NORM_DIVISOR = 4012.0  # backup col[29] normalizzato: metri = col * D (track ~3619m)
 
 
 def _lap_positions(file_path, states_tensor):
     """Posizione (distFromStart, metri) per ogni step del giro.
 
-    Preferisce il backup 30D (dataset_backup/.../<nome>) se presente e allineato
-    per numero di step; altrimenti ritorna None (nessuna enfasi, peso uniforme).
+    Ordine di preferenza (tutto in scala metri raw, coerente con CORNER_EMPHASIS_ZONES):
+      1. metadato `dist_from_start` salvato nel giro stesso (nuove raccolte di data_collection);
+      2. backup 30D (`dataset_backup/.../<nome>`, colonna 29 normalizzata × DIST_NORM_DIVISOR);
+      3. None → nessuna enfasi (peso uniforme di fallback).
     """
+    n = states_tensor.shape[0]
+    # 1) Metadato diretto nel file del giro (metri raw)
+    try:
+        with h5py.File(file_path, 'r') as h:
+            if 'dist_from_start' in h:
+                d = h['dist_from_start'][:].astype(np.float32)
+                if d.shape[0] == n:
+                    return d
+    except Exception:
+        pass
+    # 2) Backup 30D allineato per numero di step
     base = os.path.basename(file_path)
     for c in glob.glob(os.path.join('dataset_backup', '**', base), recursive=True):
         try:
             with h5py.File(c, 'r') as h:
                 bs = h['states'][:]
-            if bs.shape[1] >= 30 and bs.shape[0] == states_tensor.shape[0]:
+            if bs.shape[1] >= 30 and bs.shape[0] == n:
                 return bs[:, 29].astype(np.float32) * DIST_NORM_DIVISOR
         except Exception:
             pass

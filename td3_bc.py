@@ -41,6 +41,15 @@ except ImportError:
     print("Warning: gym_torcs non trovato.")
 
 # ──────────────────────────────────────────────────────────────────────
+#  Corner-Entry Overspeed Penalty — DEVE coincidere con gym_torcs.py
+# ──────────────────────────────────────────────────────────────────────
+# Replica esatta delle costanti di gym_torcs.py: il reward dei campioni expert
+# iniettati nel buffer deve usare la STESSA formula del reward online, altrimenti
+# il Critic riceverebbe segnali incoerenti. Vedi gym_torcs.py per la spiegazione.
+CORNER_OVERSPEED_K = 2.5
+CORNER_PROX_THRESH = 0.5
+
+# ──────────────────────────────────────────────────────────────────────
 #  Determinismo
 # ──────────────────────────────────────────────────────────────────────
 def set_seed(seed=42):
@@ -133,7 +142,12 @@ class ReplayBuffer:
                     progress = (speedX / 50.0) * np.cos(angle)
                     pos_penalty = -1.0 * (trackPos ** 2)
                     steer_change = cont_action[0] - actions_np[i-1, 0] if i > 0 else 0.0
-                    reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
+                    # Corner-entry overspeed penalty (coerente con gym_torcs.py).
+                    # I sensori track nello stato 29D sono già /200: front = min(track[8..10]) = idx 9..11.
+                    front_norm = float(np.min(states_np[i, 9:12]))
+                    corner_prox = max(0.0, CORNER_PROX_THRESH - front_norm)
+                    corner_overspeed_penalty = -CORNER_OVERSPEED_K * (corner_prox ** 2) * (speedX / 50.0)
+                    reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change)) + corner_overspeed_penalty
                     
                     mask = 1.0 # Dati expert non sono terminali
                     

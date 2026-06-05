@@ -13,6 +13,21 @@ import time
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _AUTOSTART_SH = os.path.join(_THIS_DIR, 'autostart.sh')
 
+# ──────────────────────────────────────────────────────────────────────
+#  Corner-Entry Overspeed Penalty (anti-understeer staccate)
+# ──────────────────────────────────────────────────────────────────────
+# Penalizza l'arrivo veloce in prossimità di una curva: insegna a scaricare
+# velocità in ingresso (frenare) dove serve, attaccando il fallimento ricorrente
+# (understeer al tornante perché arriva a ~165 invece di ~130 km/h).
+# Generale: usa i sensori frontali della pista, NON una posizione del tracciato.
+#   front_norm = min(track[8..10]) / 200   (1.0 = pista libera 200m, 0 = muro vicino)
+#   corner_prox = max(0, CORNER_PROX_THRESH - front_norm)   (>0 se curva entro ~100m)
+#   penalty = -CORNER_OVERSPEED_K * corner_prox^2 * (speedX/50)
+# ⚠️ CORNER_OVERSPEED_K va RIPLICATO identico in td3_bc.load_expert_data (coerenza
+#    reward online vs expert per il Critic). Tararlo durante il training.
+CORNER_OVERSPEED_K = 2.5
+CORNER_PROX_THRESH = 0.5  # 0.5*200m = 100m di visibilità frontale
+
 
 class TorcsEnv:
     terminal_judge_start = 500  # 10 secondi per consentire il transitorio di partenza
@@ -146,8 +161,15 @@ class TorcsEnv:
         # Penalità quadratica per mantenere il centro (deadzone naturale per il BC)
         pos_penalty = -1.0 * (obs['trackPos'] ** 2)
 
+        # Penalità overspeed in ingresso curva (vedi costanti in cima al file).
+        # I sensori 'track' grezzi sono in metri (0-200) → normalizziamo /200 come make_observaton.
+        track_norm = np.asarray(obs['track'], dtype=np.float32) / 200.0
+        front_norm = float(np.min(track_norm[8:11])) if track_norm.size >= 11 else 1.0
+        corner_prox = max(0.0, CORNER_PROX_THRESH - front_norm)
+        corner_overspeed_penalty = -CORNER_OVERSPEED_K * (corner_prox ** 2) * sp_norm
+
         # Reward finale scalata e bilanciata
-        reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
+        reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change)) + corner_overspeed_penalty
         
         # info dict comunicherà al Replay Buffer se il done è un vero "crash"
         info = {'crash': False}

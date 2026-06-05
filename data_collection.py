@@ -136,6 +136,13 @@ class DualSenseController:
 
         return np.array([steering, accel, brake, float(self.gear)], dtype=np.float32)
 
+    def rumble(self, intensity: float = 0.3, duration_ms: int = 180):
+        """Pulsazione aptica gentile del DualSense (feedback mentre guidi, niente log da leggere)."""
+        try:
+            self.joystick.rumble(0.0, float(min(0.5, intensity)), int(duration_ms))
+        except Exception:
+            pass  # rumble non supportato → silenzioso
+
 
 class KeyboardController:
     """Gestisce la guida di TORCS tramite la tastiera (WASD + Frecce).
@@ -154,6 +161,10 @@ class KeyboardController:
         self.steer_val = 0.0
         self._last_shift_time = 0
         print("  [Keyboard] Inizializzato. MANTIENI IL FOCUS sulla finestra nera 'Input Focus' per guidare!")
+
+    def rumble(self, intensity: float = 0.3, duration_ms: int = 180):
+        """No-op: la tastiera non ha feedback aptico."""
+        pass
 
     def get_action(self) -> np.ndarray:
         # Processa gli eventi di Pygame per mantenere la finestra attiva e reattiva
@@ -209,6 +220,57 @@ class KeyboardController:
 # ──────────────────────────────────────────────────────────────────────
 #  Utility: Flattening sicuro dello stato
 # ──────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────
+#  Zone problematiche del tracciato (raccolta mirata)
+# ──────────────────────────────────────────────────────────────────────
+# Rilevate per PURA GEOMETRIA della pista (sensore frontale medio < 0.25,
+# cioè curva entro ~50m), NON dagli input umani: così sono robuste agli errori
+# di guida (frenate fuori posto, sterzate eccessive, micro-correzioni). Ogni zona
+# include ~30m di approccio (staccata) prima della curva. Corkscrew, distFromStart in metri.
+# Per ricalcolarle: criterio min(track[8..10])/200 < 0.25 sui giri del dataset.
+PROBLEM_ZONES = [
+    (340, 530), (670, 810), (940, 1070), (1420, 1590), (1870, 1980),
+    (2380, 2530), (2570, 2780), (2890, 3020), (3190, 3300),
+]
+
+
+def _parse_zones(spec):
+    """Converte 'a:b,c:d' in [(a,b),(c,d)]. None/'' → PROBLEM_ZONES di default."""
+    if not spec:
+        return list(PROBLEM_ZONES)
+    out = []
+    for part in spec.split(','):
+        a, b = part.split(':')
+        out.append((float(a), float(b)))
+    return out
+
+
+def _zone_index(dist, zones):
+    """Indice della zona che contiene 'dist', altrimenti None."""
+    for zi, (a, b) in enumerate(zones):
+        if a <= dist <= b:
+            return zi
+    return None
+
+
+def _extract_segments(dists, zones, margin_steps=15):
+    """Run contigui di step in zona, con margine di approccio. Ritorna [(start,end), ...] (end escluso)."""
+    n = len(dists)
+    in_zone = [(_zone_index(d, zones) is not None) for d in dists]
+    segs = []
+    i = 0
+    while i < n:
+        if in_zone[i]:
+            j = i
+            while j < n and in_zone[j]:
+                j += 1
+            segs.append((max(0, i - margin_steps), j))
+            i = j
+        else:
+            i += 1
+    return segs
+
 
 def flatten_state(state_dict: dict) -> np.ndarray:
     """Appiattisce il dizionario di osservazione TORCS in un vettore 1D (29D).
@@ -362,6 +424,14 @@ def main():
         "--tcs_slip", type=float, default=5.0,
         help="Soglia di slip del TCS (default: 5.0)"
     )
+    parser.add_argument(
+        "--zones", type=str, default=None,
+        help="Zone curva target (distFromStart in metri) come 'a:b,c:d'. Default: PROBLEM_ZONES auto-rilevate per geometria."
+    )
+    parser.add_argument(
+        "--segment_only", action="store_true",
+        help="Salva SOLO i segmenti dentro le zone (raccolta parziale): guidi giri interi, vengono tenute solo le curve strette."
+    )
     args = parser.parse_args()
 
     # ── Sanitizza sys.argv per evitare conflitti con getopt di snakeoil3 ──
@@ -372,6 +442,13 @@ def main():
     # ── Cartella dati giri e curve ──
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
+
+    # ── Zone curva target (raccolta mirata) ──
+    zones = _parse_zones(args.zones)
+    print(f"\n  🎯 Zone curva target ({len(zones)}): " + ", ".join(f"{int(a)}-{int(b)}m" for a, b in zones))
+    if args.segment_only:
+        print(f"  ✂️  Modalità SEGMENT_ONLY: salvo solo i segmenti dentro le zone (guidi giri interi).")
+    print(f"  🎮 Vibrazione gentile del controller all'ingresso di ogni zona.\n")
     laps_dir = os.path.join(output_dir, "laps")
     os.makedirs(laps_dir, exist_ok=True)
 
@@ -435,6 +512,8 @@ def main():
             # ── Buffer in RAM per questo giro ──
             lap_states: list = []
             lap_actions: list = []
+            lap_dists: list = []  # distFromStart per step (METADATO: NON entra negli stati 29D)
+            active_zone_idx = None  # indice zona corrente (per il rumble all'ingresso)
 
 
 
@@ -476,8 +555,10 @@ def main():
                 next_state_vec = flatten_state(ob_next)
 
                 # ── Accumula in RAM ──
+                # state_vec corrisponde a 'ob' (pre-step) → registro la sua distFromStart
                 lap_states.append(state_vec.copy())
                 lap_actions.append(action.copy())
+                lap_dists.append(_get_dist_from_start(ob))
 
 
 
@@ -504,9 +585,18 @@ def main():
                 current_cur_lap = _get_cur_lap_time(ob_next)
                 current_dist = _get_dist_from_start(ob_next)
 
-                # Log ogni 2 secondi circa (100 step)
+                # ── Raccolta mirata: feedback APTICO all'ingresso di una zona curva ──
+                # La zona si identifica per POSIZIONE (distFromStart). Vibrazione gentile
+                # del controller quando entri: niente log da leggere mentre guidi.
+                cur_zone = _zone_index(current_dist, zones)
+                if cur_zone is not None and cur_zone != active_zone_idx:
+                    controller.rumble(intensity=0.3, duration_ms=180)  # pulsazione gentile = "sei in curva target"
+                active_zone_idx = cur_zone
+
+                # Log ogni 2 secondi circa (100 step) — indicatore zona (solo per il record)
                 if step % 100 == 0:
-                    print(f"    [Step {step:4d}] CurTime: {current_cur_lap:6.2f} | LastLap: {current_last_lap:6.2f} | Dist: {current_dist:7.1f} | OffTrack: {went_off_track}", end='\r')
+                    zone_tag = "  🎯 ZONA TARGET" if cur_zone is not None else ""
+                    print(f"    [Step {step:4d}] CurTime: {current_cur_lap:6.2f} | LastLap: {current_last_lap:6.2f} | Dist: {current_dist:7.1f}{zone_tag} | OffTrack: {went_off_track}", end='\r')
 
                 # CONDIZIONE A: TORCS aggiorna il lastLapTime (Metodo primario e più affidabile)
                 if current_last_lap > 0.0 and abs(current_last_lap - prev_last_lap_time) > 0.0001:
@@ -560,30 +650,47 @@ def main():
             print(f"\n  --- Fine Giro (step totali: {step}) ---")
 
             if lap_completed and lap_valid:
-                # ── Salvataggio HDF5 (batch unico) ──
+                # ── Salvataggio HDF5 ──
                 states_np = np.stack(lap_states)
                 actions_np = np.stack(lap_actions)
+                # Metadato posizione (allineato agli stati). NON è una feature di rete:
+                # serve solo per analisi/corner-emphasis esatti senza dipendere dal backup 30D.
+                dists_np = np.asarray(lap_dists[:len(states_np)], dtype=np.float32)
 
-                lap_counter += 1
-                filename = f"lap_{lap_counter:03d}.h5"
-                filepath = os.path.join(laps_dir, filename)
+                def _write_h5(path, st, ac, di):
+                    with h5py.File(path, 'w') as h5f:
+                        h5f.create_dataset('states', data=st, compression="gzip")
+                        h5f.create_dataset('actions', data=ac, compression="gzip")
+                        h5f.create_dataset('dist_from_start', data=di, compression="gzip")
+                        h5f.attrs['lap_time'] = lap_time
+                        h5f.attrs['num_steps'] = len(st)
+                        h5f.attrs['has_dist_meta'] = True
+                        h5f.attrs['timestamp'] = datetime.now().isoformat()
 
-                with h5py.File(filepath, 'w') as h5f:
-                    h5f.create_dataset('states', data=states_np, compression="gzip")
-                    h5f.create_dataset('actions', data=actions_np, compression="gzip")
-                    h5f.attrs['lap_time'] = lap_time
-                    h5f.attrs['num_steps'] = len(lap_states)
-                    h5f.attrs['timestamp'] = datetime.now().isoformat()
-                
-                print(f"  ✅ GIRO VALIDO — Salvato: {filename}")
+                if args.segment_only:
+                    # Raccolta PARZIALE: guidi il giro intero, tengo solo i segmenti dentro le zone
+                    # (con margine di approccio per uno stacking temporale valido).
+                    segs = [(s, e) for (s, e) in _extract_segments(dists_np, zones, margin_steps=15) if e - s >= 20]
+                    for (s, e) in segs:
+                        lap_counter += 1
+                        _write_h5(os.path.join(laps_dir, f"lap_seg_{lap_counter:03d}.h5"),
+                                  states_np[s:e], actions_np[s:e], dists_np[s:e])
+                    print(f"  ✅ GIRO VALIDO — Salvati {len(segs)} segmenti curva (lap_seg_*.h5)")
+                    log_steps = sum(e - s for s, e in segs)
+                else:
+                    lap_counter += 1
+                    filename = f"lap_{lap_counter:03d}.h5"
+                    _write_h5(os.path.join(laps_dir, filename), states_np, actions_np, dists_np)
+                    print(f"  ✅ GIRO VALIDO — Salvato: {filename}")
+                    log_steps = len(lap_states)
 
                 session_saved += 1
 
                 log_entry = (
                     f"[SAVED] | Lap Time: {lap_time:.3f}s | "
-                    f"Steps: {len(lap_states)} | {datetime.now().isoformat()}"
+                    f"Steps: {log_steps} | {datetime.now().isoformat()}"
                 )
-                print(f"     Lap Time: {lap_time:.3f}s | Steps: {len(lap_states)}")
+                print(f"     Lap Time: {lap_time:.3f}s | Steps salvati: {log_steps}")
 
             else:
                 # ── Giro scartato ──

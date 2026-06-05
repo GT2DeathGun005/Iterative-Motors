@@ -35,7 +35,7 @@ L'integrazione di una BC Penalty in un algoritmo TD3 richiede una calibrazione m
 
 ### A. Reward per Singolo Step (Dense Reward & Soft Shaping)
 A ogni istante `t`, l'agente riceve una ricompensa così calcolata:
-`Reward = (Progress * 1.5) + Pos_Penalty - Steer_Smoothness`
+`Reward = (Progress * 1.5) + Pos_Penalty - Steer_Smoothness - Corner_Overspeed_Penalty`
 
 - **Progress = (speedX / 50.0) * cos(angle) * 1.5**:
   - Incoraggia la velocità (`speedX`): scalato per compensare la presenza continua della penalità di posizione.
@@ -44,6 +44,10 @@ A ogni istante `t`, l'agente riceve una ricompensa così calcolata:
   - **Soft Constrained**: Una penalità quadratica sulla distanza dal centro. Quando l'auto è al centro (`trackPos ~ 0.1`), la penalità è irrisoria (`-0.01`), fungendo da "deadzone" naturale per le lievi sbandate apprese dal BC. Man mano che l'auto scivola verso l'erba (`trackPos = 0.8`), la penalità cresce esponenzialmente (`-0.64`), fungendo da "muro repulsivo" molto prima del crash. Questo previene il *Reward Hacking* dove l'agente preferiva sbattere piuttosto che sterzare.
 - **Steer Smoothness = -0.05 * abs(steer - last_steer)**:
   - Penalizza le variazioni brusche di sterzo, impedendo comportamenti a "zig-zag". Il peso ridotto (`0.05`) incoraggia l'agente a usare lo sterzo per tornare verso il centro della pista senza temere eccessive perdite di punti.
+- **Corner Overspeed Penalty = -K · max(0, 0.5 - front)² · (speedX/50)** (con `K = CORNER_OVERSPEED_K = 2.5`):
+  - **Anti-understeer in staccata**: attacca il fallimento ricorrente in cui l'agente arriva al tornante troppo veloce (~165 invece di ~130 km/h) e allarga di pista. `front = min(track[8..10])/200` è la distanza frontale normalizzata: quando una curva è vicina (`front < 0.5`, cioè entro ~100m) la penalità cresce **quadraticamente** con la vicinanza e **linearmente** con la velocità, insegnando a *scaricare velocità in ingresso* (frenare) dove serve.
+  - **Generale, non hardcoded**: basata sui sensori di pista, non su una posizione specifica del tracciato → funziona su qualsiasi curva/circuito. Su pista libera (`front ≥ 0.5`) la penalità è esattamente `0`.
+  - **Coerenza Critic**: la stessa identica formula (con `K` replicato) è applicata sia al reward online (`gym_torcs.py`) sia al reward dei campioni expert iniettati nel buffer (`td3_bc.load_expert_data`), così il Critic riceve un segnale coerente. `K` va tarato durante il training.
 
 ### B. Penalità Terminali (Crash e Fuoripista)
 Se l'auto esce di pista (`|trackPos| > 1.5`), si schianta, o va in stallo, l'episodio termina (`done=True`) e riceve un **`-10.0`**.
@@ -98,10 +102,10 @@ Il TD3 esplora naturalmente stati off-distribution. Grazie all'implementazione d
 ### Corner Emphasis: Oversampling Pesato per Posizione sul Tracciato (behavioral_cloning.py)
 Quando un settore specifico del circuito (es. una staccata ad alta velocità) è **sotto-rappresentato** o richiede una manovra molto più precisa del resto del giro, il BC — che minimizza un MSE *medio* — tende a non dargli abbastanza importanza, e l'agente esce di pista sempre nello stesso punto. La soluzione è un **oversampling pesato per posizione**:
 
-- **Identificazione al metro (`distFromStart`)**: una curva non si delimita per *tempo* (impreciso, varia ad ogni giro) ma per **posizione sul tracciato**, cioè un intervallo di `distFromStart` costante. La posizione esatta per ogni step si legge dal **backup 30D** (`dataset_backup/laps/`, colonna 29 normalizzata × `DIST_NORM_DIVISOR`), allineato per indice ai giri 29D di training; per i giri senza backup si ricostruisce integrando la velocità (peso uniforme di fallback).
-- **Pesatura nella loss (`CORNER_EMPHASIS_ZONES`)**: ogni zona è una tupla `(start_m, end_m, peso)`. I campioni che cadono nell'intervallo ricevono un peso maggiore nella *media pesata* della loss BC. Esempio attuale: staccata `675-720m` peso `6×` (frenata), tornante `720-810m` peso `2×` (linea/sterzo). Con peso `1` ovunque la loss coincide esattamente con la media semplice (scala e val-loss invariate).
-- **Vincolo architetturale fondamentale**: `distFromStart` è usato **esclusivamente come etichetta per pesare i campioni** — **NON** viene mai concatenato al vettore di stato. La rete resta rigorosamente **29D** (la 30ª feature era stata rimossa per train-test mismatch e non viene reintrodotta).
-- **Effetto misurato**: l'enfasi sulla zona-curva riduce lo `steer MAE` in curva (0.091→0.066); l'enfasi sulla staccata mira ad alzare la frenata nel punto critico dove l'agente arriva troppo veloce.
+- **Identificazione al metro (`distFromStart`)**: una curva non si delimita per *tempo* (impreciso, varia ad ogni giro) ma per **posizione sul tracciato**, cioè un intervallo di `distFromStart` costante. La posizione esatta per ogni step (`_lap_positions`) si ricava, in ordine di preferenza: (1) dal metadato **`dist_from_start`** salvato nel giro stesso dalle nuove raccolte di `data_collection.py`; (2) dal **backup 30D** (`dataset_backup/laps/`, col 29 × `DIST_NORM_DIVISOR`) allineato per indice; (3) fallback a peso uniforme. Le nuove raccolte sono quindi auto-sufficienti (non serve più il backup).
+- **Pesatura nella loss (`CORNER_EMPHASIS_ZONES`)**: ogni zona è una tupla `(start_m, end_m, peso)`. I campioni che cadono nell'intervallo ricevono un peso maggiore nella *media pesata* della loss BC. Con peso `1` ovunque la loss coincide esattamente con la media semplice (scala e val-loss invariate).
+- **⚠️ DISATTIVATA di default (`CORNER_EMPHASIS_ZONES = []`)**: questo ripeso artificiale, testato, **degradava il comportamento closed-loop** (la policy regrediva: usciva di pista *prima*, a ~236m invece di ~811m). Il bilanciamento curva/resto-pista si ottiene quindi in modo naturale tramite la **quantità di dati reali** raccolti sulla curva (`data_collection --segment_only`), non con un moltiplicatore. L'infrastruttura resta disponibile per riattivazioni mirate.
+- **Vincolo architetturale fondamentale**: `distFromStart` è usato **esclusivamente come etichetta** (per pesare i campioni e per le analisi) — **NON** viene mai concatenato al vettore di stato. La rete resta rigorosamente **29D** (la 30ª feature era stata rimossa per train-test mismatch e non viene reintrodotta).
 
 ## 8. Multimodal Averaging & Permanent BC Adherence (Residual RL)
 Il dataset umano originale del Behavioral Cloning (BC) contiene intrinsecamente traiettorie eterogenee (es. stringere in una curva al giro 1, allargare al giro 2). Quando una rete neurale impara da questi dati minimizzando il Mean Squared Error (MSE), tende ad apprendere la **media matematica** delle manovre. In curve complesse, questo porta spesso al **Multimodal Averaging** (un comportamento indeciso).

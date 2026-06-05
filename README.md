@@ -92,9 +92,18 @@ python data_collection.py --output_dir train_set --device controller
 
 # Con tastiera (WASD + frecce per le marce)
 python data_collection.py --output_dir train_set --device keyboard
+
+# Raccolta MIRATA: guidi giri interi, il controller VIBRA (gentile) all'ingresso di
+# ogni curva stretta, e con --segment_only vengono salvati SOLO i segmenti di quelle curve.
+python data_collection.py --output_dir train_set --device controller --segment_only
+
+# Override delle zone (default = PROBLEM_ZONES auto-rilevate per geometria della pista)
+python data_collection.py --output_dir train_set --device controller --segment_only --zones "670:810,940:1070"
 ```
 
-**Output:** un file `train_set/laps/lap_NNN.h5` per ogni giro valido.
+**Feedback aptico (non log)**: entrando in una zona-curva target il **controller vibra brevemente** (gentile, ~30%) — così sai quando sei nella curva senza leggere lo schermo mentre guidi. Le zone sono le **curve strette auto-rilevate dalla geometria** della pista (sensore frontale `<0.25`, ~9 tornanti su Corkscrew), **robuste ai tuoi errori di guida** (frenate/sterzate fuori posto: contano solo la forma della pista, non i tuoi input). Con `--segment_only` la raccolta è **parziale**: guidi giri interi ma vengono tenuti solo i segmenti dentro le zone (file `lap_seg_*.h5`, con margine di approccio per lo stacking).
+
+**Output:** un file `train_set/laps/lap_NNN.h5` per ogni giro valido. Ogni file contiene `states` (29D), `actions` e il **metadato `dist_from_start`** (posizione per step). ⚠️ `dist_from_start` è solo un'etichetta di posizione per analisi/corner-emphasis — **NON** entra nella rete, che resta **29D**.
 
 ### 2. Addestramento BC (Behavioral Cloning)
 
@@ -226,11 +235,12 @@ Actor (Warm-Start da BC)                    Critic (Twin Q-Network, da zero)
 
 La formula del calcolo della ricompensa per timestep in `gym_torcs.py`:
 
-$$r_t = \underbrace{\frac{v_x}{50} \cos(\theta) \times 1.5}_{\text{progress}} \underbrace{- (\text{trackPos})^2}_{\text{pos penalty}} \underbrace{- 0.05|\delta_t - \delta_{t-1}|}_{\text{steer smooth}}$$
+$$r_t = \underbrace{\frac{v_x}{50} \cos(\theta) \times 1.5}_{\text{progress}} \underbrace{- (\text{trackPos})^2}_{\text{pos penalty}} \underbrace{- 0.05|\delta_t - \delta_{t-1}|}_{\text{steer smooth}} \underbrace{- K\,\max(0, 0.5{-}\text{front})^2 \frac{v_x}{50}}_{\text{corner overspeed}}$$
 
 - **Progress**: Velocità in avanti normalizzata, ponderata dal coseno dell'angolo di imbardata, moltiplicata per 1.5.
 - **Pos Penalty**: Penalità quadratica sulla distanza dal centro pista (deadzone naturale).
 - **Steer Smoothness**: Penalità sulle variazioni brusche di sterzo (coefficiente 0.05).
+- **Corner Overspeed Penalty** (`K = CORNER_OVERSPEED_K = 2.5`): penalizza l'arrivo veloce in prossimità di una curva (`front = min(track[8..10])/200`; attiva entro ~100m, cresce col quadrato della vicinanza e con la velocità). Insegna a **frenare in staccata** (attacca l'understeer al tornante). Generale (sensori, non posizione); `0` su pista libera. ⚠️ `K` è replicato identico in `td3_bc.load_expert_data` per coerenza del Critic — **da tarare durante il training**.
 - **Terminali cappati a -10.0**: Danno al veicolo, fuoripista, spin e stallo.
 - **Bonus completamento giro: +50.0**: Segnale esplicito per il Critic.
 - **Nessuna sparse reward**: Reward densa per evitare distorsioni del gradiente del Critic.
@@ -280,15 +290,14 @@ Registrare **5-10 giri aggiuntivi** con:
 ### Bojarski-Style Recovery Augmentation (con gating 50%)
 Il training BC include perturbazione laterale dello stato (`trackPos ±0.4`) e angolare (`angle ±0.08 rad`) con correzione proporzionale dello sterzo e del freno target. **La perturbazione è applicata solo al 50% di ogni batch** (gating per-campione): l'altra metà resta pulita, così la rete impara *sia* la guida precisa sulla linea ideale *sia* il recupero da stati OOD. Senza il gating (perturbazione al 100%) la fedeltà di sterzo degradava (steer MAE 0.116 → 0.062 col gating).
 
-### Corner Emphasis — Oversampling Pesato per Posizione
-Per rinforzare un settore critico (es. una staccata dove l'agente esce sempre di pista) senza nuovi dati, il BC pesa di più i campioni in **intervalli di `distFromStart`** (la curva si identifica per *posizione*, non per tempo). Config in `behavioral_cloning.py`:
+### Corner Emphasis — Oversampling Pesato per Posizione (⚠️ disattivato di default)
+Meccanismo opzionale per pesare di più, nella loss BC, i campioni in **intervalli di `distFromStart`** (la curva si identifica per *posizione*, non per tempo). Config in `behavioral_cloning.py`:
 
 ```python
-CORNER_EMPHASIS_ZONES = [(675.0, 720.0, 6.0),   # staccata → peso 6× (frenata)
-                         (720.0, 810.0, 2.0)]    # tornante → peso 2× (linea)
+CORNER_EMPHASIS_ZONES = []   # disattivato. Es. per riattivare: [(675.0, 720.0, 2.0)]
 ```
 
-La posizione esatta viene letta dal **backup 30D** (`dataset_backup/laps/`, col 29), allineato per indice ai giri 29D; fallback uniforme per i giri senza backup. ⚠️ `distFromStart` è **solo un'etichetta di pesatura**: NON entra nella rete, che resta **29D**.
+**È disattivato** perché il ripeso artificiale degradava il closed-loop (la policy regrediva, uscendo prima). Il bilanciamento curva/resto-pista si ottiene invece con la **quantità di dati reali** raccolti sulla curva (`data_collection --segment_only`). La posizione per step si legge dal metadato `dist_from_start` (o dal backup 30D). ⚠️ `distFromStart` è **solo un'etichetta**: NON entra nella rete, che resta **29D**.
 
 ---
 
