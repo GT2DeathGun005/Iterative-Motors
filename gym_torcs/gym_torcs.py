@@ -29,6 +29,21 @@ CORNER_OVERSPEED_K = 2.5
 CORNER_PROX_THRESH = 0.5  # 0.5*200m = 100m di visibilità frontale
 
 
+def _kill_torcs():
+    """Termina le istanze TORCS.
+
+    Di DEFAULT uccide *tutti* i processi torcs della macchina (`pkill -9 -f torcs`):
+    è la base del workaround per il memory-leak di TORCS (vedi ARCHITECTURE §5) ed è
+    corretto per il flusso single-instance di training/test.
+
+    ⚠️ In scenari MULTI-istanza (run paralleli) o MULTI-vettura (video finale) questo
+    ucciderebbe anche gli altri TORCS: imposta `TORCS_KILL_ALL=0` per disabilitare il
+    kill globale (in quel caso gestisci tu la terminazione dell'istanza specifica).
+    """
+    if os.environ.get('TORCS_KILL_ALL', '1') != '0':
+        os.system('pkill -9 -f torcs')
+
+
 class TorcsEnv:
     terminal_judge_start = 500  # 10 secondi per consentire il transitorio di partenza
     termination_limit_progress = 5  # Soglia tollerante per non punire le incertezze
@@ -51,7 +66,7 @@ class TorcsEnv:
         self.initial_run = True
 
         ##print("launch torcs")
-        os.system('pkill -9 -f torcs')
+        _kill_torcs()
         time.sleep(1.5)
         
         # Costruisce il comando torcs base
@@ -177,10 +192,17 @@ class TorcsEnv:
         # ─── Termination Conditions ──────────────────────────────────
         episode_terminate = False
         
-        # Danno / Muro
+        # Danno / Muro. Penalità e flag crash SEMPRE attivi (coerenza reward/Critic). La
+        # TERMINAZIONE invece solo se early_termination=True (training RL): così la transizione
+        # con mask=0 corrisponde a un episodio realmente chiuso lato TORCS, senza l'incoerenza
+        # segnalata. Durante la RACCOLTA DATI umana (early_termination=False) il danno NON termina,
+        # altrimenti un contatto/cordolo ucciderebbe il giro del pilota.
         if obs['damage'] - obs_pre['damage'] > 0:
             reward = -10.0
             info['crash'] = True
+            if self.early_termination:
+                episode_terminate = True
+                client.R.d['meta'] = True
 
         if self.early_termination:
             # Fuoripista (|trackPos| > 1.5)
@@ -250,14 +272,14 @@ class TorcsEnv:
         return self.get_obs()
 
     def end(self):
-        os.system('pkill -9 -f torcs')
+        _kill_torcs()
 
     def get_obs(self):
         return self.observation
 
     def reset_torcs(self):
        #print("relaunch torcs")
-        os.system('pkill -9 -f torcs')
+        _kill_torcs()
         time.sleep(1.5)  # Garantisce che il sistema operativo liberi la porta UDP
         
         torcs_cmd = 'torcs -nofuel -nodamage -vision' if self.vision else 'torcs -nofuel -nodamage'

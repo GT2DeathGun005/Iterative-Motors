@@ -185,7 +185,9 @@ def flatten_state(state_dict: dict) -> np.ndarray:
             [_s('angle')], _a('track', 19), [_s('trackPos'), _s('speedX'), _s('speedY'), _s('speedZ')],
             _a('wheelSpinVel', 4) / 100.0, [_s('rpm') / 10000.0]
         ]).astype(np.float32)
-    except Exception:
+    except Exception as e:
+        # NON ingoiare silenziosamente: uno stato a zero falsa la rete ed è arduo da diagnosticare.
+        print(f"⚠️  flatten_state fallita (stato a zero): {e}")
         return np.zeros(29, dtype=np.float32)
 
 # ──────────────────────────────────────────────────────────────────────
@@ -498,12 +500,10 @@ class TD3BCAgent:
             episode = 0
             global_step = 0
 
-        # Fallback all'avvio da checkpoint legacy se c'è un miglior giro storico td3_best_lap.pth
-        if (best_lap_time == float('inf') or best_lap_time is None) and os.path.exists('train_set/checkpoints/td3_best_lap.pth'):
-            best_lap_time = 84.3
-            best_eval_dist = 3619.0
-            best_distance = 3619.0
-
+        # NB: nessun fallback hardcoded sui record storici. Valori hardcoded (es. 84.3s/3619m
+        # di una run specifica) corrompevano l'Elite Buffer su un resume weights-only:
+        # best_distance alto → elite_threshold = best_distance*0.9 si alza subito e il buffer
+        # non si riempie più (Self-Imitation spento). Su weights-only i record ripartono puliti.
         return episode, global_step, best_lap_time, best_eval_dist, best_distance
 
 def train():
@@ -523,7 +523,8 @@ def train():
 
     # ── Inizializzazione Agent ──
     agent = TD3BCAgent()
-    agent.actor.load_bc_weights(args.bc_weights)  # Carica il backbone dal modello BC
+    # NB: i pesi BC si caricano una sola volta — al fresh-start (blocco sotto). In resume
+    # vengono sovrascritti da load_checkpoint, quindi un caricamento qui sarebbe sprecato.
     checkpoint_path = 'train_set/checkpoints/td3_checkpoint.pth'
     start_episode, global_step, best_lap_time, best_eval_dist, best_distance = agent.load_checkpoint(checkpoint_path, memory, elite_memory)
 
@@ -593,9 +594,9 @@ def train():
         prev_last_lap = float(np.array(ob.get('lastLapTime', 0.0)).flat[0])
 
         while True:
-            agent.actor.eval()
+            # NB: niente actor.eval()/train() qui — sarebbe un no-op fuorviante (nessun dropout;
+            # il LayerNorm è indipendente dal batch). select_action usa già torch.no_grad().
             cont_action, raw_gear = agent.select_action(stacked_state, evaluate=False)
-            agent.actor.train()
 
             # Mappatura Action Space: l'Actor emette azioni in [-1,1] (spazio tanh),
             # ma TORCS si aspetta accel/brake in [0,1]. La conversione (x+1)/2

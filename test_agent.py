@@ -193,7 +193,9 @@ def flatten_state(state_dict: dict) -> np.ndarray:
             _a('wheelSpinVel', 4) / 100.0,
             [_s('rpm') / 10000.0],
         ]).astype(np.float32)
-    except Exception:
+    except Exception as e:
+        # NON silenziare: uno stato a zero falsa l'inferenza ed è difficilissimo da diagnosticare.
+        print(f"⚠️  flatten_state fallita (stato a zero): {e}")
         return np.zeros(29, dtype=np.float32)
 
 
@@ -223,50 +225,17 @@ def denormalize_action_rl(cont_action: np.ndarray, gear: int) -> np.ndarray:
     return env_action
 
 
-def apply_gear_hysteresis(predicted_gear, current_gear, gear_counter, gear_candidate,
-                          confirm_steps=3):
-    """Filtro di isteresi per la marcia predetta dalla rete neurale.
-
-    La rete predice la marcia frame-by-frame, ma nella realtà fisica un cambio
-    marcia richiede continuità. Questo filtro:
-      1. Vincolo sequenziale: permette solo ±1 per step (no salti 1→4).
-      2. Conferma temporale: un nuovo gear deve essere predetto per `confirm_steps`
-         step consecutivi prima di essere adottato.
-
-    Returns:
-        (gear_to_use, updated_counter, updated_candidate)
-    """
-    # Vincolo sequenziale: clamp a ±1 dal gear corrente
-    if predicted_gear > current_gear + 1:
-        predicted_gear = current_gear + 1
-    elif predicted_gear < current_gear - 1:
-        predicted_gear = current_gear - 1
-
-    # Safety: mai sotto gear 1 a runtime
-    predicted_gear = max(1, predicted_gear)
-
-    # Isteresi: conferma il cambio solo dopo N step consecutivi
-    if predicted_gear != current_gear:
-        if predicted_gear == gear_candidate:
-            gear_counter += 1
-        else:
-            gear_candidate = predicted_gear
-            gear_counter = 1
-
-        if gear_counter >= confirm_steps:
-            return predicted_gear, 0, predicted_gear
-        else:
-            return current_gear, gear_counter, gear_candidate
-    else:
-        # Se la rete predice il gear corrente, resetta il contatore
-        return current_gear, 0, current_gear
+# NB: la marcia in inferenza usa il SOLO vincolo sequenziale ±1 (inline nel loop),
+# identico al training (td3_bc.py). Una funzione di isteresi con conferma temporale
+# esisteva qui ma non era mai chiamata ed avrebbe introdotto un mismatch train/inferenza:
+# è stata rimossa.
 
 
 # ──────────────────────────────────────────────────────────────────────
 #  Auto-detect e caricamento pesi
 # ──────────────────────────────────────────────────────────────────────
 
-def load_best_weights(model, weights_arg, device):
+def load_best_weights(model, weights_arg, device, kind='auto'):
     """Carica i migliori pesi disponibili con auto-detect del formato.
 
     Priorità (se --weights non è specificato):
@@ -328,17 +297,23 @@ def load_best_weights(model, weights_arg, device):
     model.load_state_dict(state_dict, strict=has_log_std)
     model.eval()
 
-    # BC vs RL NON si decide dalla presenza di log_std_head: sia i vecchi
-    # checkpoint BC (legacy) sia gli Actor TD3 possono contenerla. La differenza
-    # vera è la mappatura delle azioni (RL: tanh→[0,1]; BC: sigmoid). La si
-    # determina dal nome del file, con la presenza di log_std come fallback.
-    fname = os.path.basename(load_path).lower()
-    if 'td3' in fname or 'sac' in fname:
+    # BC vs RL determina la mappatura delle azioni (RL: tanh→[0,1]; BC: sigmoid).
+    # NON si può dedurre dai pesi (sia BC legacy sia Actor TD3 possono avere log_std_head).
+    # Override esplicito con --kind {rl,bc}; in 'auto' si usa l'euristica sul nome file.
+    if kind == 'rl':
         is_rl = True
-    elif 'bc' in fname:
+    elif kind == 'bc':
         is_rl = False
     else:
-        is_rl = has_log_std
+        fname = os.path.basename(load_path).lower()
+        if 'td3' in fname or 'sac' in fname:
+            is_rl = True
+        elif 'bc' in fname:
+            is_rl = False
+        else:
+            print("  ⚠️  Tipo pesi non deducibile dal nome file: assumo "
+                  f"{'RL' if has_log_std else 'BC'}. Usa --kind rl|bc per essere esplicito.")
+            is_rl = has_log_std
 
     weight_type = "RL (TD3)" if is_rl else "BC"
     print(f"  ✅ Pesi [{weight_type}] caricati da: {load_path}")
@@ -358,6 +333,8 @@ def main():
                         help="Numero di giri da completare")
     parser.add_argument("--max_steps", type=int, default=15000,
                         help="Max step per giro (timeout)")
+    parser.add_argument("--kind", choices=["auto", "rl", "bc"], default="auto",
+                        help="Tipo di pesi: 'rl' (tanh→[0,1]) o 'bc' (sigmoid). 'auto' deduce dal nome file.")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -371,7 +348,7 @@ def main():
 
     # ── Carica modello con auto-detect ──
     model = BCActor().to(device)
-    model, is_rl = load_best_weights(model, args.weights, device)
+    model, is_rl = load_best_weights(model, args.weights, device, kind=args.kind)
 
     # Seleziona la funzione di denormalizzazione corretta
     denormalize_fn = denormalize_action_rl if is_rl else denormalize_action_bc
@@ -407,10 +384,9 @@ def main():
             lap_time = 0.0
             telemetry_data = []
 
-            # Stato per i filtri di stabilizzazione runtime
-            current_gear = 1           # Gear hysteresis: marcia corrente
-            gear_counter = 0           # Gear hysteresis: contatore conferma
-            gear_candidate = 1         # Gear hysteresis: candidato in attesa
+            # Stato per il vincolo sequenziale del gear (±1 per step, come nel training)
+            current_gear = 1
+            stall_low_speed_steps = 0  # contatore stallo (#3: semantica allineata al training)
 
             print(f"\n  {'─' * 50}")
             print(f"  🏁 Tentativo #{total_attempts} (giri completati: {len(lap_times)}/{args.laps})")
@@ -444,7 +420,7 @@ def main():
                     predicted_gear = current_gear + 1
                 elif predicted_gear < current_gear - 1:
                     predicted_gear = current_gear - 1
-                current_gear = max(1, predicted_gear)
+                current_gear = max(1, min(6, predicted_gear))  # min(6) per allineamento col training
 
                 # ── Mutual exclusion accel/brake (come l'esperto umano) ──
                 # Per i pesi BC, cont_action[1:3] sono già [0,1] (Sigmoid)
@@ -488,6 +464,19 @@ def main():
                     break
                 if np.cos(angle) < 0:
                     print(f"  ⚠️  Spin allo step {step} (angle={angle:.3f})")
+                    break
+
+                # ── Stallo (#3: semantica allineata al training) ──
+                # Training: dopo ~10s (terminal_judge_start=500 step) se la velocità in avanti
+                # (speedX·cos) < 5 km/h → terminale. Qui lo replichiamo con una finestra di
+                # conferma di ~1s per evitare falsi positivi da letture momentanee.
+                fwd_kmh = spd_kmh * float(np.cos(angle))
+                if step > 500 and fwd_kmh < 5.0:
+                    stall_low_speed_steps += 1
+                else:
+                    stall_low_speed_steps = 0
+                if stall_low_speed_steps >= 50:
+                    print(f"  ⚠️  Stallo allo step {step} (vel. avanti {fwd_kmh:.1f} km/h)")
                     break
 
                 # ── Telemetria ogni 200 step ──

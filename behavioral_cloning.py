@@ -38,6 +38,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, random_split
 import math
+from datetime import datetime
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -491,44 +492,58 @@ class BehaviorCloningTrainer:
 
     def train(self, max_epochs: int = 200,
               checkpoint_path: str = "train_set/checkpoints/bc_policy.pth",
-              patience: int = 100):
-        print(f"\n  Inizio training Behavioral Cloning su {self.device}...")
-        print(f"  Max epochs: {max_epochs} | Early Stopping patience: {patience}\n")
+              patience: int = 100, log_path: str = None):
+        # Log su file (oltre alla console) per tenere traccia del training in session_logs/
+        logf = open(log_path, "a", encoding="utf-8") if log_path else None
 
-        # Cosine Annealing LR
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=max_epochs, eta_min=1e-6
-        )
+        def _log(line: str):
+            print(line)
+            if logf:
+                logf.write(line + "\n")
+                logf.flush()
 
-        patience_counter = 0
+        try:
+            _log(f"\n  Inizio training Behavioral Cloning su {self.device}...")
+            _log(f"  Max epochs: {max_epochs} | Early Stopping patience: {patience}\n")
 
-        for epoch in range(max_epochs):
-            train_loss = self.train_epoch()
-            val_loss = self.validate()
-            lr = self.optimizer.param_groups[0]['lr']
-            scheduler.step()
-
-            improved = ""
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                torch.save(self.model.state_dict(), checkpoint_path)
-                improved = " ★ saved"
-                patience_counter = 0
-            else:
-                patience_counter += 1
-
-            print(
-                f"  Epoch {epoch+1:03d}/{max_epochs} | "
-                f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
-                f"LR: {lr:.2e}{improved}"
+            # Cosine Annealing LR
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=max_epochs, eta_min=1e-6
             )
 
-            if patience_counter >= patience:
-                print(f"\n  ⏹ Early Stopping: nessun miglioramento per {patience} epoche.")
-                break
+            patience_counter = 0
 
-        print(f"\n  Training completato. Best val loss: {self.best_val_loss:.6f}")
-        print(f"  Miglior checkpoint: {checkpoint_path}")
+            for epoch in range(max_epochs):
+                train_loss = self.train_epoch()
+                val_loss = self.validate()
+                lr = self.optimizer.param_groups[0]['lr']
+                scheduler.step()
+
+                improved = ""
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    torch.save(self.model.state_dict(), checkpoint_path)
+                    improved = " ★ saved"
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                _log(
+                    f"  Epoch {epoch+1:03d}/{max_epochs} | "
+                    f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
+                    f"LR: {lr:.2e}{improved}"
+                )
+
+                if patience_counter >= patience:
+                    _log(f"\n  ⏹ Early Stopping: nessun miglioramento per {patience} epoche.")
+                    break
+
+            _log(f"\n  Training completato. Best val loss: {self.best_val_loss:.6f}")
+            _log(f"  Miglior checkpoint: {checkpoint_path}")
+            _log(f"  Fine: {datetime.now().isoformat()}")
+        finally:
+            if logf:
+                logf.close()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -589,7 +604,26 @@ def main():
         device=device
     )
 
-    trainer.train(max_epochs=args.epochs, checkpoint_path=args.output, patience=100)
+    # ── Log di sessione (timestamp) in train_set/session_logs/ ──
+    # Convenzione: --output = train_set/checkpoints/X.pth → log in train_set/session_logs/.
+    # Fallback robusto se l'output ha un layout diverso.
+    try:
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(args.output))), "session_logs")
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError:
+        log_dir = os.path.dirname(os.path.abspath(args.output)) or "."
+        os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"bc_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("=== BEHAVIORAL CLONING TRAINING LOG ===\n")
+        f.write(f"Avvio:        {datetime.now().isoformat()}\n")
+        f.write(f"Dataset:      {args.dataset} | Campioni: {total_samples} | Device: {device}\n")
+        f.write(f"Iperparam:    epochs={args.epochs} batch={args.batch_size} lr={args.lr} state_dim={state_dim}\n")
+        f.write(f"CornerEmph:   {CORNER_EMPHASIS_ZONES}\n")
+        f.write(f"Output:       {args.output}\n")
+    print(f"  📝 Log di sessione: {log_path}")
+
+    trainer.train(max_epochs=args.epochs, checkpoint_path=args.output, patience=100, log_path=log_path)
 
     print("\n  ✅ Addestramento Behavioral Cloning Multi-Head completato.")
     print(f"  Pesi salvati in: {args.output}\n")
