@@ -58,10 +58,10 @@ L'episodio termina con **`-10.0`** se: `|trackPos| > 1.25` (taglio curva / muro 
 ### D. Ambiente Esplorativo (Anti-Stall Relaxed)
 Per proteggere l'esplorazione nei primissimi secondi di un episodio, il motore fisico di `TorcsEnv` è stato allentato. L'antistallo originario (che uccideva l'episodio se l'auto non superava i 20 km/h in 3 secondi) è stato portato a **10 secondi e 5 km/h**. Questo permette alla rete, inizialmente incerta a causa del rumore esplorativo, di scoprire i pedali senza subire terminazioni falsamente punitive.
 
-## 4. Replay Buffer, Checkpointing e Buffer Injection
+## 4. Replay Buffer, Checkpointing e Caricamento Dati Esperti
 - **Masking Corretto**: Il flag `mask=0.0` (terminale) viene salvato nel buffer *esclusivamente* in caso di crash o fallimento. Il superamento del tempo massimo (`max_steps`) o il completamento del giro non alterano il valore di Bellman (mask = 1.0). **I dati expert** provenienti da giri umani completi usano uniformemente `mask=1.0` per tutti i campioni — il completamento del giro NON è un crash.
-- **Compressione su Disco**: Per evitare di perdere dati tra i vari run, l'intero buffer viene salvato come array numpy compresso (`.npz`).
-- **Expert Buffer Injection**: Il Critic valuterà istantaneamente i Q-Value delle mosse esperte, forzando l'Actor a imitarle.
+- **Compressione su Disco**: Per evitare di perdere dati tra i vari run, il buffer online viene salvato come array numpy compresso (`.npz`).
+- **Caricamento Dati Esperti (nativo, niente script esterni)**: i giri umani vengono caricati **automaticamente da `train_set/laps`** nel buffer `expert_memory` permanente ad **ogni** avvio di `td3_bc.py` (sia `--clean` che resume). Per aggiungere nuovi dati a training già avviato basta depositare i nuovi `.h5` in `train_set/laps` e rilanciare `./train_rl.sh` (senza `--clean`): il buffer expert li ricaricherà tutti. *(Il vecchio script `inject_expert_buffer.py`, che iniettava i dati nel buffer online, è stato RIMOSSO: con l'architettura a buffer separato — sez. 9 — iniettare nell'online esporrebbe di nuovo i dati umani alla FIFO, vanificando l'ancora permanente.)* Il Critic valuta così istantaneamente i Q-Value delle mosse esperte, forzando l'Actor a imitarle.
 - **Update Frequency 1:1**: un aggiornamento del Critic ad ogni step di simulazione (standard TD3), con Delayed Policy Update dell'Actor ogni 2 step. Il buffer è ampio e diversificato (1M online + expert permanente), quindi l'overfitting su transizioni correlate non è un problema; il 1:1 sfrutta al meglio i dati raccolti e velocizza l'apprendimento.
 
 ## 5. Memory Safety (TORCS C++ Engine)
