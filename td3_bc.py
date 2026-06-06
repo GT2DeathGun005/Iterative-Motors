@@ -1,23 +1,24 @@
 """
 TD3+BC Fine-Tuning — Twin Delayed DDPG con Behavioral Cloning
 
-Architettura Ibrida BC-RL per TORCS (Offline-to-Online):
-  - L'Actor eredita backbone + gear_head dal BC (congelati via Gradient Freezing)
-  - Il TD3 aggiorna SOLO continuous_head
-  - Il Critic (Twin Q-Network) è addestrato da zero
-  - Delayed Policy Update: L'Actor e le reti target vengono aggiornati ogni 2 step del Critic.
-  - Target Policy Smoothing: Rumore gaussiano clippato aggiunto alle azioni target.
-  - BC Penalty: L'Actor massimizza il Q-Value restando ancorato ai dati esperti.
+Architettura Ibrida BC-RL per TORCS (Offline-to-Online), allineata al TD3+BC minimalista
+(Fujimoto & Gu, 2021):
+  - L'Actor eredita backbone + gear_head dal BC (warm-start). Il TD3 allena TUTTO l'Actor
+    (backbone + continuous_head); resta congelata solo la gear_head (marcia discreta).
+  - Il Critic (Twin Q-Network) è addestrato da zero.
+  - BC weight COSTANTE = 1.0 → loss = -λ·Q + (π - a)²  (λ = 2.5 / mean|Q|).
+  - Normalizzazione stati mean-0/std-1 (state_norm.npz) applicata prima della rete.
+  - Buffer EXPERT separato e permanente (anti-FIFO) + sampling 3-vie 25/15/60.
+  - Delayed Policy Update (ogni 2 step), Target Policy Smoothing, update ratio 1:1.
 
 Retro-compatibilità:
-  - La 'log_std_head' viene mantenuta nell'Actor unicamente per permettere a
-    'test_agent.py' di caricare i vecchi checkpoint SAC senza crash, ma i suoi
-    gradienti e output sono isolati e inutilizzati nel TD3.
+  - La 'log_std_head' è mantenuta nell'Actor solo per caricare vecchi checkpoint SAC in
+    'test_agent.py' senza crash; è isolata (requires_grad=False) e inutilizzata nel TD3.
 
-Reward Reshaping:
-  - progress = (speedX/50.0) * cos(angle)
-  - Penalità terminali (schianto, stallo, fuoripista): -10.0
-  - Bonus completamento giro: +50.0
+Reward (da corsa, minimalista):
+  - progress = (speedX/50.0) * cos(angle) * 1.5 ; pos_penalty deadzone oltre |trackPos|>1.0
+  - Terminali (schianto, stallo, spin, |trackPos|>1.25 = giro non valido): -10.0
+  - Bonus giro VALIDO completato: +50.0
 """
 
 import os
@@ -41,13 +42,28 @@ except ImportError:
     print("Warning: gym_torcs non trovato.")
 
 # ──────────────────────────────────────────────────────────────────────
-#  Corner-Entry Overspeed Penalty — DEVE coincidere con gym_torcs.py
+#  Normalizzazione stati mean-0 / std-1 (Fujimoto & Gu, 2021)
 # ──────────────────────────────────────────────────────────────────────
-# Replica esatta delle costanti di gym_torcs.py: il reward dei campioni expert
-# iniettati nel buffer deve usare la STESSA formula del reward online, altrimenti
-# il Critic riceverebbe segnali incoerenti. Vedi gym_torcs.py per la spiegazione.
-CORNER_OVERSPEED_K = 2.5
-CORNER_PROX_THRESH = 0.5
+# Il paper TD3+BC normalizza ogni feature dello stato a media 0 / dev.std 1 sul
+# dataset: è uno dei due cambiamenti chiave per la STABILITÀ. Le statistiche
+# (mean/std delle 29 feature) sono calcolate da behavioral_cloning.py sul dataset
+# e salvate in state_norm.npz; qui vengono caricate e applicate alla 29D PRIMA
+# dello stacking, così Actor e Critic vedono sempre stati normalizzati.
+_STATE_NORM_PATH = 'train_set/checkpoints/state_norm.npz'
+
+def _load_state_norm():
+    if os.path.exists(_STATE_NORM_PATH):
+        d = np.load(_STATE_NORM_PATH)
+        return d['mean'].astype(np.float32), d['std'].astype(np.float32)
+    return None, None
+
+_STATE_MEAN, _STATE_STD = _load_state_norm()
+
+def apply_state_norm(s):
+    """(s - mean)/(std + 1e-3) sull'ultima dimensione (29). No-op se mancano le stat."""
+    if _STATE_MEAN is None:
+        return s
+    return ((s - _STATE_MEAN) / (_STATE_STD + 1e-3)).astype(np.float32)
 
 # ──────────────────────────────────────────────────────────────────────
 #  Determinismo
@@ -115,9 +131,10 @@ class ReplayBuffer:
             if max_samples and loaded >= max_samples: break
             try:
                 with h5py.File(f, 'r') as h5f:
-                    states_np = h5f['states'][:]
+                    states_np = h5f['states'][:]   # 29D grezzi (per il reward fisico)
                     actions_np = h5f['actions'][:]
-                    
+
+                states_norm = apply_state_norm(states_np)  # normalizzati (per l'input rete)
                 length = len(states_np)
                 k = 6
                 for i in range(length - 1):
@@ -128,26 +145,24 @@ class ReplayBuffer:
                     n_idx_t6 = max(0, next_i - k)
                     n_idx_t12 = max(0, next_i - 2 * k)
                     
-                    stacked_state = np.concatenate([states_np[idx_t12], states_np[idx_t6], states_np[i]])
-                    next_stacked_state = np.concatenate([states_np[n_idx_t12], states_np[n_idx_t6], states_np[next_i]])
-                    
+                    stacked_state = np.concatenate([states_norm[idx_t12], states_norm[idx_t6], states_norm[i]])
+                    next_stacked_state = np.concatenate([states_norm[n_idx_t12], states_norm[n_idx_t6], states_norm[next_i]])
+
                     cont_action = actions_np[i, 0:3].copy()
                     cont_action[1] = (cont_action[1] * 2.0) - 1.0
                     cont_action[2] = (cont_action[2] * 2.0) - 1.0
-                    
+
+                    # Valori FISICI dello stato grezzo (non normalizzato) per il reward
                     speedX = states_np[i, 21] * 50.0
                     angle = states_np[i, 0]
                     trackPos = states_np[i, 20]
-                    
+
+                    # Reward IDENTICO a gym_torcs.step (progress + deadzone pos_penalty + steer-smooth)
                     progress = (speedX / 50.0) * np.cos(angle)
-                    pos_penalty = -1.0 * (trackPos ** 2)
+                    tp = abs(trackPos)
+                    pos_penalty = -2.0 * (max(0.0, tp - 1.0) ** 2)
                     steer_change = cont_action[0] - actions_np[i-1, 0] if i > 0 else 0.0
-                    # Corner-entry overspeed penalty (coerente con gym_torcs.py).
-                    # I sensori track nello stato 29D sono già /200: front = min(track[8..10]) = idx 9..11.
-                    front_norm = float(np.min(states_np[i, 9:12]))
-                    corner_prox = max(0.0, CORNER_PROX_THRESH - front_norm)
-                    corner_overspeed_penalty = -CORNER_OVERSPEED_K * (corner_prox ** 2) * (speedX / 50.0)
-                    reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change)) + corner_overspeed_penalty
+                    reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
                     
                     mask = 1.0 # Dati expert non sono terminali
                     
@@ -181,14 +196,15 @@ def flatten_state(state_dict: dict) -> np.ndarray:
         if v is None: return np.zeros(size, dtype=np.float32)
         return np.array(v, dtype=np.float32).flatten()[:size]
     try:
-        return np.concatenate([
+        s = np.concatenate([
             [_s('angle')], _a('track', 19), [_s('trackPos'), _s('speedX'), _s('speedY'), _s('speedZ')],
             _a('wheelSpinVel', 4) / 100.0, [_s('rpm') / 10000.0]
         ]).astype(np.float32)
+        return apply_state_norm(s)  # mean-0/std-1 (stabilità, Fujimoto & Gu 2021)
     except Exception as e:
         # NON ingoiare silenziosamente: uno stato a zero falsa la rete ed è arduo da diagnosticare.
         print(f"⚠️  flatten_state fallita (stato a zero): {e}")
-        return np.zeros(29, dtype=np.float32)
+        return apply_state_norm(np.zeros(29, dtype=np.float32))
 
 # ──────────────────────────────────────────────────────────────────────
 #  Architettura TD3
@@ -276,7 +292,7 @@ class Critic(nn.Module):
 class TD3BCAgent:
     def __init__(self, device="cuda"):
         self.device = torch.device(device)
-        self.gamma = 0.999
+        self.gamma = 0.99   # valore di riferimento TD3+BC (era 0.999: inflazionava i Q di 10× e l'overestimation)
         self.tau = 0.005
         self.policy_freq = 2 # Delayed Policy Update
 
@@ -291,12 +307,17 @@ class TD3BCAgent:
         self.critic_target = Critic().to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        # Gradient Freezing: congela backbone e gear_head per preservare
-        # la conoscenza pregressa del BC. Solo continuous_head viene aggiornato.
-        for param in self.actor.backbone.parameters(): param.requires_grad = False
+        # Backbone SCONGELATO (TIER 3b): come in TD3+BC originale si allena tutta la rete
+        # dell'Actor. È sicuro perché l'ancora BC è forte e costante (bc_weight=1.0, niente decay),
+        # e sblocca capacità di apprendimento prima limitata alla sola testa lineare.
+        # Resta congelata solo la gear_head (marcia discreta, ereditata dal BC, non soggetta a RL).
         for param in self.actor.gear_head.parameters(): param.requires_grad = False
 
-        self.actor_optimizer = optim.Adam(self.actor.continuous_head.parameters(), lr=3e-4)
+        # LR di riferimento 3e-4 per Actor e Critic. NON si tunara a tentativi: la
+        # normalizzazione λ = α/mean|Q| del TD3+BC normalizza già il learning rate
+        # rispetto alla scala di Q (Fujimoto & Gu, 2021). L'iperparametro da tarare è α (=2.5).
+        actor_params = [p for p in self.actor.parameters() if p.requires_grad]
+        self.actor_optimizer = optim.Adam(actor_params, lr=3e-4)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
 
     def select_action(self, state, evaluate=False):
@@ -305,31 +326,34 @@ class TD3BCAgent:
             cont_action, _, gear_idx = self.actor.sample(state_t, evaluate=evaluate)
         return cont_action.cpu().numpy()[0], gear_idx.cpu().item()
 
-    def update(self, memory, elite_memory, batch_size, global_step):
-        # ── Hybrid Sampling (75% Standard + 25% Elite) ──
-        # Il buffer standard contiene tutte le esperienze (anche crash e run mediocri),
-        # essenziale per insegnare all'agente a generalizzare in stati "sporchi".
-        # L'Elite Buffer contiene solo i giri da record (Self-Imitation Learning),
-        # che forzano l'Actor a imitare le proprie migliori performance.
-        # Il rapporto 75/25 bilancia generalizzazione vs ottimizzazione.
-        b1 = int(batch_size * 0.75)
-        b2 = batch_size - b1
-        if len(elite_memory.buffer) >= b2:
-            s1, a1, r1, ns1, m1, em1 = memory.sample(b1)
-            s2, a2, r2, ns2, m2, em2 = elite_memory.sample(b2)
-            state_b = np.concatenate([s1, s2], axis=0)
-            action_b = np.concatenate([a1, a2], axis=0)
-            reward_b = np.concatenate([r1, r2], axis=0)
-            next_state_b = np.concatenate([ns1, ns2], axis=0)
-            mask_b = np.concatenate([m1, m2], axis=0)
-            expert_mask_b = np.concatenate([em1, em2], axis=0)
-        else:
-            state_b, action_b, reward_b, next_state_b, mask_b, expert_mask_b = memory.sample(batch_size)
+    def update(self, online_memory, elite_memory, expert_memory, batch_size, global_step):
+        # ── Hybrid Sampling a 3 vie: Expert + Online + Elite ──
+        # Expert (umano): buffer SEPARATO e permanente — mai soggetto a FIFO, quindi
+        #   l'ancora BC è presente in OGNI batch (stabilità del TD3+BC).
+        # Online: esperienza dell'agente (FIFO), per generalizzare in stati "sporchi".
+        # Elite: record dell'agente (Self-Imitation), se disponibili.
+        # Quote: 25% expert + 15% elite + 60% online. Se online/elite sono scarsi
+        # (es. inizio training), il resto è riempito dall'expert (sempre pieno).
+        b_expert = int(batch_size * 0.25)
+        b_elite = min(int(batch_size * 0.15), len(elite_memory.buffer))
+        b_online = min(batch_size - b_expert - b_elite, len(online_memory.buffer))
+        b_expert = batch_size - b_online - b_elite  # il resto dall'expert (sempre disponibile)
 
-        # Reward Scaling: comprime i Q-values per compensare l'orizzonte lungo
-        # di gamma=0.999 (che decuplica la magnitudo dei Q rispetto a gamma=0.99).
-        # Senza questo scaling, i gradienti del Critic esploderebbero.
-        reward_scale = 0.002
+        parts = [expert_memory.sample(b_expert)]
+        if b_online > 0: parts.append(online_memory.sample(b_online))
+        if b_elite > 0:  parts.append(elite_memory.sample(b_elite))
+        state_b      = np.concatenate([p[0] for p in parts], axis=0)
+        action_b     = np.concatenate([p[1] for p in parts], axis=0)
+        reward_b     = np.concatenate([p[2] for p in parts], axis=0)
+        next_state_b = np.concatenate([p[3] for p in parts], axis=0)
+        mask_b       = np.concatenate([p[4] for p in parts], axis=0)
+        expert_mask_b= np.concatenate([p[5] for p in parts], axis=0)
+
+        # Reward Scaling: con gamma=0.99 i Q sono ~10× più piccoli che con 0.999,
+        # quindi alziamo lo scale a 0.02 per tenere i Q in un range sano. Nota: la
+        # normalizzazione λ=α/mean|Q| rende comunque l'Actor invariante alla scala;
+        # questo scale serve solo a mantenere ragionevole la magnitudo del Critic.
+        reward_scale = 0.02
         reward_b = reward_b * reward_scale
 
         state_b = torch.FloatTensor(state_b).to(self.device)
@@ -405,24 +429,21 @@ class TD3BCAgent:
             mutual_exclusion_penalty = (det_accel * det_brake).mean()
             bc_penalty = bc_penalty + (mutual_exclusion_penalty * 0.1)
 
-            # ── Relaxed Policy Constraint Corretto (Beeson & Montana, 2022) ──
-            # Manteniamo lambda FISSO a 2.5 per garantire che il gradiente RL
-            # mantenga una spinta costante verso la massimizzazione di Q.
+            # ── Normalizzazione λ del TD3+BC (Fujimoto & Gu, 2021) ──
+            # λ = α / mean|Q| con α=2.5: rende il termine RL invariante alla scala di Q
+            # (e normalizza implicitamente il learning rate).
             lambda_val = 2.5
             Q_abs_mean = q1_pi.abs().mean().detach().clamp(min=1e-5)
             dynamic_alpha = lambda_val / Q_abs_mean
 
-            # Decadimento esponenziale del peso della BC Penalty con FLOOR permanente.
-            # Da 1.0 (warm-up) scende asintoticamente a 0.5 su 200k step, SENZA mai
-            # azzerare l'ancora. Motivazione empirica: nei run precedenti la policy
-            # regrediva proprio quando bc_weight scendeva sotto ~0.4 (termine RL -2.5
-            # che domina su una BC penalty applicata solo al ~25% di campioni expert).
-            # Il floor a 0.5 realizza la "Permanent BC Adherence" del Residual RL.
-            if global_step <= 15000:
-                bc_weight = 1.0
-            else:
-                progress = min(1.0, (global_step - 15000) / 200000.0)
-                bc_weight = 0.5 + 0.5 * (0.1 ** progress)
+            # ── BC weight COSTANTE = 1.0 (niente decay) ──
+            # Questo riproduce ESATTAMENTE la loss del TD3+BC originale:
+            #   L = -λ·Q + (π - a)²  (qui bc_penalty è la nostra MSE pesata).
+            # Il decay precedente (1.0→0.5) indeboliva la BC nella fase fragile post-warm-up
+            # → "troppo RL troppo presto" → collasso (Beeson & Montana 2022, Ablation 1;
+            # Fujimoto & Gu 2021, ablation su α). L'eventuale rilassamento del vincolo va fatto
+            # in una FASE separata dopo il training stabile, con il Critic congelato (non qui).
+            bc_weight = 1.0
 
             total_actor_loss = dynamic_alpha * actor_loss_td3 + (bc_weight * bc_penalty)
 
@@ -518,8 +539,13 @@ def train():
     set_seed(args.seed)
 
     env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=True)
-    memory = ReplayBuffer(100000)
+    # Buffer ONLINE (FIFO) per l'esperienza dell'agente. 1M transizioni (~0.7 GB RAM):
+    # con ~700 step/episodio copre ~1400 episodi senza evizione precoce.
+    memory = ReplayBuffer(1000000)
     elite_memory = ReplayBuffer(20000)
+    # Buffer EXPERT SEPARATO e PERMANENTE (dati umani): capacità > dataset così non viene
+    # MAI svuotato dalla FIFO. Risolve la perdita dell'ancora BC e la rende presente in ogni batch.
+    expert_memory = ReplayBuffer(400000)
 
     # ── Inizializzazione Agent ──
     agent = TD3BCAgent()
@@ -528,14 +554,16 @@ def train():
     checkpoint_path = 'train_set/checkpoints/td3_checkpoint.pth'
     start_episode, global_step, best_lap_time, best_eval_dist, best_distance = agent.load_checkpoint(checkpoint_path, memory, elite_memory)
 
+    # I dati esperti vengono SEMPRE (ri)caricati da disco nel buffer permanente — sia al
+    # fresh-start sia in resume — così l'ancora umana è garantita per tutto il training.
+    expert_memory.load_expert_data('train_set/laps', max_samples=350000)
+
     agent.actor_frozen = False
 
-    # Warm-Start: se è il primo avvio (nessun checkpoint), inizializza
-    # l'Actor con i pesi BC e inietta 50k campioni esperti nel buffer.
+    # Warm-Start: se è il primo avvio (nessun checkpoint), inizializza l'Actor con i pesi BC.
     if start_episode == 0:
         agent.actor.load_bc_weights(args.bc_weights)
         agent.actor_target.load_state_dict(agent.actor.state_dict())
-        memory.load_expert_data('train_set/laps', max_samples=50000)
     else:
         # Rollback Actor: solo se esplicitamente richiesto da riga di comando
         if args.rollback:
@@ -545,7 +573,8 @@ def train():
                 agent.actor.load_state_dict(torch.load(best_lap_path, map_location=agent.device))
                 agent.actor_target.load_state_dict(agent.actor.state_dict())
                 import torch.optim as optim
-                agent.actor_optimizer = optim.Adam(agent.actor.continuous_head.parameters(), lr=3e-4)
+                agent.actor_optimizer = optim.Adam(
+                    [p for p in agent.actor.parameters() if p.requires_grad], lr=3e-4)
                 # Attiviamo il congelamento temporaneo dell'Actor post-rollback
                 agent.actor_frozen = True
                 print("🧊 Actor congelato temporaneamente per stabilizzazione post-rollback.")
@@ -580,7 +609,7 @@ def train():
         stacked_state = np.concatenate([state_stack[0], state_stack[6], state_stack[12]])
 
         episode_reward, step, max_dist = 0, 0, 0.0
-        critic_loss_val, actor_loss_val = 0.0, 0.0
+        critic_losses, actor_losses = [], []
         termination_reason = "TIMEOUT"
         new_record = False
 
@@ -655,34 +684,44 @@ def train():
             step += 1
             global_step += 1
 
-            # Update Frequency 1:4: un aggiornamento ogni 4 step di simulazione.
-            # Riduce l'overfitting su transizioni correlate e stabilizza i gradienti.
-            if len(memory) > batch_size and global_step % 4 == 0:
-                critic_loss_val, actor_loss_val, _ = agent.update(memory, elite_memory, batch_size, global_step)
+            # Update Frequency 1:1: un aggiornamento ad ogni step di simulazione (standard TD3).
+            # L'expert buffer è sempre pieno → si aggiorna fin dal primo step (il Critic si
+            # pre-allena sui dati umani, come la fase offline del TD3+BC) e l'ancora BC è garantita.
+            if len(expert_memory) > batch_size:
+                critic_loss_val, actor_loss_val, _ = agent.update(memory, elite_memory, expert_memory, batch_size, global_step)
+                critic_losses.append(critic_loss_val)
+                if actor_loss_val != 0.0:
+                    actor_losses.append(actor_loss_val)
 
             if done or env_done or time_limit_reached:
                 for t in episode_transitions:
                     memory.push(t[0], t[1], t[2], t[3], t[4], expert=0.0)
                 
                 # ── Elite Buffer Injection ──
-                # Se la distanza supera la soglia (best_distance * 0.9),
-                # l'episodio viene clonato nell'Elite Buffer per Self-Imitation.
-                # Gli ultimi 50 step di un crash vengono flaggati expert=0.0
-                # per evitare Causal Confusion (imitare azioni pre-schianto).
+                # Se la distanza supera la soglia (best_distance * 0.7), l'episodio viene clonato
+                # nell'Elite Buffer per Self-Imitation. Gli ultimi 50 step di un crash sono flaggati
+                # expert=0.0 per evitare Causal Confusion (imitare azioni pre-schianto).
+                # NB: moltiplicatore abbassato da 0.9 a 0.7. Con 0.9 un singolo colpo fortunato
+                # precoce (es. 2793m all'ep2) bloccava la soglia troppo in alto: l'Elite Buffer
+                # si riempiva ~3 volte su 144 episodi e il Self-Imitation rinforzava solo poche
+                # traiettorie irriproducibili (instabilità). Con 0.7 si riempie più spesso pur
+                # richiedendo episodi "buoni", restando monotonicamente non decrescente.
                 if max_dist >= elite_threshold:
                     n_trans = len(episode_transitions)
                     for i, t in enumerate(episode_transitions):
                         is_danger = (termination_reason == "CRASH") and (i >= n_trans - 50)
                         elite_memory.push(t[0], t[1], t[2], t[3], t[4], expert=0.0 if is_danger else 1.0)
-                    elite_threshold = max(500.0, best_distance * 0.9)  # Soglia monotonicamente crescente
+                    elite_threshold = max(500.0, best_distance * 0.7)  # Soglia monotonicamente crescente
                 break
 
         lap_time = step * 0.02
         time_str = datetime.now().strftime("%H:%M:%S")
+        avg_critic_loss = np.mean(critic_losses) if len(critic_losses) > 0 else 0.0
+        avg_actor_loss = np.mean(actor_losses) if len(actor_losses) > 0 else 0.0
         log_msg = (f"[{time_str}] Episode {episode+1:03d} | [{termination_reason}] | "
                    f"Reward: {episode_reward:7.1f} | Steps: {step:4d} | "
                    f"Time: {lap_time:5.1f}s | Dist: {int(max_dist):5d}m | "
-                   f"CriticL: {critic_loss_val:.3f} | ActorL: {actor_loss_val:.3f}")
+                   f"CriticL: {avg_critic_loss:.3f} | ActorL: {avg_actor_loss:.3f}")
         if new_record: log_msg += f" | 🏆 NEW RECORD"
         print(f"🏁 {log_msg}")
 
@@ -736,6 +775,24 @@ def train():
             if eval_dist > best_eval_dist:
                 best_eval_dist = eval_dist
                 torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_best_eval.pth')
+
+            # ── Best-Ever (sopravvive a --clean) ──
+            # td3_best_eval.pth viene cancellato da --clean. Per non perdere MAI la migliore
+            # policy raggiunta tra run diversi, manteniamo td3_best_ever.pth + un sidecar .txt
+            # con la sua distanza. train_rl.sh --clean NON cancella questi due file.
+            best_ever_pth = 'train_set/checkpoints/td3_best_ever.pth'
+            best_ever_txt = 'train_set/checkpoints/td3_best_ever.txt'
+            prev_best_ever = 0.0
+            if os.path.exists(best_ever_txt):
+                try:
+                    with open(best_ever_txt) as f: prev_best_ever = float(f.read().strip())
+                except Exception: pass
+            if eval_dist > prev_best_ever:
+                torch.save(agent.actor.state_dict(), best_ever_pth)
+                with open(best_ever_txt, 'w') as f: f.write(f"{eval_dist:.2f}")
+                msg = f"  🏅 NUOVO BEST-EVER: {int(eval_dist)}m (preservato anche dopo --clean)"
+                print(msg)
+                with open(log_file, 'a', encoding='utf-8') as f: f.write(msg + "\n")
 
     env.end()
 

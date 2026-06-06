@@ -514,7 +514,7 @@ def main():
             lap_actions: list = []
             lap_dists: list = []  # distFromStart per step (METADATO: NON entra negli stati 29D)
             active_zone_idx = None  # indice zona corrente (per il rumble all'ingresso)
-
+            entered_any_zone = False  # Traccia se siamo entrati in almeno una zona target
 
 
             # ── Stato di validità del giro ──
@@ -592,6 +592,18 @@ def main():
                 if cur_zone is not None and cur_zone != active_zone_idx:
                     controller.rumble(intensity=0.3, duration_ms=180)  # pulsazione gentile = "sei in curva target"
                 active_zone_idx = cur_zone
+
+                if cur_zone is not None:
+                    entered_any_zone = True
+
+                # Termina subito dopo la fine della sezione indicata per ottimizzare il tempo
+                if args.zones and entered_any_zone:
+                    max_zone_bound = max(b for a, b in zones)
+                    if current_dist > max_zone_bound + 10.0:
+                        lap_completed = True
+                        lap_valid = True
+                        lap_time = current_cur_lap
+                        print(f"\n  ✅ [TARGET COMPLETATO] Zona completata (distanza: {current_dist:.1f}m > limit: {max_zone_bound + 10.0:.1f}m). Termino il giro anticipatamente!")
 
                 # Log ogni 2 secondi circa (100 step) — indicatore zona (solo per il record)
                 if step % 100 == 0:
@@ -671,11 +683,25 @@ def main():
                     # Raccolta PARZIALE: guidi il giro intero, tengo solo i segmenti dentro le zone
                     # (con margine di approccio per uno stacking temporale valido).
                     segs = [(s, e) for (s, e) in _extract_segments(dists_np, zones, margin_steps=15) if e - s >= 20]
+                    saved_names = []
                     for (s, e) in segs:
                         lap_counter += 1
-                        _write_h5(os.path.join(laps_dir, f"lap_seg_{lap_counter:03d}.h5"),
+                        # Trova la zona corrispondente al segmento
+                        target_dist = dists_np[(s + e) // 2]
+                        matched_zone = None
+                        for (za, zb) in zones:
+                            if za <= target_dist <= zb:
+                                matched_zone = (za, zb)
+                                break
+                        if matched_zone is None:
+                            matched_zone = min(zones, key=lambda z: min(abs(z[0] - target_dist), abs(z[1] - target_dist)))
+                        
+                        za_int, zb_int = int(matched_zone[0]), int(matched_zone[1])
+                        filename = f"lap_seg_{za_int}m_{zb_int}m_{lap_counter:03d}.h5"
+                        _write_h5(os.path.join(laps_dir, filename),
                                   states_np[s:e], actions_np[s:e], dists_np[s:e])
-                    print(f"  ✅ GIRO VALIDO — Salvati {len(segs)} segmenti curva (lap_seg_*.h5)")
+                        saved_names.append(filename)
+                    print(f"  ✅ GIRO VALIDO — Salvati {len(segs)} segmenti curva ({', '.join(saved_names)})")
                     log_steps = sum(e - s for s, e in segs)
                 else:
                     lap_counter += 1

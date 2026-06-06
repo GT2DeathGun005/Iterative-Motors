@@ -269,10 +269,20 @@ class BehaviorCloningTrainer:
     STEER_CURVE_THRESHOLD = 0.10  # soglia sterzo per curva (nel range [-1,1])
 
     def __init__(self, model: nn.Module, dataset: Dataset,
-                 batch_size: int = 128, lr: float = 3e-4, device: str = "cpu"):
+                 batch_size: int = 128, lr: float = 3e-4, device: str = "cpu",
+                 state_mean=None, state_std=None):
         self.device = torch.device(device)
         self.model = model.to(self.device)
         print(f"  Modello spostato su: {self.device}")
+
+        # Normalizzazione stati mean-0/std-1 (Fujimoto & Gu 2021), applicata DOPO
+        # l'augmentation e prima della rete. Le statistiche (29 feature) sono calcolate
+        # sul dataset in main() e salvate in state_norm.npz (usate poi anche da RL/test).
+        if state_mean is not None:
+            self.state_mean = torch.tensor(state_mean, dtype=torch.float32, device=self.device)
+            self.state_std = torch.tensor(state_std, dtype=torch.float32, device=self.device)
+        else:
+            self.state_mean, self.state_std = None, None
 
         self.optimizer = optim.Adam(
             self.model.parameters(), lr=lr, weight_decay=1e-5
@@ -460,7 +470,10 @@ class BehaviorCloningTrainer:
                     targets[:, 2] = targets[:, 2] + 0.8 * speed_factor
                     targets[:, 2] = torch.clamp(targets[:, 2], 0.0, 1.0)
 
-            # Ri-appiattiamo in 87D prima di passarlo alla rete
+            # Normalizzazione mean-0/std-1 sui 3 frame (DOPO l'augmentation, che lavora
+            # in spazio fisico), poi ri-appiattimento in 87D per la rete.
+            if self.state_mean is not None:
+                states = (states - self.state_mean) / (self.state_std + 1e-3)
             states = states.view(batch_size, 87)
 
             self.optimizer.zero_grad()
@@ -482,6 +495,12 @@ class BehaviorCloningTrainer:
         for states, targets, _weights in self.val_loader:
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
+
+            # Stessa normalizzazione del training (nessuna augmentation in validazione)
+            if self.state_mean is not None:
+                states = states.view(states.size(0), 3, 29)
+                states = (states - self.state_mean) / (self.state_std + 1e-3)
+                states = states.view(states.size(0), 87)
 
             # Val-loss uniforme (sample_weight=None) per restare comparabile tra run
             pred_cont, pred_gear = self.model(states)
@@ -590,6 +609,27 @@ def main():
     # ── Assicurati che la directory di output esista ──
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
+    # ── Statistiche di normalizzazione stati (mean-0/std-1) sul dataset ──
+    # Calcolate sulle 29 feature grezze (post-scaling fisso) e salvate in state_norm.npz.
+    # Verranno applicate qui (BC) e caricate da td3_bc.py / test_agent.py per coerenza.
+    if os.path.isdir(args.dataset):
+        _h5s = sorted(glob.glob(os.path.join(args.dataset, "**/lap_*.h5"), recursive=True))
+    else:
+        _h5s = [args.dataset]
+    _all_states = []
+    for _f in _h5s:
+        try:
+            with h5py.File(_f, 'r') as _h:
+                _all_states.append(_h['states'][:])
+        except Exception:
+            pass
+    _all_states = np.concatenate(_all_states, axis=0).astype(np.float32)  # (N, 29)
+    state_mean = _all_states.mean(axis=0)
+    state_std = _all_states.std(axis=0)
+    _norm_path = os.path.join(os.path.dirname(args.output) or ".", "state_norm.npz")
+    np.savez(_norm_path, mean=state_mean, std=state_std)
+    print(f"  📐 Normalizzazione stati salvata: {_norm_path} (mean/std su {len(_all_states)} stati 29D)")
+
     # ── Modello ──
     model = PolicyNetwork(state_dim=state_dim)
     total_params = sum(p.numel() for p in model.parameters())
@@ -601,7 +641,9 @@ def main():
         dataset=dataset,
         batch_size=args.batch_size,
         lr=args.lr,
-        device=device
+        device=device,
+        state_mean=state_mean,
+        state_std=state_std
     )
 
     # ── Log di sessione (timestamp) in train_set/session_logs/ ──

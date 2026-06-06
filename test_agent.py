@@ -165,6 +165,24 @@ class BCActor(nn.Module):
 #  Utilities
 # ──────────────────────────────────────────────────────────────────────
 
+# Normalizzazione stati mean-0/std-1 (Fujimoto & Gu 2021): stesse statistiche del BC,
+# salvate in state_norm.npz, applicate alla 29D prima dello stacking. DEVE coincidere
+# con td3_bc.apply_state_norm e con quanto applicato in fase di training BC.
+_STATE_NORM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'train_set', 'checkpoints', 'state_norm.npz')
+if os.path.exists(_STATE_NORM_PATH):
+    _sn = np.load(_STATE_NORM_PATH)
+    _STATE_MEAN, _STATE_STD = _sn['mean'].astype(np.float32), _sn['std'].astype(np.float32)
+else:
+    _STATE_MEAN, _STATE_STD = None, None
+
+
+def apply_state_norm(s):
+    if _STATE_MEAN is None:
+        return s
+    return ((s - _STATE_MEAN) / (_STATE_STD + 1e-3)).astype(np.float32)
+
+
 def flatten_state(state_dict: dict) -> np.ndarray:
     """Appiattisce osservazione TORCS → vettore 29D.
 
@@ -183,7 +201,7 @@ def flatten_state(state_dict: dict) -> np.ndarray:
         return np.array(v, dtype=np.float32).flatten()[:size]
 
     try:
-        return np.concatenate([
+        s = np.concatenate([
             [_s('angle')],
             _a('track', 19),              # già /200 da make_observaton
             [_s('trackPos')],
@@ -193,10 +211,11 @@ def flatten_state(state_dict: dict) -> np.ndarray:
             _a('wheelSpinVel', 4) / 100.0,
             [_s('rpm') / 10000.0],
         ]).astype(np.float32)
+        return apply_state_norm(s)  # mean-0/std-1, coerente col training
     except Exception as e:
         # NON silenziare: uno stato a zero falsa l'inferenza ed è difficilissimo da diagnosticare.
         print(f"⚠️  flatten_state fallita (stato a zero): {e}")
-        return np.zeros(29, dtype=np.float32)
+        return apply_state_norm(np.zeros(29, dtype=np.float32))
 
 
 def denormalize_action_bc(cont_action: np.ndarray, gear: int) -> np.ndarray:
@@ -239,11 +258,12 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
     """Carica i migliori pesi disponibili con auto-detect del formato.
 
     Priorità (se --weights non è specificato):
-      1. td3_best_eval.pth (miglior checkpoint deterministico TD3)
-      2. td3_best_lap.pth  (record sul giro TD3)
-      3. td3_best_dist.pth (record di distanza TD3)
-      4. td3_policy.pth    (ultimo step TD3)
-      5. bc_policy.pth     (fallback supervisionato)
+      1. td3_best_ever.pth (miglior policy ASSOLUTA tra tutti i run; sopravvive a --clean)
+      2. td3_best_eval.pth (miglior checkpoint deterministico del run corrente)
+      3. td3_best_lap.pth  (record sul giro TD3)
+      4. td3_best_dist.pth (record di distanza TD3)
+      5. td3_policy.pth    (ultimo step TD3)
+      6. bc_policy.pth     (fallback supervisionato)
 
     Se --weights è specificato, usa quello direttamente.
 
@@ -252,6 +272,7 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
     """
     checkpoint_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'train_set', 'checkpoints')
+    td3_best_ever_path = os.path.join(checkpoint_dir, 'td3_best_ever.pth')
     td3_best_eval_path = os.path.join(checkpoint_dir, 'td3_best_eval.pth')
     td3_best_lap_path = os.path.join(checkpoint_dir, 'td3_best_lap.pth')
     td3_best_dist_path = os.path.join(checkpoint_dir, 'td3_best_dist.pth')
@@ -263,6 +284,9 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
     # Se l'utente ha specificato un path esplicito, usalo
     if weights_arg:
         load_path = weights_arg
+    elif os.path.exists(td3_best_ever_path):
+        load_path = td3_best_ever_path
+        print(f"  🔍 Auto-detect: trovato td3_best_ever.pth (Miglior policy ASSOLUTA, sopravvive ai --clean!)")
     elif os.path.exists(td3_best_eval_path):
         load_path = td3_best_eval_path
         print(f"  🔍 Auto-detect: trovato td3_best_eval.pth (Miglior checkpoint deterministico TD3!)")
@@ -458,9 +482,9 @@ def main():
                     'gear': int(env_action[3])
                 })
 
-                # ── Check fuoripista/spin (soglia a 1.50 per consentire l'uso delle vie di fuga asfaltate e dei cordoli estesi) ──
-                if abs(track_pos) > 1.50:
-                    print(f"  ⚠️  Fuori pista allo step {step} (trackPos={track_pos:.3f})")
+                # ── Giro NON valido oltre |trackPos| > 1.25 (taglio/muro), coerente col training e coi limiti di raccolta dati ──
+                if abs(track_pos) > 1.25:
+                    print(f"  ⚠️  Fuori pista / giro non valido allo step {step} (trackPos={track_pos:.3f})")
                     break
                 if np.cos(angle) < 0:
                     print(f"  ⚠️  Spin allo step {step} (angle={angle:.3f})")

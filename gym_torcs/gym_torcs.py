@@ -13,21 +13,6 @@ import time
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _AUTOSTART_SH = os.path.join(_THIS_DIR, 'autostart.sh')
 
-# ──────────────────────────────────────────────────────────────────────
-#  Corner-Entry Overspeed Penalty (anti-understeer staccate)
-# ──────────────────────────────────────────────────────────────────────
-# Penalizza l'arrivo veloce in prossimità di una curva: insegna a scaricare
-# velocità in ingresso (frenare) dove serve, attaccando il fallimento ricorrente
-# (understeer al tornante perché arriva a ~165 invece di ~130 km/h).
-# Generale: usa i sensori frontali della pista, NON una posizione del tracciato.
-#   front_norm = min(track[8..10]) / 200   (1.0 = pista libera 200m, 0 = muro vicino)
-#   corner_prox = max(0, CORNER_PROX_THRESH - front_norm)   (>0 se curva entro ~100m)
-#   penalty = -CORNER_OVERSPEED_K * corner_prox^2 * (speedX/50)
-# ⚠️ CORNER_OVERSPEED_K va RIPLICATO identico in td3_bc.load_expert_data (coerenza
-#    reward online vs expert per il Critic). Tararlo durante il training.
-CORNER_OVERSPEED_K = 2.5
-CORNER_PROX_THRESH = 0.5  # 0.5*200m = 100m di visibilità frontale
-
 
 def _kill_torcs():
     """Termina le istanze TORCS.
@@ -173,18 +158,16 @@ class TorcsEnv:
         steer_change = this_action['steer'] - self.last_steer
         self.last_steer = this_action['steer']
 
-        # Penalità quadratica per mantenere il centro (deadzone naturale per il BC)
-        pos_penalty = -1.0 * (obs['trackPos'] ** 2)
+        # Penalità di posizione con DEADZONE: nessuna penalità entro |trackPos| < 1.0
+        # (libertà piena sulla pista), poi una rampa morbida nella fascia dei cordoli
+        # 1.0→1.25 come margine prima del limite di GIRO VALIDO. Oltre 1.25 = taglio/uscita
+        # → terminale (sotto). Coerente coi limiti usati in raccolta dati (|trackPos| ≤ 1.25).
+        tp = abs(float(obs['trackPos']))
+        pos_penalty = -2.0 * (max(0.0, tp - 1.0) ** 2)
 
-        # Penalità overspeed in ingresso curva (vedi costanti in cima al file).
-        # I sensori 'track' grezzi sono in metri (0-200) → normalizziamo /200 come make_observaton.
-        track_norm = np.asarray(obs['track'], dtype=np.float32) / 200.0
-        front_norm = float(np.min(track_norm[8:11])) if track_norm.size >= 11 else 1.0
-        corner_prox = max(0.0, CORNER_PROX_THRESH - front_norm)
-        corner_overspeed_penalty = -CORNER_OVERSPEED_K * (corner_prox ** 2) * sp_norm
-
-        # Reward finale scalata e bilanciata
-        reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change)) + corner_overspeed_penalty
+        # Reward da corsa: massimizza il progresso (velocità in avanti) lasciando l'agente
+        # libero su staccate e velocità in curva; lo steer-smoothness è un lieve anti-zigzag.
+        reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
         
         # info dict comunicherà al Replay Buffer se il done è un vero "crash"
         info = {'crash': False}
@@ -205,8 +188,9 @@ class TorcsEnv:
                 client.R.d['meta'] = True
 
         if self.early_termination:
-            # Fuoripista (|trackPos| > 1.5)
-            if abs(obs['trackPos']) > 1.5:
+            # Giro NON valido: oltre |trackPos| > 1.25 (taglio curva / muro). È lo stesso limite
+            # usato in raccolta dati (cordoli consentiti fino a 1.25, oltre = invalido).
+            if abs(obs['trackPos']) > 1.25:
                 reward = -10.0
                 info['crash'] = True
                 episode_terminate = True

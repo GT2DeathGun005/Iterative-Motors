@@ -10,7 +10,7 @@ Questo repository implementa una pipeline end-to-end per addestrare un agente di
 
 Questo progetto supera il classico Behavioral Cloning tramite un'architettura **Ibrida BC-RL**. L'agente parte con una **Deep Policy Network Multi-Head** addestrata offline per imitare l'esperto umano. Per sconfiggere il temuto *Covariate Shift* (che fa deragliare l'agente non appena si discosta millimetricamente dalla traiettoria ottimale), la pipeline prosegue con un **TD3+BC Fine-Tuning**.
 
-Questa fase RL sfrutta la tecnica del **Warm-Start** e il **Gradient Freezing**: il backbone estratto dal BC viene congelato (per prevenire il *Latent Shift*), mentre il TD3 esplora l'ambiente penalizzando duramente gli errori di traiettoria e massimizzando la velocità longitudinale.
+Questa fase RL sfrutta il **Warm-Start** dal BC e segue il **TD3+BC minimalista** (Fujimoto & Gu, 2021): l'Actor (backbone incluso) viene allenato con un termine di Behavioral Cloning **costante** che lo ancora ai dati umani, mentre il TD3 massimizza la velocità longitudinale. Stati normalizzati mean-0/std-1 e ancora BC sempre presente in ogni batch → stabilità.
 
 ### Punti di forza della pipeline Ibrida BC-RL:
 1. **Sample Efficiency**: Il BC fornisce un ottimo punto di partenza, abbattendo drasticamente i tempi di esplorazione del RL.
@@ -150,7 +150,9 @@ Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per preve
 
 ### 4. Test Deterministico (Inference)
 
-Il test agent auto-rileva i migliori pesi disponibili: `td3_best_eval.pth` → `td3_best_lap.pth` → `td3_best_dist.pth` → `td3_policy.pth` → `bc_policy.pth`.
+Il test agent auto-rileva i migliori pesi disponibili: `td3_best_ever.pth` → `td3_best_eval.pth` → `td3_best_lap.pth` → `td3_best_dist.pth` → `td3_policy.pth` → `bc_policy.pth`.
+
+> `td3_best_ever.pth` è la **migliore policy assoluta tra tutti i run** e — a differenza degli altri — **sopravvive a `--clean`** (così non si perde mai un buon risultato per un restart sfortunato).
 
 > ⚠️ **BC vs RL — rilevamento per nome file**: la mappatura azioni (RL: `tanh→[0,1]`; BC: `sigmoid`) viene scelta in base al **nome del file** (`td3_*`/`sac_*` = RL, `bc_*` = BC), **non** dalla presenza di `log_std_head` (che i vecchi checkpoint BC possono contenere). Caricare un BC come se fosse RL applicherebbe la de-normalizzazione sbagliata su gas/freno.
 
@@ -187,12 +189,12 @@ Durante il training RL, il log stampa metriche fondamentali per diagnosticare la
 
 ### 2. Actor Loss (`ActorL`)
 * **Cos'è:** Misura quanto l'Actor sta massimizzando le reward stimate dal Critic. 
-* **Valori Sani:** Grazie al *Masking Rigoroso*, l'ActorL non rimarrà più incastrata in un plateau a `2.5` durante i crash o fasi OOD. La loss deve assumere valori variabili e scendere dolcemente man mano che il *Lambda* decade.
+* **Valori Sani:** con `bc_weight=1.0` costante, dopo il warm-up l'ActorL si assesta intorno a **`-2.5`** (= `-λ`, dominanza del termine RL normalizzato). È il comportamento atteso del TD3+BC.
 * **Diagnosi:** Una discesa progressiva della loss è segno che l'Actor sta abbandonando l'imitazione forte iniziale per capitalizzare sul Q-Value. 
 
 ### 3. Dinamiche TD3+BC (Decay di Lambda)
 * In TD3+BC l'entropia del SAC è rimossa, l'agente è completamente deterministico.
-* **BC Weight Decay (con floor):** $\lambda$ resta **fisso a `2.5`** (normalizzazione di Fujimoto & Gu, 2021). A decadere è il **peso della BC Penalty** $w_{BC}$, da `1.0` verso un **floor permanente di `0.5`** sui 200k step successivi ai 15k di warm-up — **non scende mai a zero** (Permanent BC Adherence). Motivazione: la BC penalty agisce solo sul ~25% di campioni expert mentre il termine Q agisce su tutto il batch; un floor alto evita che l'ancora venga sopraffatta e che la policy regredisca (osservato nei run con floor 0.1).
+* **BC weight costante = 1.0:** $\lambda$ resta **fisso a `2.5`** (normalizzazione di Fujimoto & Gu, 2021) e il peso della BC penalty è **costante** — niente decay. La loss è esattamente quella del TD3+BC originale ($-\lambda Q + (\pi-a)^2$). Un decay del vincolo nella fase fragile causava "troppo RL troppo presto" → collasso (Beeson & Montana 2022, Ablation 1). L'ancora umana è inoltre **garantita in ogni batch** dal buffer expert separato (quota 25%).
 
 ---
 
@@ -225,25 +227,24 @@ Actor (Warm-Start da BC)                    Critic (Twin Q-Network, da zero)
 └─────────────────────────┘                 + Target Q (Polyak τ=0.005)
 ```
 
-**Gradient Freezing:** Il backbone e la gear_head hanno `requires_grad=False`. L'ottimizzatore aggiorna SOLO `continuous_head` (LR=3e-4). La `log_std_head` è mantenuta con `requires_grad=False` per retro-compatibilità, ma è completamente isolata dal training TD3.
+**Training dell'Actor:** come nel TD3+BC originale, il TD3 allena **tutto l'Actor** (backbone + `continuous_head`) con LR=`3e-4`. Resta congelata solo la `gear_head` (marcia discreta, dal BC) e la `log_std_head` (legacy, retro-compatibilità). L'ancora BC costante (`bc_weight=1.0`) previene il *Latent Shift* del backbone.
 
 **Critic Warm-Up (15.000 step):** I primi 15.000 step aggiornano solo il Critic. Questo protegge i pesi BC dai gradienti randomici di un Critic non ancora calibrato.
 
-**Update Frequency 1:4:** L'aggiornamento avviene ogni 4 step, non ad ogni step. Riduce l'overfitting su transizioni correlate.
+**Update Frequency 1:1:** un aggiornamento ad ogni step di simulazione (standard TD3). Con l'expert buffer sempre pieno il Critic si pre-allena sui dati umani già dal primo step.
 
-### Reward Reshaping
+### Reward Reshaping (da corsa, minimalista)
 
-La formula del calcolo della ricompensa per timestep in `gym_torcs.py`:
+Formula per timestep in `gym_torcs.py`:
 
-$$r_t = \underbrace{\frac{v_x}{50} \cos(\theta) \times 1.5}_{\text{progress}} \underbrace{- (\text{trackPos})^2}_{\text{pos penalty}} \underbrace{- 0.05|\delta_t - \delta_{t-1}|}_{\text{steer smooth}} \underbrace{- K\,\max(0, 0.5{-}\text{front})^2 \frac{v_x}{50}}_{\text{corner overspeed}}$$
+$$r_t = \underbrace{\tfrac{v_x}{50} \cos(\theta) \times 1.5}_{\text{progress}} \underbrace{- 2\,\max(0, |\text{trackPos}|-1)^2}_{\text{pos penalty (deadzone)}} \underbrace{- 0.05|\delta_t - \delta_{t-1}|}_{\text{steer smooth}}$$
 
-- **Progress**: Velocità in avanti normalizzata, ponderata dal coseno dell'angolo di imbardata, moltiplicata per 1.5.
-- **Pos Penalty**: Penalità quadratica sulla distanza dal centro pista (deadzone naturale).
-- **Steer Smoothness**: Penalità sulle variazioni brusche di sterzo (coefficiente 0.05).
-- **Corner Overspeed Penalty** (`K = CORNER_OVERSPEED_K = 2.5`): penalizza l'arrivo veloce in prossimità di una curva (`front = min(track[8..10])/200`; attiva entro ~100m, cresce col quadrato della vicinanza e con la velocità). Insegna a **frenare in staccata** (attacca l'understeer al tornante). Generale (sensori, non posizione); `0` su pista libera. ⚠️ `K` è replicato identico in `td3_bc.load_expert_data` per coerenza del Critic — **da tarare durante il training**.
-- **Terminali cappati a -10.0**: Danno al veicolo, fuoripista, spin e stallo.
-- **Bonus completamento giro: +50.0**: Segnale esplicito per il Critic.
-- **Nessuna sparse reward**: Reward densa per evitare distorsioni del gradiente del Critic.
+- **Progress**: velocità in avanti normalizzata × `cos(angle)` × 1.5. È il termine dominante → giri veloci.
+- **Pos Penalty (deadzone)**: **0** entro `|trackPos| < 1.0` (libertà piena), rampa morbida sui cordoli `1.0→1.25`. Lascia l'agente libero su staccate e linea.
+- **Steer Smoothness**: lieve anti-zigzag (coeff. 0.05).
+- **Terminali -10.0**: danno/muro, **`|trackPos| > 1.25` (giro non valido)**, spin, stallo.
+- **Bonus giro VALIDO: +50.0**: TORCS aggiorna `lastLapTime` solo per giri senza tagli/uscite.
+- *(La vecchia "Corner Overspeed Penalty" è stata RIMOSSA: creava un attrattore "vai piano" → collasso. L'agente è ora libero di scegliere le velocità in curva, purché resti valido e veloce.)*
 
 ### Replay Buffer Checkpointing
 
