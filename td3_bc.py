@@ -517,7 +517,7 @@ class TD3BCAgent:
             global_step = checkpoint['global_step']
             print(f"✅ Checkpoint caricato: ripresa dall'Episodio {episode}")
         else:
-            # È un file di soli pesi dell'actor (come td3_best_dist.pth)
+            # È un file di soli pesi dell'actor (come td3_expl_best_dist.pth)
             print("ℹ️ Checkpoint contiene solo pesi dell'Actor (formato weights-only). Inizializzazione degli altri componenti.")
             self.actor.load_state_dict(checkpoint)
             self.actor_target.load_state_dict(self.actor.state_dict())
@@ -532,6 +532,24 @@ class TD3BCAgent:
         # best_distance alto → elite_threshold = best_distance*0.9 si alza subito e il buffer
         # non si riempie più (Self-Imitation spento). Su weights-only i record ripartono puliti.
         return episode, global_step, best_lap_time, best_eval_dist, best_distance
+
+def load_recent_evals_from_log(log_path, max_len=8):
+    evals = []
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if '🔍 [EVAL] Result: Dist' in line:
+                        try:
+                            parts = line.split('Dist ')
+                            if len(parts) > 1:
+                                dist_str = parts[1].split('m')[0].strip()
+                                evals.append(float(dist_str))
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"⚠️ Impossibile leggere lo storico eval dal log: {e}")
+    return evals[-max_len:]
 
 def train():
     parser = argparse.ArgumentParser()
@@ -571,19 +589,30 @@ def train():
     #  AUTO-REFINEMENT (Beeson & Montana 2022): dopo un PLATEAU stabile, congela il
     #  Critic e riduce il vincolo BC per spingere la policy deterministica oltre il muro.
     #  Conservativo (refine troppo presto → collasso, Ablation 1) + rete di sicurezza:
-    #  se l'eval crolla, rollback automatico al best_ever (mai perso su disco).
+    #  se l'eval crolla, rollback automatico al td3_det_best_dist (mai perso su disco).
     # ─────────────────────────────────────────────────────────────────────────
     REFINE_BC_WEIGHT = 0.3         # vincolo BC ridotto durante la refinement
     REFINE_MAX_ATTEMPTS = 3        # oltre, resta in training normale (no loop)
     REFINE_COLLAPSE_FRAC = 0.6     # eval < 60% del LIVELLO RECENTE per 3 volte → rollback
     REFINE_WINDOW = 8              # ampiezza finestra eval per MEDIA/MAX recenti (statistica robusta)
-    REFINE_PLATEAU_EVALS = 12      # valutazioni con MEDIA recente NON in salita → plateau (auto)
+    REFINE_PLATEAU_EVALS = 4       # valutazioni con MEDIA recente NON in salita → plateau (auto)
     REFINE_MIN_EP = 200            # episodio minimo per l'auto-trigger
     REFINE_IMPROVE_FRAC = 1.02     # la media deve salire >2% per contare come "miglioramento"
     agent.refine_mode = False
     agent.refine_bc_weight = 1.0
     recent_eval_window = deque(maxlen=REFINE_WINDOW)  # ultimi eval → media/max recenti
+
+    # Popoliamo la finestra leggendo i dati recenti direttamente dal log
+    initial_evals = load_recent_evals_from_log('train_set/session_logs/td3_training.log', REFINE_WINDOW)
+    for ev in initial_evals:
+        recent_eval_window.append(ev)
+    if len(recent_eval_window) > 0:
+        print(f"📊 Caricati {len(recent_eval_window)} eval precedenti dal log. Storico: {list(recent_eval_window)}")
+
     refine_best_mean = 0.0         # miglior MEDIA-finestra vista (segnale di plateau)
+    if len(recent_eval_window) >= REFINE_WINDOW:
+        refine_best_mean = sum(recent_eval_window) / len(recent_eval_window)
+
     refine_evals_no_improve = 0
     refine_attempts = 0
     refine_plateau_level = 0.0     # 0 = riferimento rollback non ancora impostato
@@ -593,20 +622,51 @@ def train():
         # Avvio mirato quando l'operatore SA già che è in plateau: refinement ON da subito.
         agent.refine_mode = True
         agent.refine_bc_weight = REFINE_BC_WEIGHT
-        print(f"🔧 --refine attivo: refinement ON da subito (Critic congelato, bc_weight={REFINE_BC_WEIGHT}). "
-              f"Riferimento rollback impostato dopo i primi eval (MAX recente).")
+        
+        # Inizializziamo il livello di riferimento per il rollback di sicurezza
+        # usando lo storico appena letto dal log, o il record caricato o td3_det_best_dist.
+        # Se stiamo facendo un rollback, escludiamo lo storico recente (che è degradato)
+        # e usiamo direttamente il best_eval_dist o il file td3_det_best_dist.
+        if len(recent_eval_window) >= 4 and not getattr(args, 'rollback', False):
+            refine_plateau_level = float(np.median(list(recent_eval_window)))
+        else:
+            refine_plateau_level = best_eval_dist
+            det_best_dist_txt = 'train_set/checkpoints/td3_det_best_dist.txt'
+            if refine_plateau_level <= 0.0 and os.path.exists(det_best_dist_txt):
+                try:
+                    with open(det_best_dist_txt) as f_be:
+                        refine_plateau_level = float(f_be.read().strip())
+                except Exception:
+                    pass
+
+        if refine_plateau_level > 0.0:
+            print(f"🔧 --refine attivo: refinement ON da subito (Critic congelato, bc_weight={REFINE_BC_WEIGHT}). "
+                  f"Riferimento rollback impostato a {refine_plateau_level:.0f}m.")
+        else:
+            print(f"🔧 --refine attivo: refinement ON da subito (Critic congelato, bc_weight={REFINE_BC_WEIGHT}). "
+                  f"Riferimento rollback impostato dopo i primi eval (MAX recente).")
 
     # Warm-Start: se è il primo avvio (nessun checkpoint), inizializza l'Actor con i pesi BC.
     if start_episode == 0:
         agent.actor.load_bc_weights(args.bc_weights)
         agent.actor_target.load_state_dict(agent.actor.state_dict())
     else:
-        # Rollback Actor: solo se esplicitamente richiesto da riga di comando
+        # Rollback Actor: solo se esplicitamente richiesto da riga di comando.
+        # PRIORITÀ DETERMINISTICA (la competizione/submission usa la policy senza rumore):
+        # si riparte dalla migliore policy DETERMINISTICA, non dal giro esplorativo (rumoroso,
+        # "fortunato"). Gli esplorativi (best_lap/best_dist) sono solo un ripiego estremo.
         if args.rollback:
-            best_lap_path = 'train_set/checkpoints/td3_best_lap.pth'
-            if os.path.exists(best_lap_path):
-                print(f"♻️  Rollback Actor: caricamento dei pesi del miglior giro storico da {best_lap_path}")
-                agent.actor.load_state_dict(torch.load(best_lap_path, map_location=agent.device))
+            rollback_candidates = [
+                'train_set/checkpoints/td3_det_best_lap.pth',  # 1) giro VALIDO deterministico più veloce
+                'train_set/checkpoints/td3_det_best_dist.pth',          # 2) miglior DISTANZA deterministica (sopravvive a --clean)
+                'train_set/checkpoints/td3_det_best_dist_run.pth',          # 3) miglior eval deterministico del run corrente
+                'train_set/checkpoints/td3_expl_best_lap.pth',           # 4) giro ESPLORATIVO (rumoroso) — ripiego
+                'train_set/checkpoints/td3_expl_best_dist.pth',          # 5) distanza ESPLORATIVA — ripiego
+            ]
+            best_path = next((p for p in rollback_candidates if os.path.exists(p)), None)
+            if best_path:
+                print(f"♻️  Rollback Actor: caricamento della migliore policy deterministica da {best_path}")
+                agent.actor.load_state_dict(torch.load(best_path, map_location=agent.device))
                 agent.actor_target.load_state_dict(agent.actor.state_dict())
                 import torch.optim as optim
                 agent.actor_optimizer = optim.Adam(
@@ -615,7 +675,7 @@ def train():
                 agent.actor_frozen = True
                 print("🧊 Actor congelato temporaneamente per stabilizzazione post-rollback.")
             else:
-                print("⚠️  Rollback richiesto ma train_set/checkpoints/td3_best_lap.pth non trovato! Avvio ripresa normale.")
+                print("⚠️  Rollback richiesto ma nessun checkpoint valido trovato! Avvio ripresa normale.")
         else:
             print("▶️  Ripresa regolare dal checkpoint (nessun rollback o congelamento Actor).")
 
@@ -706,7 +766,7 @@ def train():
                 if last_lap_time < best_lap_time:
                     best_lap_time = last_lap_time
                     new_record = True
-                    torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_best_lap.pth')
+                    torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_expl_best_lap.pth')
                 
             if info.get('crash', False):
                 done, termination_reason = True, "CRASH"
@@ -714,7 +774,7 @@ def train():
 
             if max_dist > best_distance and max_dist > 500.0:
                 best_distance = max_dist
-                torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_best_dist.pth')
+                torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_expl_best_dist.pth')
 
             next_stacked_state = np.concatenate([state_stack[0], state_stack[6], state_stack[12]])
             mask = 0.0 if info.get('crash', False) else 1.0
@@ -824,47 +884,53 @@ def train():
                 if eval_info.get('crash', False) or eval_done: break
             agent.actor.train()
 
-            eval_msg = f"[{time_str}] 🔍 [EVAL] Result: Dist {int(eval_dist)}m | Reward: {eval_reward:.1f}"
+            refine_status = ""
+            if getattr(agent, 'refine_mode', False):
+                refine_status = f" | Refine: ON (bc_weight={agent.refine_bc_weight:.1f}, Critic Frozen, target={refine_plateau_level:.0f}m)"
+            else:
+                refine_status = " | Refine: OFF"
+            
+            eval_msg = f"[{time_str}] 🔍 [EVAL] Result: Dist {int(eval_dist)}m | Reward: {eval_reward:.1f}{refine_status}"
             print(f"  {eval_msg}")
             with open(log_file, 'a', encoding='utf-8') as f: f.write(eval_msg + "\n")
             
             if eval_dist > best_eval_dist:
                 best_eval_dist = eval_dist
-                torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_best_eval.pth')
+                torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_det_best_dist_run.pth')
 
             # ── Best-Ever (sopravvive a --clean) ──
-            # td3_best_eval.pth viene cancellato da --clean. Per non perdere MAI la migliore
-            # policy raggiunta tra run diversi, manteniamo td3_best_ever.pth + un sidecar .txt
+            # td3_det_best_dist_run.pth viene cancellato da --clean. Per non perdere MAI la migliore
+            # policy raggiunta tra run diversi, manteniamo td3_det_best_dist.pth + un sidecar .txt
             # con la sua distanza. train_rl.sh --clean NON cancella questi due file.
-            best_ever_pth = 'train_set/checkpoints/td3_best_ever.pth'
-            best_ever_txt = 'train_set/checkpoints/td3_best_ever.txt'
-            prev_best_ever = 0.0
-            if os.path.exists(best_ever_txt):
+            det_best_dist_pth = 'train_set/checkpoints/td3_det_best_dist.pth'
+            det_best_dist_txt = 'train_set/checkpoints/td3_det_best_dist.txt'
+            prev_det_best_dist = 0.0
+            if os.path.exists(det_best_dist_txt):
                 try:
-                    with open(best_ever_txt) as f: prev_best_ever = float(f.read().strip())
+                    with open(det_best_dist_txt) as f: prev_det_best_dist = float(f.read().strip())
                 except Exception: pass
-            if eval_dist > prev_best_ever:
-                torch.save(agent.actor.state_dict(), best_ever_pth)
-                with open(best_ever_txt, 'w') as f: f.write(f"{eval_dist:.2f}")
+            if eval_dist > prev_det_best_dist:
+                torch.save(agent.actor.state_dict(), det_best_dist_pth)
+                with open(det_best_dist_txt, 'w') as f: f.write(f"{eval_dist:.2f}")
                 msg = f"  🏅 NUOVO BEST-EVER: {int(eval_dist)}m (preservato anche dopo --clean)"
                 print(msg)
                 with open(log_file, 'a', encoding='utf-8') as f: f.write(msg + "\n")
 
             # ── Best-Eval-LapTime: miglior GIRO VALIDO deterministico (candidato submission) ──
-            # A differenza di best_ever (basato sulla DISTANZA), questo cattura il GIRO VALIDO più
+            # A differenza di td3_det_best_dist (basato sulla DISTANZA), questo cattura il GIRO VALIDO più
             # VELOCE chiuso in eval deterministica: esattamente la policy da sottomettere. Sidecar
             # .txt col tempo; train_rl.sh --clean NON lo cancella (preservato tra run).
             if eval_best_lap_in_run < float('inf'):
-                best_lt_pth = 'train_set/checkpoints/td3_best_eval_laptime.pth'
-                best_lt_txt = 'train_set/checkpoints/td3_best_eval_laptime.txt'
-                prev_best_lt = float('inf')
-                if os.path.exists(best_lt_txt):
+                det_best_lap_pth = 'train_set/checkpoints/td3_det_best_lap.pth'
+                det_best_lap_txt = 'train_set/checkpoints/td3_det_best_lap.txt'
+                prev_det_best_lap = float('inf')
+                if os.path.exists(det_best_lap_txt):
                     try:
-                        with open(best_lt_txt) as f: prev_best_lt = float(f.read().strip())
+                        with open(det_best_lap_txt) as f: prev_det_best_lap = float(f.read().strip())
                     except Exception: pass
-                if eval_best_lap_in_run < prev_best_lt:
-                    torch.save(agent.actor.state_dict(), best_lt_pth)
-                    with open(best_lt_txt, 'w') as f: f.write(f"{eval_best_lap_in_run:.3f}")
+                if eval_best_lap_in_run < prev_det_best_lap:
+                    torch.save(agent.actor.state_dict(), det_best_lap_pth)
+                    with open(det_best_lap_txt, 'w') as f: f.write(f"{eval_best_lap_in_run:.3f}")
                     msg = f"  🏆 NUOVO MIGLIOR GIRO VALIDO (eval deterministica): {eval_best_lap_in_run:.3f}s (preservato anche dopo --clean)"
                     print(msg)
                     with open(log_file, 'a', encoding='utf-8') as f: f.write(msg + "\n")
@@ -889,19 +955,19 @@ def train():
                             and refine_attempts < REFINE_MAX_ATTEMPTS):
                         agent.refine_mode = True
                         agent.refine_bc_weight = REFINE_BC_WEIGHT
-                        # Riferimento rollback = MAX recente (modo "buono" del bimodale), non il best storico
-                        refine_plateau_level = max(recent_eval_window)
+                        # Riferimento rollback = MEDIANA recente (modo 'buono' del bimodale), non il singolo max stocastico
+                        refine_plateau_level = float(np.median(list(recent_eval_window)))
                         refine_collapse_count = 0
                         refine_breakout_logged = False
                         _rlog(f"  🔧 AUTO-REFINEMENT ON (tentativo {refine_attempts+1}/{REFINE_MAX_ATTEMPTS}): "
                               f"media recente in plateau a {cur_mean:.0f}m, Critic congelato, "
-                              f"bc_weight→{REFINE_BC_WEIGHT}, riferimento={refine_plateau_level:.0f}m")
+                              f"bc_weight→{REFINE_BC_WEIGHT}, riferimento (mediana)={refine_plateau_level:.0f}m (max recente={max(recent_eval_window):.0f}m)")
             elif refine_plateau_level <= 0.0:
                 # --refine: refinement già ON, ma il riferimento rollback si fissa dopo i primi eval
-                # (MAX recente), così la rete di sicurezza non usa un valore casuale/fortunato.
-                if len(recent_eval_window) >= 3:
-                    refine_plateau_level = max(recent_eval_window)
-                    _rlog(f"  🔧 refinement: riferimento rollback = {refine_plateau_level:.0f}m (MAX recente)")
+                # (MEDIANA recente per robustezza), così la rete di sicurezza non usa un valore casuale/fortunato.
+                if len(recent_eval_window) >= 4:
+                    refine_plateau_level = float(np.median(list(recent_eval_window)))
+                    _rlog(f"  🔧 refinement: riferimento rollback = {refine_plateau_level:.0f}m (MEDIANA degli ultimi {len(recent_eval_window)} eval, max={max(recent_eval_window):.0f}m)")
             else:
                 # In REFINEMENT. ① Avviso di RECUPERO: la refinement ha rotto il plateau (eval
                 # oltre +10% del riferimento) → log una-tantum, è il segnale che sta funzionando.
@@ -910,15 +976,15 @@ def train():
                     _rlog(f"  🚀 PLATEAU SUPERATO: la refinement funziona! eval {eval_dist:.0f}m "
                           f"> riferimento {refine_plateau_level:.0f}m (+{(eval_dist/refine_plateau_level-1)*100:.0f}%)")
                 # ② Rete di sicurezza. Se l'eval crolla sotto il 60% del livello recente per 3
-                # valutazioni consecutive → ROLLBACK al best_ever e training normale.
+                # valutazioni consecutive → ROLLBACK al miglior deterministico (td3_det_best_dist) e training normale.
                 if eval_dist < refine_plateau_level * REFINE_COLLAPSE_FRAC:
                     refine_collapse_count += 1
                 else:
                     refine_collapse_count = 0
                 if refine_collapse_count >= 3:
                     ref_lvl = refine_plateau_level
-                    if os.path.exists(best_ever_pth):
-                        agent.actor.load_state_dict(torch.load(best_ever_pth, map_location=agent.device))
+                    if os.path.exists(det_best_dist_pth):
+                        agent.actor.load_state_dict(torch.load(det_best_dist_pth, map_location=agent.device))
                         agent.actor_target.load_state_dict(agent.actor.state_dict())
                     agent.refine_mode = False
                     agent.refine_bc_weight = 1.0
@@ -928,7 +994,7 @@ def train():
                     refine_best_mean = 0.0          # ricomincia a misurare il plateau da capo
                     refine_plateau_level = 0.0
                     _rlog(f"  🛡️ REFINEMENT collassata (<{int(REFINE_COLLAPSE_FRAC*100)}% di {ref_lvl:.0f}m) "
-                          f"→ ROLLBACK al best_ever, bc_weight→1.0, Critic scongelato. Tentativi: {refine_attempts}/{REFINE_MAX_ATTEMPTS}")
+                          f"→ ROLLBACK al miglior deterministico (td3_det_best_dist), bc_weight→1.0, Critic scongelato. Tentativi: {refine_attempts}/{REFINE_MAX_ATTEMPTS}")
 
     env.end()
 

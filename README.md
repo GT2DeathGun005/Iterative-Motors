@@ -40,7 +40,7 @@ La pipeline si compone di quattro fasi sequenziali:
 |------|--------|-------------|
 | 1. Data Collection | `data_collection.py` | Raccolta di giri guidati da umano con controller PS5 o tastiera WASD. Salva solo i giri puliti. |
 | 2. BC Training | `behavioral_cloning.py` | Addestramento della PolicyNetwork sui dati esperti. Produce una policy che imita l'esperto (`bc_policy.pth`). |
-| 3. TD3 RL | `td3_bc.py` | Fine-tuning del modello tramite TD3+BC e Residual RL. Massimizza la velocità, salva il *Best Lap* (`td3_best_lap.pth`) e il *Best Eval* deterministico (`td3_best_eval.pth`). |
+| 3. TD3 RL | `td3_bc.py` | Fine-tuning del modello tramite TD3+BC. Massimizza la velocità; salva i record **deterministici** (`td3_det_best_dist.pth`, e il giro valido `td3_det_best_lap.pth` = submission) e quelli esplorativi di riferimento (`td3_expl_best_*.pth`). Vedi ARCHITECTURE §14. |
 | 4. Test & Eval | `test_agent.py` | Esecuzione deterministica del modello finale su TORCS per valutare la capacità di completare giri autonomi. |
 
 ---
@@ -64,7 +64,7 @@ AIcar/
 ├── telemetry/                 # Telemetria CSV dei test agent (auto-generata)
 └── train_set/                 # Dati e Checkpoint
     ├── laps/                  #   File HDF5 dei giri registrati (lap_001.h5 ...)
-    ├── checkpoints/           #   Pesi: bc_policy.pth, td3_policy.pth, td3_best_lap.pth, td3_best_dist.pth, td3_best_eval.pth, td3_best_ever.pth, td3_best_eval_laptime.pth
+    ├── checkpoints/           #   Pesi: bc_policy.pth, td3_policy.pth, td3_expl_best_lap.pth, td3_expl_best_dist.pth, td3_det_best_dist_run.pth, td3_det_best_dist.pth, td3_det_best_lap.pth
     │   └── buffers/
     │       ├── td3_checkpoint_buffer.npz        # Replay Buffer standard compresso (numpy)
     │       └── td3_checkpoint_elite_buffer.npz  # Elite Buffer compresso (numpy)
@@ -146,15 +146,15 @@ Il training è **resume-safe**: il checkpoint viene salvato ad ogni episodio. Pu
 
 Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per prevenire problemi di focus con il desktop dell'host. 
 
-**Output:** `train_set/checkpoints/td3_policy.pth` + `td3_best_lap.pth` + `td3_best_dist.pth` + `td3_best_eval.pth` + `td3_checkpoint.pth` + `buffers/td3_checkpoint_buffer.npz` + `buffers/td3_checkpoint_elite_buffer.npz`
+**Output:** `train_set/checkpoints/td3_policy.pth` + `td3_expl_best_lap.pth` + `td3_expl_best_dist.pth` + `td3_det_best_dist_run.pth` + `td3_checkpoint.pth` + `buffers/td3_checkpoint_buffer.npz` + `buffers/td3_checkpoint_elite_buffer.npz`
 
 ### 4. Test Deterministico (Inference)
 
-Il test agent auto-rileva i migliori pesi disponibili: `td3_best_eval_laptime.pth` → `td3_best_ever.pth` → `td3_best_eval.pth` → `td3_best_lap.pth` → `td3_best_dist.pth` → `td3_policy.pth` → `bc_policy.pth`.
+Il test agent auto-rileva i migliori pesi disponibili: `td3_det_best_lap.pth` → `td3_det_best_dist.pth` → `td3_det_best_dist_run.pth` → `td3_expl_best_lap.pth` → `td3_expl_best_dist.pth` → `td3_policy.pth` → `bc_policy.pth`.
 
-> `td3_best_eval_laptime.pth` è il **miglior giro VALIDO completato in valutazione deterministica** (il più veloce), con sidecar `.txt` che ne riporta il tempo: è il **candidato diretto per la submission** (giro valido + tempo minimo + riproducibile). Anch'esso **sopravvive a `--clean`**.
+> `td3_det_best_lap.pth` è il **miglior giro VALIDO completato in valutazione deterministica** (il più veloce), con sidecar `.txt` che ne riporta il tempo: è il **candidato diretto per la submission** (giro valido + tempo minimo + riproducibile). Anch'esso **sopravvive a `--clean`**.
 
-> `td3_best_ever.pth` è la **migliore policy assoluta tra tutti i run** e — a differenza degli altri — **sopravvive a `--clean`** (così non si perde mai un buon risultato per un restart sfortunato).
+> `td3_det_best_dist.pth` è la **migliore policy assoluta tra tutti i run** e — a differenza degli altri — **sopravvive a `--clean`** (così non si perde mai un buon risultato per un restart sfortunato).
 
 > ⚠️ **BC vs RL — rilevamento per nome file**: la mappatura azioni (RL: `tanh→[0,1]`; BC: `sigmoid`) viene scelta in base al **nome del file** (`td3_*`/`sac_*` = RL, `bc_*` = BC), **non** dalla presenza di `log_std_head` (che i vecchi checkpoint BC possono contenere). Caricare un BC come se fosse RL applicherebbe la de-normalizzazione sbagliata su gas/freno.
 
@@ -163,13 +163,13 @@ Il test agent auto-rileva i migliori pesi disponibili: `td3_best_eval_laptime.pt
 SHOW_GUI=1 python test_agent.py
 
 # Vedere a schermo il MIGLIOR GIRO in assoluto (best lap storico)
-SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_best_lap.pth --laps 1
+SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_expl_best_lap.pth --laps 1
 
 # Vedere la policy con la distanza maggiore raggiunta in addestramento
-SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_best_dist.pth --laps 1
+SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_expl_best_dist.pth --laps 1
 
 # Vedere la policy migliore ottenuta in fase di valutazione deterministica
-SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_best_eval.pth --laps 3
+SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_det_best_dist_run.pth --laps 3
 ```
 
 ### Script di Supporto

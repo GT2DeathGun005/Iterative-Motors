@@ -168,7 +168,7 @@ class TorcsEnv:
         # Reward da corsa: massimizza il progresso (velocità in avanti) lasciando l'agente
         # libero su staccate e velocità in curva; lo steer-smoothness è un lieve anti-zigzag.
         # NB: il bonus +50 per GIRO VALIDO completato è applicato nel loop di training di
-        # td3_bc.py (dove si rileva il cambio di lastLapTime e si salva td3_best_lap.pth),
+        # td3_bc.py (dove si rileva il cambio di lastLapTime e si salva td3_expl_best_lap.pth),
         # NON qui — altrimenti si conterebbe due volte.
         reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
 

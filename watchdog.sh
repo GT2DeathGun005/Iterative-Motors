@@ -15,7 +15,7 @@
 #         - processo di training morto inaspettatamente
 #         - log fermo da troppo tempo (training appeso / TORCS impiccato)
 #    3. Su rilevamento:
-#         - fa SEMPRE un backup timestamped di td3_best_ever.pth (+ checkpoint)
+#         - fa SEMPRE un backup timestamped di td3_det_best_dist.pth (+ checkpoint)
 #         - se MODE=active → ferma il run e lo riavvia con --rollback (o resume)
 #         - se MODE=alert  → non tocca nulla, scrive solo l'allarme (+ notify-send)
 #    4. Cooldown + tetto massimo interventi → niente loop di restart.
@@ -55,7 +55,7 @@ notify() {   # best-effort: notifica desktop se disponibile, altrimenti silenzio
 
 backup_best() {   # salva una copia timestamped dei pesi migliori e del checkpoint
     local ts; ts="$(date '+%Y%m%d_%H%M%S')"
-    for f in td3_best_ever.pth td3_best_ever.txt td3_checkpoint.pth td3_best_lap.pth; do
+    for f in td3_det_best_lap.pth td3_det_best_lap.txt td3_det_best_dist.pth td3_det_best_dist.txt td3_checkpoint.pth td3_expl_best_lap.pth; do
         [[ -f "$CKPT_DIR/$f" ]] && cp -p "$CKPT_DIR/$f" "$BACKUP_DIR/${f%.pth}_$ts.${f##*.}" 2>/dev/null
     done
     wlog "🛡️  Backup dei pesi migliori salvato in $BACKUP_DIR (suffisso $ts)"

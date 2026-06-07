@@ -9,7 +9,8 @@
 #    ./train_rl.sh                      # 1000 episodi (default)
 #    TD3_EPISODES=500 ./train_rl.sh     # Override episodi
 #    ./train_rl.sh --clean              # Riparte da zero (cancella checkpoint TD3)
-#    ./train_rl.sh --rollback           # Forza il rollback al miglior giro storico e lo congela per 10 ep
+#    ./train_rl.sh --rollback           # Rollback alla migliore policy DETERMINISTICA (det_best_lap →
+#                                       #   det_best_dist → det_best_dist_run) e congela l'Actor per ~10 ep (recupero)
 #    ./train_rl.sh --refine             # Avvia in REFINEMENT (Critic congelato + bc_weight ridotto): usare in
 #                                       #   resume quando il training è già in plateau stabile (vedi ARCHITECTURE §17.2)
 #
@@ -60,7 +61,7 @@ log_phase() { echo -e "\n${BOLD}${BLUE}═════════════�
 # ── Gestione flag --clean ──
 if [[ "${1:-}" == "--clean" ]]; then
     log_warn "Flag --clean rilevato: cancellazione checkpoint TD3 precedenti..."
-    rm -f "$TD3_CHECKPOINT" "$TD3_BUFFER" "$TD3_ELITE_BUFFER" "$TD3_POLICY" "train_set/checkpoints/td3_best_lap.pth" "train_set/checkpoints/td3_best_dist.pth" "train_set/checkpoints/td3_best_eval.pth"
+    rm -f "$TD3_CHECKPOINT" "$TD3_BUFFER" "$TD3_ELITE_BUFFER" "$TD3_POLICY" "train_set/checkpoints/td3_expl_best_lap.pth" "train_set/checkpoints/td3_expl_best_dist.pth" "train_set/checkpoints/td3_det_best_dist_run.pth"
     log_ok "Checkpoint TD3 cancellati. Ripartenza pulita."
 fi
 
