@@ -64,7 +64,7 @@ AIcar/
 ├── telemetry/                 # Telemetria CSV dei test agent (auto-generata)
 └── train_set/                 # Dati e Checkpoint
     ├── laps/                  #   File HDF5 dei giri registrati (lap_001.h5 ...)
-    ├── checkpoints/           #   Pesi: bc_policy.pth, td3_policy.pth, td3_best_lap.pth, td3_best_dist.pth, td3_best_eval.pth
+    ├── checkpoints/           #   Pesi: bc_policy.pth, td3_policy.pth, td3_best_lap.pth, td3_best_dist.pth, td3_best_eval.pth, td3_best_ever.pth, td3_best_eval_laptime.pth
     │   └── buffers/
     │       ├── td3_checkpoint_buffer.npz        # Replay Buffer standard compresso (numpy)
     │       └── td3_checkpoint_elite_buffer.npz  # Elite Buffer compresso (numpy)
@@ -150,7 +150,9 @@ Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per preve
 
 ### 4. Test Deterministico (Inference)
 
-Il test agent auto-rileva i migliori pesi disponibili: `td3_best_ever.pth` → `td3_best_eval.pth` → `td3_best_lap.pth` → `td3_best_dist.pth` → `td3_policy.pth` → `bc_policy.pth`.
+Il test agent auto-rileva i migliori pesi disponibili: `td3_best_eval_laptime.pth` → `td3_best_ever.pth` → `td3_best_eval.pth` → `td3_best_lap.pth` → `td3_best_dist.pth` → `td3_policy.pth` → `bc_policy.pth`.
+
+> `td3_best_eval_laptime.pth` è il **miglior giro VALIDO completato in valutazione deterministica** (il più veloce), con sidecar `.txt` che ne riporta il tempo: è il **candidato diretto per la submission** (giro valido + tempo minimo + riproducibile). Anch'esso **sopravvive a `--clean`**.
 
 > `td3_best_ever.pth` è la **migliore policy assoluta tra tutti i run** e — a differenza degli altri — **sopravvive a `--clean`** (così non si perde mai un buon risultato per un restart sfortunato).
 

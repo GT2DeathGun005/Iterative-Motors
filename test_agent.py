@@ -9,11 +9,13 @@ La classe BCActor è compatibile con entrambi i formati:
   - td3_policy.pth (con log_std_head)   — caricato con strict=True
 
 Priorità di caricamento automatica:
-  1. td3_best_eval.pth   (miglior checkpoint deterministico TD3)
-  2. td3_best_lap.pth    (record sul giro TD3)
-  3. td3_best_dist.pth   (record di distanza TD3)
-  4. td3_policy.pth      (ultimo step TD3)
-  5. bc_policy.pth       (fallback supervisionato)
+  1. td3_best_eval_laptime.pth (miglior GIRO VALIDO deterministico: candidato submission)
+  2. td3_best_ever.pth   (miglior policy ASSOLUTA per distanza; sopravvive a --clean)
+  3. td3_best_eval.pth   (miglior checkpoint deterministico TD3)
+  4. td3_best_lap.pth    (record sul giro TD3)
+  5. td3_best_dist.pth   (record di distanza TD3)
+  6. td3_policy.pth      (ultimo step TD3)
+  7. bc_policy.pth       (fallback supervisionato)
   6. --weights path      (override esplicito)
 
 Determinismo:
@@ -258,12 +260,13 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
     """Carica i migliori pesi disponibili con auto-detect del formato.
 
     Priorità (se --weights non è specificato):
-      1. td3_best_ever.pth (miglior policy ASSOLUTA tra tutti i run; sopravvive a --clean)
-      2. td3_best_eval.pth (miglior checkpoint deterministico del run corrente)
-      3. td3_best_lap.pth  (record sul giro TD3)
-      4. td3_best_dist.pth (record di distanza TD3)
-      5. td3_policy.pth    (ultimo step TD3)
-      6. bc_policy.pth     (fallback supervisionato)
+      1. td3_best_eval_laptime.pth (miglior GIRO VALIDO deterministico: candidato submission)
+      2. td3_best_ever.pth (miglior policy ASSOLUTA per distanza; sopravvive a --clean)
+      3. td3_best_eval.pth (miglior checkpoint deterministico del run corrente)
+      4. td3_best_lap.pth  (record sul giro TD3)
+      5. td3_best_dist.pth (record di distanza TD3)
+      6. td3_policy.pth    (ultimo step TD3)
+      7. bc_policy.pth     (fallback supervisionato)
 
     Se --weights è specificato, usa quello direttamente.
 
@@ -272,6 +275,7 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
     """
     checkpoint_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'train_set', 'checkpoints')
+    td3_best_laptime_path = os.path.join(checkpoint_dir, 'td3_best_eval_laptime.pth')
     td3_best_ever_path = os.path.join(checkpoint_dir, 'td3_best_ever.pth')
     td3_best_eval_path = os.path.join(checkpoint_dir, 'td3_best_eval.pth')
     td3_best_lap_path = os.path.join(checkpoint_dir, 'td3_best_lap.pth')
@@ -284,9 +288,18 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
     # Se l'utente ha specificato un path esplicito, usalo
     if weights_arg:
         load_path = weights_arg
+    elif os.path.exists(td3_best_laptime_path):
+        load_path = td3_best_laptime_path
+        _lt = ''
+        _lt_txt = os.path.join(checkpoint_dir, 'td3_best_eval_laptime.txt')
+        if os.path.exists(_lt_txt):
+            try:
+                with open(_lt_txt) as f: _lt = f' ({float(f.read().strip()):.3f}s)'
+            except Exception: pass
+        print(f"  🔍 Auto-detect: trovato td3_best_eval_laptime.pth (Miglior GIRO VALIDO deterministico{_lt} — candidato submission!)")
     elif os.path.exists(td3_best_ever_path):
         load_path = td3_best_ever_path
-        print(f"  🔍 Auto-detect: trovato td3_best_ever.pth (Miglior policy ASSOLUTA, sopravvive ai --clean!)")
+        print(f"  🔍 Auto-detect: trovato td3_best_ever.pth (Miglior policy ASSOLUTA per distanza, sopravvive ai --clean!)")
     elif os.path.exists(td3_best_eval_path):
         load_path = td3_best_eval_path
         print(f"  🔍 Auto-detect: trovato td3_best_eval.pth (Miglior checkpoint deterministico TD3!)")

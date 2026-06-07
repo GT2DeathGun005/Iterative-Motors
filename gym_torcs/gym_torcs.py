@@ -154,8 +154,6 @@ class TorcsEnv:
         # Inizializza last_steer se non esiste
         if not hasattr(self, 'last_steer'):
             self.last_steer = 0.0
-        if not hasattr(self, 'prev_last_lap_time'):
-            self.prev_last_lap_time = 0.0
             
         steer_change = this_action['steer'] - self.last_steer
         self.last_steer = this_action['steer']
@@ -169,18 +167,10 @@ class TorcsEnv:
 
         # Reward da corsa: massimizza il progresso (velocità in avanti) lasciando l'agente
         # libero su staccate e velocità in curva; lo steer-smoothness è un lieve anti-zigzag.
+        # NB: il bonus +50 per GIRO VALIDO completato è applicato nel loop di training di
+        # td3_bc.py (dove si rileva il cambio di lastLapTime e si salva td3_best_lap.pth),
+        # NON qui — altrimenti si conterebbe due volte.
         reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
-
-        # ─── Bonus Giro VALIDO (+50) ──────────────────────────────────
-        # TORCS aggiorna lastLapTime al taglio del traguardo. Poiché l'episodio TERMINA su
-        # qualsiasi |trackPos|>1.25 / crash / spin (vedi sotto), arrivare al traguardo implica
-        # necessariamente che l'intero giro è rimasto valido → il cambio di lastLapTime segnala
-        # un giro VALIDO completato. Segnale esplicito una-tantum per il Critic (distingue
-        # "completato il circuito" da "stava andando bene poi è uscito").
-        last_lap = float(obs.get('lastLapTime', 0.0))
-        if last_lap > 0.0 and last_lap != self.prev_last_lap_time:
-            reward += 50.0
-            self.prev_last_lap_time = last_lap
 
         # info dict comunicherà al Replay Buffer se il done è un vero "crash"
         info = {'crash': False}
@@ -264,9 +254,6 @@ class TorcsEnv:
 
         self.last_u = None
         self.last_steer = 0.0
-        # Baseline del cronometro: nuova istanza TORCS → lastLapTime parte da 0. Il bonus giro
-        # valido scatta quando questo valore cambia (taglio del traguardo a giro valido).
-        self.prev_last_lap_time = float(obs.get('lastLapTime', 0.0))
 
         self.initial_reset = False
         return self.get_obs()

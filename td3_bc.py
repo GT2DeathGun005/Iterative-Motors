@@ -740,6 +740,9 @@ def train():
             eval_stacked = np.concatenate([eval_stack[0], eval_stack[6], eval_stack[12]])
             eval_dist, eval_step, eval_reward = 0.0, 0, 0.0
             eval_current_gear = 1  # Vincolo sequenziale gear anche in eval
+            # Cronometraggio del miglior giro VALIDO completato in questa valutazione deterministica.
+            eval_prev_last_lap = float(np.array(eval_ob.get('lastLapTime', 0.0)).flat[0])
+            eval_best_lap_in_run = float('inf')
 
             agent.actor.eval()
             while eval_step < args.max_steps:
@@ -764,6 +767,14 @@ def train():
                 eval_stack.append(flatten_state(eval_ob))
                 eval_stacked = np.concatenate([eval_stack[0], eval_stack[6], eval_stack[12]])
                 eval_dist = float(np.array(eval_ob.get('distRaced', 0.0)).flat[0])
+
+                # Rilevamento giro VALIDO deterministico: TORCS aggiorna lastLapTime al traguardo.
+                # L'eval prosegue oltre il traguardo (non termina sul giro), quindi può chiudere più
+                # giri: teniamo il più veloce. Stesso criterio del loop di training (step>500).
+                eval_last_lap = float(np.array(eval_ob.get('lastLapTime', 0.0)).flat[0])
+                if eval_last_lap > 0.0 and abs(eval_last_lap - eval_prev_last_lap) > 0.01 and eval_step > 500:
+                    eval_prev_last_lap = eval_last_lap
+                    eval_best_lap_in_run = min(eval_best_lap_in_run, eval_last_lap)
 
                 if eval_info.get('crash', False) or eval_done: break
             agent.actor.train()
@@ -793,6 +804,25 @@ def train():
                 msg = f"  🏅 NUOVO BEST-EVER: {int(eval_dist)}m (preservato anche dopo --clean)"
                 print(msg)
                 with open(log_file, 'a', encoding='utf-8') as f: f.write(msg + "\n")
+
+            # ── Best-Eval-LapTime: miglior GIRO VALIDO deterministico (candidato submission) ──
+            # A differenza di best_ever (basato sulla DISTANZA), questo cattura il GIRO VALIDO più
+            # VELOCE chiuso in eval deterministica: esattamente la policy da sottomettere. Sidecar
+            # .txt col tempo; train_rl.sh --clean NON lo cancella (preservato tra run).
+            if eval_best_lap_in_run < float('inf'):
+                best_lt_pth = 'train_set/checkpoints/td3_best_eval_laptime.pth'
+                best_lt_txt = 'train_set/checkpoints/td3_best_eval_laptime.txt'
+                prev_best_lt = float('inf')
+                if os.path.exists(best_lt_txt):
+                    try:
+                        with open(best_lt_txt) as f: prev_best_lt = float(f.read().strip())
+                    except Exception: pass
+                if eval_best_lap_in_run < prev_best_lt:
+                    torch.save(agent.actor.state_dict(), best_lt_pth)
+                    with open(best_lt_txt, 'w') as f: f.write(f"{eval_best_lap_in_run:.3f}")
+                    msg = f"  🏆 NUOVO MIGLIOR GIRO VALIDO (eval deterministica): {eval_best_lap_in_run:.3f}s (preservato anche dopo --clean)"
+                    print(msg)
+                    with open(log_file, 'a', encoding='utf-8') as f: f.write(msg + "\n")
 
     env.end()
 
