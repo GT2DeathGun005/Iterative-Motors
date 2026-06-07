@@ -316,6 +316,8 @@ CORNER_EMPHASIS_ZONES = []   # disattivato. Es. per riattivare: [(675.0, 720.0, 
 
 **Problema 2 — Falso stallo in test:** `test_agent.py` rilevava uno stallo fasullo a ~550 step. Causa: leggeva la velocità da `next_state[21]*50`, ma `next_state` è ora **normalizzato** (`apply_state_norm`, mean/std) → a velocità sotto-media il valore diventa negativo → `fwd_kmh < 5` fasullo. **Fix:** leggere la velocità dall'obs grezzo `next_obs['speedX']*50`. *(Bug presente solo nel test, non nel training.)*
 
+**Problema 3 — Segmenti concentrati avvelenano il BC:** Aggiungendo 18 segmenti della sola Corkscrew al dataset BC, gli eval di warm-up sono crollati da ~400-818m a ~19-188m (l'agente usciva di pista già a curva 1). **Root cause:** il BC è cieco alla posizione (29D, no `distFromStart`) e minimizza l'errore medio → la sterzata pesante di una curva concentrata "trabocca" su stati simili altrove. **Fix — Split dati BC/RL** (ARCHITECTURE §7, Livello 3): il BC carica solo i **giri interi** (`lap_[0-9]*.h5`, distribuzione bilanciata), l'**RL expert buffer** carica anche i **segmenti** (`lap_seg_*.h5`, come 25% di anchor con value function). Verificato: BC ri-allenato sui soli giri interi → guida di nuovo bene. *(Escluso anche il mismatch marce manuali/algoritmiche come causa: il BC pulito + `compute_gear` guida bene da subito → covariate shift tollerabile.)*
+
 ### [2026-06-04] Risoluzione OOD BC Bug e Relaxed Policy Constraint
 
 **Problema:** L'Actor dimenticava come guidare in modo deterministico (Catastrophic Forgetting), esibendo un plateau fisso della `ActorL` a ~2.516 durante i crash.

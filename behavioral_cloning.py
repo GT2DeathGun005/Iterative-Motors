@@ -169,11 +169,16 @@ class TorcsHDF5Dataset(Dataset):
 def load_dataset(path: str) -> Dataset:
     """Carica e aggrega l'intero manifold di giri per migliorare la robustezza."""
     if os.path.isdir(path):
-        h5_files = sorted(glob.glob(os.path.join(path, "**/lap_*.h5"), recursive=True))
-        
+        # SOLO giri interi (lap_<numero>.h5). I segmenti di curva (lap_seg_*.h5) sono ESCLUSI dal
+        # BC: una distribuzione concentrata su poche curve sbilancia il BC (che minimizza l'errore
+        # medio ed è cieco alla posizione → la sterzata di una curva "trabocca" su stati simili
+        # altrove). I segmenti vengono usati SOLO dall'expert buffer dell'RL (che ha la value
+        # function ed è robusto). Vedi ARCHITECTURE §7/§17.1.
+        h5_files = sorted(glob.glob(os.path.join(path, "**/lap_[0-9]*.h5"), recursive=True))
+
         if not h5_files:
             raise FileNotFoundError(
-                f"Nessun file lap_*.h5 trovato in {path} o nelle sue sottocartelle"
+                f"Nessun file lap_[0-9]*.h5 (giro intero) trovato in {path} o nelle sue sottocartelle"
             )
         print(f"  Trovati {len(h5_files)} file HDF5. Carico l'intero dataset...")
         
@@ -613,7 +618,8 @@ def main():
     # Calcolate sulle 29 feature grezze (post-scaling fisso) e salvate in state_norm.npz.
     # Verranno applicate qui (BC) e caricate da td3_bc.py / test_agent.py per coerenza.
     if os.path.isdir(args.dataset):
-        _h5s = sorted(glob.glob(os.path.join(args.dataset, "**/lap_*.h5"), recursive=True))
+        # Solo giri interi per lo state_norm (coerente col training BC sopra; segmenti esclusi).
+        _h5s = sorted(glob.glob(os.path.join(args.dataset, "**/lap_[0-9]*.h5"), recursive=True))
     else:
         _h5s = [args.dataset]
     _all_states = []

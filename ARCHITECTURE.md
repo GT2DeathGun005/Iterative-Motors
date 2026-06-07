@@ -89,6 +89,15 @@ Durante il training BC, il **50% di ogni mini-batch** (gating casuale per-campio
 ### Livello 2: Relaxed Policy Constraint (td3_bc.py)
 Il TD3 esplora naturalmente stati off-distribution. Grazie all'implementazione del Masking Rigoroso della BC Penalty, per gli stati online (esplorativi) il peso dell'imitazione viene azzerato. L'Actor è quindi **completamente libero** di imparare correzioni locali (come frenare e raddrizzarsi per evitare il muro) basate esclusivamente sui Q-Value del Critic, senza che nessuna rete BC interferisca tentando di suggerire azioni OOD "allucinate".
 
+### Livello 3: Split dei Dati BC vs RL (giri interi vs segmenti di curva)
+Il BC minimizza l'errore **medio** ed è **cieco alla posizione** (lo stato è 29D, senza `distFromStart`): mappa solo *stato sensoriale → azione*. Di conseguenza una manciata di **segmenti concentrati su una sola curva** (es. la Corkscrew, con sterzo medio doppio rispetto al giro) **sbilancia il BC**: la sterzata pesante di quella curva "trabocca" su stati sensorialmente simili altrove (es. la curva 1), facendo uscire di pista l'agente in punti del tutto scollegati. *(Misurato: aggiungendo 18 segmenti Corkscrew al BC, gli eval di warm-up sono crollati da ~400-818m a ~19-188m; rimuovendoli sono tornati a ~470-813m.)*
+
+La soluzione è separare le sorgenti dati per i due stadi:
+- **BC** carica **solo i giri interi** (`lap_[0-9]*.h5`) → distribuzione bilanciata dell'intera pista, nessuno sbilanciamento da segmenti.
+- **RL expert buffer** carica **tutto** (`lap_*.h5`, giri + segmenti `lap_seg_*.h5`) → i segmenti mirati rinforzano le curve difficili, ma solo come **25% di anchor** dentro un buffer diversificato, e l'RL ha la *value function* (Critic) per usarli senza imitare ciecamente.
+
+La distinzione è automatica via convenzione di naming (il glob `lap_[0-9]*.h5` esclude i `lap_seg_*.h5`): raccogliere nuovi segmenti mirati con `data_collection.py --segment_only` li indirizza da solo al solo RL, senza rischio di avvelenare il BC.
+
 ### Corner Emphasis: Oversampling Pesato per Posizione sul Tracciato (behavioral_cloning.py)
 Quando un settore specifico del circuito (es. una staccata ad alta velocità) è **sotto-rappresentato** o richiede una manovra molto più precisa del resto del giro, il BC — che minimizza un MSE *medio* — tende a non dargli abbastanza importanza, e l'agente esce di pista sempre nello stesso punto. La soluzione è un **oversampling pesato per posizione**:
 
