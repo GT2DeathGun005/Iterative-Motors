@@ -10,6 +10,8 @@
 #    TD3_EPISODES=500 ./train_rl.sh     # Override episodi
 #    ./train_rl.sh --clean              # Riparte da zero (cancella checkpoint TD3)
 #    ./train_rl.sh --rollback           # Forza il rollback al miglior giro storico e lo congela per 10 ep
+#    ./train_rl.sh --refine             # Avvia in REFINEMENT (Critic congelato + bc_weight ridotto): usare in
+#                                       #   resume quando il training è già in plateau stabile (vedi ARCHITECTURE §17.2)
 #
 #  Per interrompere il training in sicurezza:
 #    Ctrl+C  oppure  ./stop_training.sh

@@ -580,7 +580,7 @@ def main():
     )
     parser.add_argument(
         "--dataset", type=str, default="train_set/laps",
-        help="Path al dataset HDF5 (file singolo o directory di lap_*.h5)"
+        help="Path al dataset HDF5 (file singolo, o directory: il BC carica SOLO i giri interi lap_[0-9]*.h5, i segmenti lap_seg_*.h5 sono esclusi)"
     )
     parser.add_argument("--epochs", type=int, default=300, help="Max epoche")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size")

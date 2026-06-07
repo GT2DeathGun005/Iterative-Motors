@@ -385,10 +385,13 @@ class TD3BCAgent:
         q1, q2 = self.critic(state_b, action_b)
         critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
 
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)  # Anti Gradient Explosion
-        self.critic_optimizer.step()
+        # In REFINEMENT (Paper 2) il Critic è CONGELATO: l'Actor si raffina verso una value
+        # function fissa con vincolo BC ridotto. critic_loss resta calcolata solo per logging.
+        if not getattr(self, 'refine_mode', False):
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)  # Anti Gradient Explosion
+            self.critic_optimizer.step()
 
         actor_loss_val = 0.0
 
@@ -444,8 +447,9 @@ class TD3BCAgent:
             # Il decay precedente (1.0→0.5) indeboliva la BC nella fase fragile post-warm-up
             # → "troppo RL troppo presto" → collasso (Beeson & Montana 2022, Ablation 1;
             # Fujimoto & Gu 2021, ablation su α). L'eventuale rilassamento del vincolo va fatto
-            # in una FASE separata dopo il training stabile, con il Critic congelato (non qui).
-            bc_weight = 1.0
+            # in una FASE separata dopo il training stabile, con il Critic congelato (vedi
+            # AUTO-REFINEMENT nel loop di train): lì bc_weight scende a refine_bc_weight.
+            bc_weight = self.refine_bc_weight if getattr(self, 'refine_mode', False) else 1.0
 
             total_actor_loss = dynamic_alpha * actor_loss_td3 + (bc_weight * bc_penalty)
 
@@ -536,6 +540,7 @@ def train():
     parser.add_argument('--max_steps', type=int, default=5000)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--rollback', action='store_true', help="Forza il rollback dell'Actor all'ultimo miglior giro storico e lo congela per 10 episodi")
+    parser.add_argument('--refine', action='store_true', help="Avvia subito in modalità REFINEMENT (Critic congelato + bc_weight ridotto): usare in resume quando il training è già in plateau stabile")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -561,6 +566,35 @@ def train():
     expert_memory.load_expert_data('train_set/laps', max_samples=350000)
 
     agent.actor_frozen = False
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  AUTO-REFINEMENT (Beeson & Montana 2022): dopo un PLATEAU stabile, congela il
+    #  Critic e riduce il vincolo BC per spingere la policy deterministica oltre il muro.
+    #  Conservativo (refine troppo presto → collasso, Ablation 1) + rete di sicurezza:
+    #  se l'eval crolla, rollback automatico al best_ever (mai perso su disco).
+    # ─────────────────────────────────────────────────────────────────────────
+    REFINE_BC_WEIGHT = 0.3         # vincolo BC ridotto durante la refinement
+    REFINE_MAX_ATTEMPTS = 3        # oltre, resta in training normale (no loop)
+    REFINE_COLLAPSE_FRAC = 0.6     # eval < 60% del LIVELLO RECENTE per 3 volte → rollback
+    REFINE_WINDOW = 8              # ampiezza finestra eval per MEDIA/MAX recenti (statistica robusta)
+    REFINE_PLATEAU_EVALS = 12      # valutazioni con MEDIA recente NON in salita → plateau (auto)
+    REFINE_MIN_EP = 200            # episodio minimo per l'auto-trigger
+    REFINE_IMPROVE_FRAC = 1.02     # la media deve salire >2% per contare come "miglioramento"
+    agent.refine_mode = False
+    agent.refine_bc_weight = 1.0
+    recent_eval_window = deque(maxlen=REFINE_WINDOW)  # ultimi eval → media/max recenti
+    refine_best_mean = 0.0         # miglior MEDIA-finestra vista (segnale di plateau)
+    refine_evals_no_improve = 0
+    refine_attempts = 0
+    refine_plateau_level = 0.0     # 0 = riferimento rollback non ancora impostato
+    refine_collapse_count = 0
+    refine_breakout_logged = False  # per loggare UNA volta il superamento del plateau
+    if getattr(args, 'refine', False):
+        # Avvio mirato quando l'operatore SA già che è in plateau: refinement ON da subito.
+        agent.refine_mode = True
+        agent.refine_bc_weight = REFINE_BC_WEIGHT
+        print(f"🔧 --refine attivo: refinement ON da subito (Critic congelato, bc_weight={REFINE_BC_WEIGHT}). "
+              f"Riferimento rollback impostato dopo i primi eval (MAX recente).")
 
     # Warm-Start: se è il primo avvio (nessun checkpoint), inizializza l'Actor con i pesi BC.
     if start_episode == 0:
@@ -588,6 +622,12 @@ def train():
     os.makedirs('train_set/checkpoints', exist_ok=True)
     os.makedirs('train_set/session_logs', exist_ok=True)
     log_file = 'train_set/session_logs/td3_training.log'
+    # Conferma nel LOG (non solo stdout) se la refinement è stata armata da --refine, così è
+    # tracciabile a posteriori senza ambiguità con l'AUTO-REFINEMENT che scatta da solo.
+    if getattr(args, 'refine', False):
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"🔧 AVVIO con --refine: REFINEMENT armata da subito "
+                    f"(Critic congelato, bc_weight={REFINE_BC_WEIGHT}, ep iniziale {start_episode})\n")
 
     batch_size = 256
     elite_threshold = 500.0
@@ -828,6 +868,67 @@ def train():
                     msg = f"  🏆 NUOVO MIGLIOR GIRO VALIDO (eval deterministica): {eval_best_lap_in_run:.3f}s (preservato anche dopo --clean)"
                     print(msg)
                     with open(log_file, 'a', encoding='utf-8') as f: f.write(msg + "\n")
+
+            # ── AUTO-REFINEMENT: macchina a stati (plateau → refine; collasso → rollback) ──
+            def _rlog(m):
+                print(m)
+                with open(log_file, 'a', encoding='utf-8') as f: f.write(m + "\n")
+
+            recent_eval_window.append(eval_dist)
+            if not agent.refine_mode:
+                # Rilevamento PLATEAU su STATISTICA (non sul singolo best, robusto ai colpi di
+                # fortuna): la MEDIA della finestra recente smette di salire. Serve la finestra piena.
+                if len(recent_eval_window) >= REFINE_WINDOW:
+                    cur_mean = sum(recent_eval_window) / len(recent_eval_window)
+                    if cur_mean > refine_best_mean * REFINE_IMPROVE_FRAC:
+                        refine_best_mean = cur_mean          # la performance tipica sta ancora salendo
+                        refine_evals_no_improve = 0
+                    else:
+                        refine_evals_no_improve += 1          # tipica ferma → conta verso il plateau
+                    if (refine_evals_no_improve >= REFINE_PLATEAU_EVALS and (episode + 1) >= REFINE_MIN_EP
+                            and refine_attempts < REFINE_MAX_ATTEMPTS):
+                        agent.refine_mode = True
+                        agent.refine_bc_weight = REFINE_BC_WEIGHT
+                        # Riferimento rollback = MAX recente (modo "buono" del bimodale), non il best storico
+                        refine_plateau_level = max(recent_eval_window)
+                        refine_collapse_count = 0
+                        refine_breakout_logged = False
+                        _rlog(f"  🔧 AUTO-REFINEMENT ON (tentativo {refine_attempts+1}/{REFINE_MAX_ATTEMPTS}): "
+                              f"media recente in plateau a {cur_mean:.0f}m, Critic congelato, "
+                              f"bc_weight→{REFINE_BC_WEIGHT}, riferimento={refine_plateau_level:.0f}m")
+            elif refine_plateau_level <= 0.0:
+                # --refine: refinement già ON, ma il riferimento rollback si fissa dopo i primi eval
+                # (MAX recente), così la rete di sicurezza non usa un valore casuale/fortunato.
+                if len(recent_eval_window) >= 3:
+                    refine_plateau_level = max(recent_eval_window)
+                    _rlog(f"  🔧 refinement: riferimento rollback = {refine_plateau_level:.0f}m (MAX recente)")
+            else:
+                # In REFINEMENT. ① Avviso di RECUPERO: la refinement ha rotto il plateau (eval
+                # oltre +10% del riferimento) → log una-tantum, è il segnale che sta funzionando.
+                if not refine_breakout_logged and eval_dist > refine_plateau_level * 1.1:
+                    refine_breakout_logged = True
+                    _rlog(f"  🚀 PLATEAU SUPERATO: la refinement funziona! eval {eval_dist:.0f}m "
+                          f"> riferimento {refine_plateau_level:.0f}m (+{(eval_dist/refine_plateau_level-1)*100:.0f}%)")
+                # ② Rete di sicurezza. Se l'eval crolla sotto il 60% del livello recente per 3
+                # valutazioni consecutive → ROLLBACK al best_ever e training normale.
+                if eval_dist < refine_plateau_level * REFINE_COLLAPSE_FRAC:
+                    refine_collapse_count += 1
+                else:
+                    refine_collapse_count = 0
+                if refine_collapse_count >= 3:
+                    ref_lvl = refine_plateau_level
+                    if os.path.exists(best_ever_pth):
+                        agent.actor.load_state_dict(torch.load(best_ever_pth, map_location=agent.device))
+                        agent.actor_target.load_state_dict(agent.actor.state_dict())
+                    agent.refine_mode = False
+                    agent.refine_bc_weight = 1.0
+                    refine_attempts += 1
+                    refine_evals_no_improve = 0
+                    refine_collapse_count = 0
+                    refine_best_mean = 0.0          # ricomincia a misurare il plateau da capo
+                    refine_plateau_level = 0.0
+                    _rlog(f"  🛡️ REFINEMENT collassata (<{int(REFINE_COLLAPSE_FRAC*100)}% di {ref_lvl:.0f}m) "
+                          f"→ ROLLBACK al best_ever, bc_weight→1.0, Critic scongelato. Tentativi: {refine_attempts}/{REFINE_MAX_ATTEMPTS}")
 
     env.end()
 
