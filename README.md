@@ -308,6 +308,14 @@ CORNER_EMPHASIS_ZONES = []   # disattivato. Es. per riattivare: [(675.0, 720.0, 
 
 ## 🐛 Bug Risolti (Workflow Tracking)
 
+### [2026-06-07] Cambio Marcia Deterministico + Falso Stallo in Test
+
+**Problema 1 — Hunting del cambio:** La `gear_head` appresa (congelata durante l'RL) produceva hunting estremo (fino a ~322 cambi ogni 1000 step, con assurdità tipo 1ª a 150 km/h) che destabilizzava l'intero giro e spezzava la trazione. Essendo congelata, l'RL non poteva correggerla.
+
+**Fix:** Sostituita con `gearing.compute_gear`, logica deterministica **velocità-primaria** (vedi ARCHITECTURE §17.1). Il downshift guarda la velocità (monotòna in frenata) → il classico problema del picco-rpm in staccata (che fa ri-salire di marcia gli shifter ingenui) sparisce per costruzione; l'upshift scatta solo sul gas. Soglie derivate e validate sui 75 giri umani (**±1 marcia 99%**, 0% fuorigiri) **e dal vivo sulla policy RL** (10.5 cambi/1000, 0 oscillazioni rapide). Usata identica in training/eval/test.
+
+**Problema 2 — Falso stallo in test:** `test_agent.py` rilevava uno stallo fasullo a ~550 step. Causa: leggeva la velocità da `next_state[21]*50`, ma `next_state` è ora **normalizzato** (`apply_state_norm`, mean/std) → a velocità sotto-media il valore diventa negativo → `fwd_kmh < 5` fasullo. **Fix:** leggere la velocità dall'obs grezzo `next_obs['speedX']*50`. *(Bug presente solo nel test, non nel training.)*
+
 ### [2026-06-04] Risoluzione OOD BC Bug e Relaxed Policy Constraint
 
 **Problema:** L'Actor dimenticava come guidare in modo deterministico (Catastrophic Forgetting), esibendo un plateau fisso della `ActorL` a ~2.516 durante i crash.
