@@ -43,6 +43,7 @@ from collections import deque
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'gym_torcs')))
 
 from gym_torcs import TorcsEnv
+from gearing import compute_gear  # cambio marcia deterministico (anti-hunting), condiviso col training
 import random
 
 # ──────────────────────────────────────────────────────────────────────
@@ -421,8 +422,11 @@ def main():
             lap_time = 0.0
             telemetry_data = []
 
-            # Stato per il vincolo sequenziale del gear (±1 per step, come nel training)
+            # Marcia deterministica (gearing.py), identica a training/eval
             current_gear = 1
+            steps_since_shift = 999
+            cur_speed_kmh = float(np.array(obs.get('speedX', 0.0)).flat[0]) * 50.0
+            cur_rpm = float(np.array(obs.get('rpm', 0.0)).flat[0])
             stall_low_speed_steps = 0  # contatore stallo (#3: semantica allineata al training)
 
             print(f"\n  {'─' * 50}")
@@ -451,35 +455,38 @@ def main():
                         cont_action = pred_cont.cpu().numpy()[0]
                         raw_gear = int(gear_logits.argmax(dim=1).item())
 
-                # ── Gear Filter (solo vincolo sequenziale ±1, nessuna latenza) ──
-                predicted_gear = raw_gear
-                if predicted_gear > current_gear + 1:
-                    predicted_gear = current_gear + 1
-                elif predicted_gear < current_gear - 1:
-                    predicted_gear = current_gear - 1
-                current_gear = max(1, min(6, predicted_gear))  # min(6) per allineamento col training
-
                 # ── Mutual exclusion accel/brake (come l'esperto umano) ──
                 # Per i pesi BC, cont_action[1:3] sono già [0,1] (Sigmoid)
                 # Per i pesi RL, cont_action[1:3] sono [-1,1] (Tanh) — denormalize_fn li converte
                 if not is_rl:
                     cont_action[1] = cont_action[1] * (1.0 - cont_action[2])
 
-                # ── Step nell'ambiente ──
+                # ── Costruzione azione (la marcia viene sovrascritta sotto) ──
                 env_action = denormalize_fn(cont_action, current_gear)
 
                 # Mutual exclusion post-denormalize per RL
                 if is_rl:
                     env_action[1] = env_action[1] * (1.0 - env_action[2])
 
+                # ── Marcia DETERMINISTICA (anti-hunting), identica a training/eval (gearing.py) ──
+                # raw_gear (gear_head congelata) è ignorato. Usa il gas APPLICATO (env_action[1]).
+                current_gear, _shifted = compute_gear(cur_speed_kmh, float(env_action[1]), cur_rpm, current_gear, steps_since_shift)
+                steps_since_shift = 0 if _shifted else steps_since_shift + 1
+                env_action[3] = current_gear
+
                 next_obs, _, env_done, _ = env.step(env_action)
                 next_state = flatten_state(next_obs)
+                cur_speed_kmh = float(np.array(next_obs.get('speedX', 0.0)).flat[0]) * 50.0
+                cur_rpm = float(np.array(next_obs.get('rpm', 0.0)).flat[0])
 
                 # Salva telemetria step
                 dist_raw = next_obs.get('distFromStart', 0.0)
                 if isinstance(dist_raw, np.ndarray): dist_raw = float(dist_raw.flat[0])
                 dist_m = dist_raw
-                spd_kmh = float(next_state[21] * 50.0)
+                # Velocità in km/h dall'obs GREZZO (make_observaton ha già fatto speedX/50), NON da
+                # next_state[21]: quest'ultimo è ora normalizzato (apply_state_norm, mean/std), quindi
+                # *50 darebbe un valore senza senso (negativo a velocità sotto-media → falso stallo).
+                spd_kmh = float(np.array(next_obs.get('speedX', 0.0)).flat[0]) * 50.0
                 track_pos = float(np.array(next_obs.get('trackPos', 0.0)).flat[0])
                 angle = float(np.array(next_obs.get('angle', 0.0)).flat[0])
 

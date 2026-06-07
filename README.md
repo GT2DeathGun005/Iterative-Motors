@@ -229,7 +229,9 @@ Actor (Warm-Start da BC)                    Critic (Twin Q-Network, da zero)
 └─────────────────────────┘                 + Target Q (Polyak τ=0.005)
 ```
 
-**Training dell'Actor:** come nel TD3+BC originale, il TD3 allena **tutto l'Actor** (backbone + `continuous_head`) con LR=`3e-4`. Resta congelata solo la `gear_head` (marcia discreta, dal BC) e la `log_std_head` (legacy, retro-compatibilità). L'ancora BC costante (`bc_weight=1.0`) previene il *Latent Shift* del backbone.
+**Training dell'Actor:** come nel TD3+BC originale, il TD3 allena **tutto l'Actor** (backbone + `continuous_head`) con LR=`3e-4`. La `gear_head` resta congelata ed è ormai **inutilizzata** (la marcia è calcolata dalla logica deterministica `gearing.py`, non più dalla rete); la `log_std_head` è legacy (retro-compatibilità). L'ancora BC costante (`bc_weight=1.0`) previene il *Latent Shift* del backbone.
+
+> **Marcia deterministica (`gearing.py`)**: la marcia non è predetta dalla rete ma da una funzione velocità-primaria anti-hunting (downshift sulla velocità, upshift solo sul gas+rpm), validata sui giri umani (±1 marcia 99%, ~9.7 cambi/1000 step vs 322 della testa appresa). Identica in training/eval/test. Vedi ARCHITECTURE §17.1.
 
 **Critic Warm-Up (15.000 step):** I primi 15.000 step aggiornano solo il Critic. Questo protegge i pesi BC dai gradienti randomici di un Critic non ancora calibrato.
 

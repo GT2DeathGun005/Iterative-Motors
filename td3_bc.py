@@ -41,6 +41,8 @@ try:
 except ImportError:
     print("Warning: gym_torcs non trovato.")
 
+from gearing import compute_gear  # cambio marcia deterministico (anti-hunting)
+
 # ──────────────────────────────────────────────────────────────────────
 #  Normalizzazione stati mean-0 / std-1 (Fujimoto & Gu, 2021)
 # ──────────────────────────────────────────────────────────────────────
@@ -613,11 +615,12 @@ def train():
         termination_reason = "TIMEOUT"
         new_record = False
 
-        # Vincolo sequenziale del gear (±1 per step): identico a test_agent.py.
-        # Garantisce che la dinamica del cambio in training/eval coincida con
-        # quella di deployment, rendendo i checkpoint (best_lap/best_eval)
-        # esattamente riproducibili in inferenza.
+        # Marcia deterministica (gearing.py): identica in training/eval/test → i checkpoint
+        # (best_lap/best_eval) sono esattamente riproducibili in inferenza.
         current_gear = 1
+        steps_since_shift = 999  # consenti il primo cambio subito
+        cur_speed_kmh = float(np.array(ob.get('speedX', 0.0)).flat[0]) * 50.0
+        cur_rpm = float(np.array(ob.get('rpm', 0.0)).flat[0])
         # Rilevamento robusto del completamento giro: confrontiamo lastLapTime
         # con il valore iniziale invece di assumere che il relaunch lo azzeri.
         prev_last_lap = float(np.array(ob.get('lastLapTime', 0.0)).flat[0])
@@ -632,23 +635,23 @@ def train():
             # preserva la simmetria del tanh per la backpropagation.
             env_action = np.zeros(4)
             env_action[0:3] = cont_action
-            # Vincolo sequenziale ±1 sul gear (coerente con test_agent.py)
-            predicted_gear = raw_gear
-            if predicted_gear > current_gear + 1:
-                predicted_gear = current_gear + 1
-            elif predicted_gear < current_gear - 1:
-                predicted_gear = current_gear - 1
-            current_gear = max(1, min(6, predicted_gear))
-            env_action[3] = current_gear
-            
+
             torcs_action = env_action.copy()
             torcs_action[1] = np.clip((torcs_action[1] + 1.0) / 2.0, 0.0, 1.0)  # accel: [-1,1] → [0,1]
             torcs_action[2] = np.clip((torcs_action[2] + 1.0) / 2.0, 0.0, 1.0)  # brake: [-1,1] → [0,1]
-            
             # Mutual exclusion continua/moltiplicativa per prevenire stalli repentini
             torcs_action[1] = torcs_action[1] * (1.0 - torcs_action[2])
-                
+
+            # Marcia DETERMINISTICA (anti-hunting): da velocità/rpm correnti + il gas applicato.
+            # raw_gear (gear_head congelata) è ignorato. Vedi gearing.py.
+            current_gear, _shifted = compute_gear(cur_speed_kmh, torcs_action[1], cur_rpm, current_gear, steps_since_shift)
+            steps_since_shift = 0 if _shifted else steps_since_shift + 1
+            torcs_action[3] = current_gear
+            env_action[3] = current_gear
+
             next_ob, reward, env_done, info = env.step(torcs_action)
+            cur_speed_kmh = float(np.array(next_ob.get('speedX', 0.0)).flat[0]) * 50.0
+            cur_rpm = float(np.array(next_ob.get('rpm', 0.0)).flat[0])
             next_f_state = flatten_state(next_ob)
             state_stack.append(next_f_state)
 
@@ -739,7 +742,10 @@ def train():
             eval_stack = deque([flatten_state(eval_ob)]*13, maxlen=13)
             eval_stacked = np.concatenate([eval_stack[0], eval_stack[6], eval_stack[12]])
             eval_dist, eval_step, eval_reward = 0.0, 0, 0.0
-            eval_current_gear = 1  # Vincolo sequenziale gear anche in eval
+            eval_current_gear = 1  # marcia deterministica anche in eval (gearing.py)
+            eval_steps_since_shift = 999
+            eval_cur_speed_kmh = float(np.array(eval_ob.get('speedX', 0.0)).flat[0]) * 50.0
+            eval_cur_rpm = float(np.array(eval_ob.get('rpm', 0.0)).flat[0])
             # Cronometraggio del miglior giro VALIDO completato in questa valutazione deterministica.
             eval_prev_last_lap = float(np.array(eval_ob.get('lastLapTime', 0.0)).flat[0])
             eval_best_lap_in_run = float('inf')
@@ -750,19 +756,18 @@ def train():
                 with torch.no_grad():
                     eval_action, eval_gear = agent.select_action(eval_stacked, evaluate=True)
                 eval_env = np.zeros(4)
-                eval_pred_gear = eval_gear
-                if eval_pred_gear > eval_current_gear + 1:
-                    eval_pred_gear = eval_current_gear + 1
-                elif eval_pred_gear < eval_current_gear - 1:
-                    eval_pred_gear = eval_current_gear - 1
-                eval_current_gear = max(1, min(6, eval_pred_gear))
-                eval_env[0:3], eval_env[3] = eval_action, eval_current_gear
+                eval_env[0:3] = eval_action
                 eval_env[1], eval_env[2] = np.clip((eval_env[1]+1)/2, 0, 1), np.clip((eval_env[2]+1)/2, 0, 1)
-                
                 # Mutual exclusion continua/moltiplicativa per EVAL
                 eval_env[1] = eval_env[1] * (1.0 - eval_env[2])
+                # Marcia DETERMINISTICA (anti-hunting), identica a training/test (gearing.py)
+                eval_current_gear, _esh = compute_gear(eval_cur_speed_kmh, eval_env[1], eval_cur_rpm, eval_current_gear, eval_steps_since_shift)
+                eval_steps_since_shift = 0 if _esh else eval_steps_since_shift + 1
+                eval_env[3] = eval_current_gear
 
                 eval_ob, eval_r, eval_done, eval_info = env.step(eval_env)
+                eval_cur_speed_kmh = float(np.array(eval_ob.get('speedX', 0.0)).flat[0]) * 50.0
+                eval_cur_rpm = float(np.array(eval_ob.get('rpm', 0.0)).flat[0])
                 eval_reward += eval_r
                 eval_stack.append(flatten_state(eval_ob))
                 eval_stacked = np.concatenate([eval_stack[0], eval_stack[6], eval_stack[12]])
