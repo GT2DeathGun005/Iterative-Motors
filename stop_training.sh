@@ -3,7 +3,7 @@
 #  stop_training.sh — Ferma i processi AIcar di training, test e TORCS
 # ═══════════════════════════════════════════════════════════════════════
 
-echo "🛑 Arresto dei processi di addestramento AIcar in corso..."
+echo "Arresto dei processi di addestramento AIcar in corso..."
 
 # Ferma gli script di training
 pkill -f "train_bc.sh" || echo "Nessun processo train_bc.sh attivo."
@@ -24,4 +24,4 @@ pkill -f "gym_torcs" || echo "Nessun processo gym_torcs attivo."
 pkill -f "xvfb-run" || echo "Nessun processo xvfb-run attivo."
 pkill -f "Xvfb" || echo "Nessun processo Xvfb attivo."
 
-echo "✅ Tutti i processi sono stati fermati con successo."
+echo "Tutti i processi sono stati fermati con successo."

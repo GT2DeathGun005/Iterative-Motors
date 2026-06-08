@@ -313,7 +313,7 @@ def flatten_state(state_dict: dict) -> np.ndarray:
         ])
         return state_vec.astype(np.float32)
     except Exception as e:
-        print(f"  [WARN] Errore in flatten_state: {e}. Ritorno vettore zero (29D).")
+        print(f"  Errore in flatten_state: {e}. Ritorno vettore zero (29D).")
         return np.zeros(29, dtype=np.float32)
 
 
@@ -443,10 +443,10 @@ def main():
 
     # ── Zone curva target (raccolta mirata) ──
     zones = _parse_zones(args.zones)
-    print(f"\n  🎯 Zone curva target ({len(zones)}): " + ", ".join(f"{int(a)}-{int(b)}m" for a, b in zones))
+    print(f"\n  Zone curva target ({len(zones)}): " + ", ".join(f"{int(a)}-{int(b)}m" for a, b in zones))
     if args.segment_only:
-        print(f"  ✂️  Modalità SEGMENT_ONLY: salvo solo i segmenti dentro le zone (guidi giri interi).")
-    print(f"  🎮 Vibrazione gentile del controller all'ingresso di ogni zona.\n")
+        print(f"  Modalità SEGMENT_ONLY: salvo solo i segmenti dentro le zone (guidi giri interi).")
+    print(f"  Vibrazione gentile del controller all'ingresso di ogni zona.\n")
     laps_dir = os.path.join(output_dir, "laps")
     os.makedirs(laps_dir, exist_ok=True)
 
@@ -463,8 +463,8 @@ def main():
         try:
             controller = DualSenseController(steering_deadzone=args.steering_deadzone)
         except RuntimeError as e:
-            print(f"  ❌ Errore controller: {e}")
-            print("  👉 Vuoi usare la tastiera? Avvia con: python data_collection.py --device keyboard")
+            print(f"  Errore controller: {e}")
+            print("  Vuoi usare la tastiera? Avvia con: python data_collection.py --device keyboard")
             sys.exit(1)
 
     # ── Conta i giri già esistenti nella directory per numerazione continua ──
@@ -480,7 +480,7 @@ def main():
 
     print()
     print("=" * 64)
-    print("   🏎️  DATA COLLECTION — Giro Secco TORCS")
+    print("   DATA COLLECTION — Giro Secco TORCS")
     print("   Premi Ctrl+C nel terminale per terminare la sessione")
     print("=" * 64)
 
@@ -531,7 +531,7 @@ def main():
             controller.gear = 1
 
             print(f"\n{'─' * 64}")
-            print(f"  🏁 TENTATIVO GIRO #{lap_attempt}  (giri salvati finora: {lap_counter})")
+            print(f"  TENTATIVO GIRO #{lap_attempt}  (giri salvati finora: {lap_counter})")
             print(f"  Status: [VALIDO]")
             print(f"{'─' * 64}")
 
@@ -570,7 +570,7 @@ def main():
                 
                 # Usiamo 1.25 come limite per permettere una guida più aggressiva sui cordoli.
                 if abs(current_track_pos) > 1.25:
-                    print(f"\n  ❌ [OFF-TRACK] trackPos: {current_track_pos:.2f} - Riavvio immediato simulazione.")
+                    print(f"\n  [OFF-TRACK] trackPos: {current_track_pos:.2f} - Riavvio immediato simulazione.")
                     went_off_track = True
                     lap_completed = True
                     lap_valid = False
@@ -601,11 +601,11 @@ def main():
                         lap_completed = True
                         lap_valid = True
                         lap_time = current_cur_lap
-                        print(f"\n  ✅ [ZONA COMPLETATA] Zona completata (distanza: {current_dist:.1f}m > limite: {max_zone_bound + 10.0:.1f}m). Termino il giro anticipatamente!")
+                        print(f"\n  [ZONA COMPLETATA] Zona completata (distanza: {current_dist:.1f}m > limite: {max_zone_bound + 10.0:.1f}m). Termino il giro anticipatamente!")
 
                 # Log ogni 2 secondi circa (100 step) — indicatore zona (solo per il record)
                 if step % 100 == 0:
-                    zone_tag = "  🎯 ZONA TARGET" if cur_zone is not None else ""
+                    zone_tag = "  ZONA TARGET" if cur_zone is not None else ""
                     print(
                         f"    [Passo {step:4d}] Tempo giro corrente: {current_cur_lap:6.2f}s | "
                         f"Ultimo giro: {current_last_lap:6.2f}s | Distanza: {current_dist:7.1f}m"
@@ -619,11 +619,11 @@ def main():
                     if went_off_track:
                         lap_valid = False
                         invalidation_reason = "Giro invalidato (taglio curva o fuori pista)"
-                        print(f"\n  ⚠️  TRAGUARDO (A)! {invalidation_reason}")
+                        print(f"\n  TRAGUARDO (A)! {invalidation_reason}")
                     else:
                         lap_valid = True
                         lap_time = current_last_lap
-                        print(f"\n  🏁 TRAGUARDO (A)! Lap time rilevato: {lap_time:.3f}s")
+                        print(f"\n  TRAGUARDO (A)! Lap time rilevato: {lap_time:.3f}s")
 
                 # CONDIZIONE B: Reset di curLapTime (Metodo secondario per giri invalidati)
                 elif current_cur_lap < 1.5 and prev_cur_lap_time > 5.0:
@@ -631,7 +631,7 @@ def main():
                     # Se siamo qui, TORCS non ha aggiornato lastLapTime (quindi è invalido)
                     lap_valid = False
                     invalidation_reason = "Giro invalidato da TORCS (taglio o uscita)"
-                    print(f"\n  ⚠️  TRAGUARDO (B)! {invalidation_reason} (CurTime resettato)")
+                    print(f"\n  TRAGUARDO (B)! {invalidation_reason} (CurTime resettato)")
 
                 # CONDIZIONE C: Reset di distFromStart (Metodo di emergenza se i timer falliscono)
                 elif current_dist < 50.0 and prev_dist > 500.0:
@@ -642,7 +642,7 @@ def main():
                         lap_completed = True
                         lap_valid = False
                         invalidation_reason = "Fine giro rilevata da posizione (timer TORCS non aggiornato)"
-                        print(f"\n  ⚠️  TRAGUARDO (C)! {invalidation_reason}")
+                        print(f"\n  TRAGUARDO (C)! {invalidation_reason}")
 
                 prev_cur_lap_time = current_cur_lap
                 prev_dist = current_dist
@@ -704,13 +704,13 @@ def main():
                         _write_h5(os.path.join(laps_dir, filename),
                                   states_np[s:e], actions_np[s:e], dists_np[s:e])
                         saved_names.append(filename)
-                    print(f"  ✅ GIRO VALIDO — Salvati {len(segs)} segmenti curva ({', '.join(saved_names)})")
+                    print(f"  GIRO VALIDO — Salvati {len(segs)} segmenti curva ({', '.join(saved_names)})")
                     log_steps = sum(e - s for s, e in segs)
                 else:
                     lap_counter += 1
                     filename = f"lap_{lap_counter:03d}.h5"
                     _write_h5(os.path.join(laps_dir, filename), states_np, actions_np, dists_np)
-                    print(f"  ✅ GIRO VALIDO — Salvato: {filename}")
+                    print(f"  GIRO VALIDO — Salvato: {filename}")
                     log_steps = len(lap_states)
 
                 session_saved += 1
@@ -733,7 +733,7 @@ def main():
                     f"[SCARTATO] Tentativo #{lap_attempt} | Motivo: {reason} | "
                     f"Passi: {len(lap_states)} | {datetime.now().isoformat()}"
                 )
-                print(f"  ❌ GIRO SCARTATO — {reason}")
+                print(f"  GIRO SCARTATO — {reason}")
 
             # ── Scrivi log su file ──
             with open(log_path, 'a') as f:
@@ -742,12 +742,12 @@ def main():
     except KeyboardInterrupt:
         # ── Interruzione manuale: NON salvare il giro corrente ──
         print(f"\n\n{'=' * 64}")
-        print(f"  🛑 SESSIONE TERMINATA (Ctrl+C)")
+        print(f"  SESSIONE TERMINATA (Ctrl+C)")
         print(f"     Giri salvati:   {session_saved}")
         print(f"     Giri scartati:  {session_discarded}")
         print(f"     Log sessione:   {log_path}")
         print(f"{'=' * 64}")
-        print(f"  ⚠️  Giro corrente scartato (incompleto/interrotto).")
+        print(f"  Giro corrente scartato (incompleto/interrotto).")
 
     finally:
         # ── Scrivi riepilogo finale nel log ──

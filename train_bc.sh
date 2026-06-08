@@ -38,16 +38,16 @@ BC_BATCH_SIZE=256
 # ── Funzioni utility ──
 timestamp() { date '+%Y-%m-%d %H:%M:%S'; }
 
-log_info()  { echo -e "${CYAN}[$(timestamp)]${NC} ${BLUE}ℹ${NC}  $1"; }
-log_ok()    { echo -e "${CYAN}[$(timestamp)]${NC} ${GREEN}✅${NC} $1"; }
-log_warn()  { echo -e "${CYAN}[$(timestamp)]${NC} ${YELLOW}⚠️${NC}  $1"; }
-log_error() { echo -e "${CYAN}[$(timestamp)]${NC} ${RED}❌${NC} $1"; }
+log_info()  { echo -e "${CYAN}[$(timestamp)]${NC} $1"; }
+log_ok()    { echo -e "${CYAN}[$(timestamp)]${NC} $1"; }
+log_warn()  { echo -e "${CYAN}[$(timestamp)]${NC} $1"; }
+log_error() { echo -e "${CYAN}[$(timestamp)]${NC} $1"; }
 log_phase() { echo -e "\n${BOLD}${BLUE}══════════════════════════════════════════${NC}"; \
               echo -e "${BOLD}${BLUE}  $1${NC}"; \
               echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}\n"; }
 
 # ── Pre-check ──
-log_phase "🏎️  AIcar BC Training Pipeline"
+log_phase "AIcar BC Training Pipeline"
 
 # Controlla che esistano giri completi. Il BC esclude i segmenti lap_seg_*.h5:
 # quei file vengono usati solo dall'expert buffer del TD3+BC.
@@ -66,7 +66,7 @@ mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR"
 # ═══════════════════════════════════════════════════════════════════════
 #  Behavioral Cloning Training
 # ═══════════════════════════════════════════════════════════════════════
-log_phase "🧠  Training: Behavioral Cloning"
+log_phase "Training: Behavioral Cloning"
 log_info "Dataset: $DEMO_DIR ($DEMO_COUNT giri completi; segmenti esclusi dal BC)"
 log_info "Epochs: $BC_EPOCHS | Batch: $BC_BATCH_SIZE"
 log_info "Output: $BC_WEIGHTS"

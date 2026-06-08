@@ -18,7 +18,7 @@ def _kill_torcs():
     è la base del workaround per il memory-leak di TORCS (vedi ARCHITECTURE §5) ed è
     corretto per il flusso single-instance di training/test.
 
-    ⚠️ In scenari MULTI-istanza (run paralleli) o MULTI-vettura (video finale) questo
+    In scenari MULTI-istanza (run paralleli) o MULTI-vettura (video finale) questo
     ucciderebbe anche gli altri TORCS: imposta `TORCS_KILL_ALL=0` per disabilitare il
     kill globale (in quel caso gestisci tu la terminazione dell'istanza specifica).
     """

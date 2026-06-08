@@ -56,10 +56,10 @@ TD3_MAX_STEPS="${TD3_MAX_STEPS:-5000}"
 # ── Funzioni utility ──
 timestamp() { date '+%Y-%m-%d %H:%M:%S'; }
 
-log_info()  { echo -e "${CYAN}[$(timestamp)]${NC} ${BLUE}ℹ${NC}  $1"; }
-log_ok()    { echo -e "${CYAN}[$(timestamp)]${NC} ${GREEN}✅${NC} $1"; }
-log_warn()  { echo -e "${CYAN}[$(timestamp)]${NC} ${YELLOW}⚠️${NC}  $1"; }
-log_error() { echo -e "${CYAN}[$(timestamp)]${NC} ${RED}❌${NC} $1"; }
+log_info()  { echo -e "${CYAN}[$(timestamp)]${NC} $1"; }
+log_ok()    { echo -e "${CYAN}[$(timestamp)]${NC} $1"; }
+log_warn()  { echo -e "${CYAN}[$(timestamp)]${NC} $1"; }
+log_error() { echo -e "${CYAN}[$(timestamp)]${NC} $1"; }
 log_phase() { echo -e "\n${BOLD}${BLUE}══════════════════════════════════════════${NC}"; \
               echo -e "${BOLD}${BLUE}  $1${NC}"; \
               echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}\n"; }
@@ -107,7 +107,7 @@ for arg in "$@"; do
 done
 
 # ── Pre-check ──
-log_phase "🧠  AIcar TD3+BC Training (Reinforcement Learning)"
+log_phase "AIcar TD3+BC Training (Reinforcement Learning)"
 
 # Crea directory necessarie
 mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR" "train_set/checkpoints/buffers" "$BACKUP_DIR/buffers"
@@ -117,7 +117,7 @@ mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR" "train_set/checkpoints/buffers" "$BACKUP_D
 # ═══════════════════════════════════════════════════════════════════════
 
 if [[ -f "$TD3_CHECKPOINT" ]]; then
-    log_phase "♻️  Ripresa Training (Resume)"
+    log_phase "Ripresa Training (Resume)"
     TD3_SIZE=$(du -h "$TD3_CHECKPOINT" | cut -f1)
     log_info "Checkpoint TD3 trovato: ${BOLD}$TD3_CHECKPOINT${NC} ($TD3_SIZE)"
     if [[ -f "$TD3_BUFFER" ]]; then
@@ -128,14 +128,14 @@ if [[ -f "$TD3_CHECKPOINT" ]]; then
     fi
     log_info "Il training riprenderà dall'ultimo episodio salvato."
 elif [[ -f "$BC_WEIGHTS" ]]; then
-    log_phase "🚀  Warm-Start da Behavioral Cloning"
+    log_phase "Warm-Start da Behavioral Cloning"
     BC_SIZE=$(du -h "$BC_WEIGHTS" | cut -f1)
     log_info "Pesi BC trovati: ${BOLD}$BC_WEIGHTS${NC} ($BC_SIZE)"
     log_info "L'Actor TD3 inizializzerà backbone e continuous_head dal BC."
     log_info "Il Critic partirà da zero (Twin Q-Network)."
     log_info "Actor trainabile: backbone + continuous_head; gear_head congelata e ignorata da gearing.py."
 else
-    log_phase "⚠️  Cold-Start (Nessun Peso Trovato)"
+    log_phase "Cold-Start (Nessun Peso Trovato)"
     log_warn "Nessun peso BC trovato in: $BC_WEIGHTS"
     log_warn "Il TD3 partirà da ZERO — l'addestramento sarà molto più lungo."
     log_warn "Consiglio: esegui prima './train_bc.sh' per addestrare il BC."

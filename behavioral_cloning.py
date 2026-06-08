@@ -136,7 +136,7 @@ def load_dataset(path: str) -> Dataset:
                 
         if not datasets:
             raise ValueError("Nessun dataset valido trovato.")
-        print(f"  📚 Dataset caricato: {len(datasets)} giri, {total_samples} campioni totali.")
+        print(f"  Dataset caricato: {len(datasets)} giri, {total_samples} campioni totali.")
         return ConcatDataset(datasets), total_samples
     else:
         ds = TorcsHDF5Dataset(path)
@@ -479,7 +479,7 @@ class BehaviorCloningTrainer:
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     torch.save(self.model.state_dict(), checkpoint_path)
-                    improved = " ★ saved"
+                    improved = " saved"
                     patience_counter = 0
                 else:
                     patience_counter += 1
@@ -491,7 +491,7 @@ class BehaviorCloningTrainer:
                 )
 
                 if patience_counter >= patience:
-                    _log(f"\n  ⏹ Early Stopping: nessun miglioramento per {patience} epoche.")
+                    _log(f"\n  Early Stopping: nessun miglioramento per {patience} epoche.")
                     break
 
             _log(f"\n  Training completato. Best val loss: {self.best_val_loss:.6f}")
@@ -526,7 +526,7 @@ def main():
     # ── Device ──
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n{'=' * 64}")
-    print(f"  🧠 BEHAVIORAL CLONING — TORCS Giro Secco (Multi-Head)")
+    print(f"  BEHAVIORAL CLONING — TORCS Giro Secco (Multi-Head)")
     print(f"  Device: {device}")
     if device == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
@@ -566,7 +566,7 @@ def main():
     state_std = _all_states.std(axis=0)
     _norm_path = os.path.join(os.path.dirname(args.output) or ".", "state_norm.npz")
     np.savez(_norm_path, mean=state_mean, std=state_std)
-    print(f"  📐 Normalizzazione stati salvata: {_norm_path} (mean/std su {len(_all_states)} stati 29D)")
+    print(f"  Normalizzazione stati salvata: {_norm_path} (mean/std su {len(_all_states)} stati 29D)")
 
     # ── Modello ──
     model = PolicyNetwork(state_dim=state_dim)
@@ -600,11 +600,11 @@ def main():
         f.write(f"Dataset:      {args.dataset} | Campioni: {total_samples} | Device: {device}\n")
         f.write(f"Iperparam:    epochs={args.epochs} batch={args.batch_size} lr={args.lr} state_dim={state_dim}\n")
         f.write(f"Output:       {args.output}\n")
-    print(f"  📝 Log di sessione: {log_path}")
+    print(f"  Log di sessione: {log_path}")
 
     trainer.train(max_epochs=args.epochs, checkpoint_path=args.output, patience=100, log_path=log_path)
 
-    print("\n  ✅ Addestramento Behavioral Cloning Multi-Head completato.")
+    print("\n  Addestramento Behavioral Cloning Multi-Head completato.")
     print(f"  Pesi salvati in: {args.output}\n")
 
 if __name__ == "__main__":

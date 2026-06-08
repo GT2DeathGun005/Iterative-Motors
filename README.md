@@ -1,4 +1,4 @@
-# 🏎️ AIcar — Hybrid BC-RL Architecture (IBM AI Racing League 2026)
+# AIcar — Hybrid BC-RL Architecture (IBM AI Racing League 2026)
 
 **Agente autonomo che impara a guidare tramite Behavioral Cloning (BC) e Twin Delayed DDPG (TD3+BC).**
 
@@ -6,7 +6,7 @@ Questo repository implementa una pipeline end-to-end per addestrare un agente di
 
 ---
 
-## 🧠 Filosofia del Progetto: Architettura Ibrida BC-RL
+## Filosofia del Progetto: Architettura Ibrida BC-RL
 
 Questo progetto supera il classico Behavioral Cloning tramite un'architettura **Ibrida BC-RL**. L'agente parte con una **Deep Policy Network Multi-Head** addestrata offline per imitare l'esperto umano. Per sconfiggere il temuto *Covariate Shift* (che fa deragliare l'agente non appena si discosta millimetricamente dalla traiettoria ottimale), la pipeline prosegue con un **TD3+BC Fine-Tuning**.
 
@@ -24,16 +24,16 @@ Questa fase RL sfrutta il **Warm-Start** dal BC e segue il **TD3+BC minimalista*
 
 ---
 
-## 🏛️ Architettura del Sistema
+## Architettura del Sistema
 
 La pipeline si compone di quattro fasi sequenziali:
 
 ```
 ┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
 │  Fase 1              │     │  Fase 2              │     │  Fase 3              │     │  Fase 4              │
-│  RACCOLTA DATI       │────▶│  TRAINING BC         │────▶│  RIFINITURA TD3+BC   │────▶│  TEST / INFERENZA    │
+│  RACCOLTA DATI       │────>│  TRAINING BC         │────>│  RIFINITURA TD3+BC   │────>│  TEST / INFERENZA    │
 │                      │     │                      │     │                      │     │                      │
-│  🎮 PS5 / Tastiera   │     │  behavioral_cloning  │     │  td3_bc.py           │     │  test_agent.py       │
+│  PS5 / Tastiera      │     │  behavioral_cloning  │     │  td3_bc.py           │     │  test_agent.py       │
 │  data_collection.py  │     │  .py                 │     │  (Warm-Start)        │     │  Deterministico      │
 │                      │     │                      │     │                      │     │                      │
 │  Output:             │     │  Output:             │     │  Output:             │     │  Valutazione live    │
@@ -50,7 +50,7 @@ La pipeline si compone di quattro fasi sequenziali:
 
 ---
 
-## 📁 Struttura del Repository
+## Struttura del Repository
 
 ```
 AIcar/
@@ -58,9 +58,9 @@ AIcar/
 ├── behavioral_cloning.py      # Fase 2: Training della Deep Policy Network
 ├── td3_bc.py                  # Fase 3: TD3 Fine-Tuning (Warm-Start da BC)
 ├── test_agent.py              # Fase 4: Inferenza deterministica (BC o RL)
-├── train_bc.sh                # 🚀 Script per lanciare il training BC
-├── train_rl.sh                # 🚀 Script per lanciare il training TD3
-├── stop_training.sh           # 🛑 Ferma i processi di training/TORCS
+├── train_bc.sh                # Script per lanciare il training BC
+├── train_rl.sh                # Script per lanciare il training TD3
+├── stop_training.sh           # Ferma i processi di training/TORCS
 ├── README.md
 ├── gym_torcs/                 # Wrapper Python per TORCS
 │   ├── gym_torcs.py           #   Ambiente OpenAI Gym con Reward Reshaping
@@ -80,7 +80,7 @@ AIcar/
 
 ---
 
-## ⚙️ Istruzioni d'Uso
+## Istruzioni d'Uso
 
 ### Prerequisiti
 
@@ -110,7 +110,7 @@ python data_collection.py --output_dir train_set --device controller --segment_o
 
 **Feedback aptico (non log)**: entrando in una zona-curva target il **controller vibra brevemente** (gentile, ~30%) — così sai quando sei nella curva senza leggere lo schermo mentre guidi. Le zone sono le **curve strette auto-rilevate dalla geometria** della pista (sensore frontale `<0.25`, ~9 tornanti su Corkscrew), **robuste ai tuoi errori di guida** (frenate/sterzate fuori posto: contano solo la forma della pista, non i tuoi input). Con `--segment_only` la raccolta è **parziale**: guidi giri interi ma vengono tenuti solo i segmenti dentro le zone (file `lap_seg_*.h5`, con margine di approccio per lo stacking).
 
-**Output:** un file `train_set/laps/lap_NNN.h5` per ogni giro valido. Ogni file contiene `states` (29D), `actions` e il **metadato `dist_from_start`** (posizione per step). ⚠️ `dist_from_start` è solo un'etichetta di posizione per le analisi — **NON** entra nella rete, che resta **29D**.
+**Output:** un file `train_set/laps/lap_NNN.h5` per ogni giro valido. Ogni file contiene `states` (29D), `actions` e il **metadato `dist_from_start`** (posizione per step). `dist_from_start` è solo un'etichetta di posizione per le analisi — **NON** entra nella rete, che resta **29D**.
 
 ### 2. Addestramento BC (Behavioral Cloning)
 
@@ -163,7 +163,7 @@ python td3_bc.py \
 
 Il training è **resume-safe**: ad ogni episodio salva buffer e checkpoint in modo atomico, mantenendo anche `*.bak` e `*.prev` come ultime due copie complete recuperabili dentro `train_set/checkpoints/backups/`. Puoi interromperlo con `Ctrl+C` e riprenderlo in qualsiasi momento; se il checkpoint principale è corrotto, il loader prova automaticamente i backup recenti prima di cadere sul recupero minimo da log.
 
-Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per prevenire problemi di focus con il desktop dell'host. 
+Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per prevenire problemi di focus con il desktop dell'host.
 
 **Output:** `train_set/checkpoints/td3_policy.pth` + `td3_expl_best_lap.pth` + `td3_expl_best_dist.pth` + `td3_det_best_dist_run.pth` + `td3_det_best_dist.pth` + `td3_det_best_lap.pth` (quando chiude un giro valido deterministico) + `td3_checkpoint.pth` + `buffers/td3_checkpoint_buffer.npz` + `buffers/td3_checkpoint_elite_buffer.npz` + backup automatici in `backups/`.
 
@@ -175,7 +175,7 @@ Il test agent auto-rileva i migliori pesi disponibili: `td3_det_best_lap.pth` �
 
 > `td3_det_best_dist.pth` è la **migliore policy assoluta tra tutti i run** e — a differenza degli altri — **sopravvive a `--clean`** (così non si perde mai un buon risultato per un restart sfortunato).
 
-> ⚠️ **BC vs RL — rilevamento per nome file**: la mappatura azioni (RL: `tanh→[0,1]`; BC: `sigmoid`) viene scelta in base al **nome del file** (`td3_*`/`sac_*` = RL, `bc_*` = BC), **non** dalla presenza di `log_std_head` (che i vecchi checkpoint BC possono contenere). Caricare un BC come se fosse RL applicherebbe la de-normalizzazione sbagliata su gas/freno.
+> **BC vs RL — rilevamento per nome file**: la mappatura azioni (RL: `tanh→[0,1]`; BC: `sigmoid`) viene scelta in base al **nome del file** (`td3_*`/`sac_*` = RL, `bc_*` = BC), **non** dalla presenza di `log_std_head` (che i vecchi checkpoint BC possono contenere). Caricare un BC come se fosse RL applicherebbe la de-normalizzazione sbagliata su gas/freno.
 
 ```bash
 # Esecuzione standard con bypass Xvfb (visibile a schermo)
@@ -199,19 +199,19 @@ SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_det_best_dis
 
 ---
 
-## 📊 Interpretazione dei Log di Addestramento TD3+BC
+## Interpretazione dei Log di Addestramento TD3+BC
 
 Durante il training RL, il log stampa metriche fondamentali per diagnosticare la salute dell'addestramento. Ecco i valori corretti da aspettarsi:
 
 ### 1. Loss del Critic
 * **Cos'è:** Misura l'errore (MSE) del Critic nel prevedere le reward future.
-* **Valori Sani:** Grazie al *Reward Scaling* implementato, i valori ottimali oscillano **tra `0.01` e `5.0`** (con occasionali picchi isolati a `10-20` quando la macchina scopre porzioni di pista inedite). 
+* **Valori Sani:** Grazie al *Reward Scaling* implementato, i valori ottimali oscillano **tra `0.01` e `5.0`** (con occasionali picchi isolati a `10-20` quando la macchina scopre porzioni di pista inedite).
 * **Diagnosi:** Un valore stabilmente basso significa che il Critic sta fornendo stime coerenti. Se la loss del Critic schizza permanentemente a centinaia, c'è un'esplosione dei gradienti (o mancano i dati Behavioral Cloning nel replay buffer). In refinement le righe episodio mostrano `CriticL: ... (OFF)`: in quel caso la loss è calcolata e mostrata solo come diagnostica, ma il Critic **non** viene aggiornato.
 
 ### 2. Loss dell'Actor
-* **Cos'è:** Misura quanto l'Actor sta massimizzando le reward stimate dal Critic. 
+* **Cos'è:** Misura quanto l'Actor sta massimizzando le reward stimate dal Critic.
 * **Valori Sani:** con peso Behavioral Cloning costante a `1.0`, dopo il warm-up la loss dell'Actor si assesta intorno a **`-2.5`** (= `-λ`, dominanza del termine RL normalizzato). È il comportamento atteso del TD3+BC.
-* **Diagnosi:** Una discesa progressiva della loss è segno che l'Actor sta abbandonando l'imitazione forte iniziale per capitalizzare sul Q-Value. 
+* **Diagnosi:** Una discesa progressiva della loss è segno che l'Actor sta abbandonando l'imitazione forte iniziale per capitalizzare sul Q-Value.
 
 ### 3. Dinamiche TD3+BC (Decay di Lambda)
 * In TD3+BC l'entropia del SAC è rimossa, l'agente è completamente deterministico.
@@ -222,7 +222,7 @@ La refinement è una fase separata per plateau stabili: il peso Behavioral Cloni
 
 ---
 
-## 🔧 Dettagli Tecnici
+## Dettagli Tecnici
 
 ### PolicyNetwork / Actor Multi-Head
 
@@ -301,11 +301,11 @@ Nel TD3+BC il buffer salva un `mask` per la Bellman equation:
 | 24–27 | `wheelSpinVel[4]` | /100 | [0, ~2.6] |
 | 28 | `rpm` | /10000 | [0.5, 2.0] |
 
-> ⚠️ **IMPORTANTE:** ci sono due livelli distinti: scaling fisso fisico (`gym_torcs.make_observaton()` + `flatten_state()`) e normalizzazione statistica mean/std (`state_norm.npz`) applicata prima della rete. Non aggiungere nuove normalizzazioni ad hoc.
+> **IMPORTANTE:** ci sono due livelli distinti: scaling fisso fisico (`gym_torcs.make_observaton()` + `flatten_state()`) e normalizzazione statistica mean/std (`state_norm.npz`) applicata prima della rete. Non aggiungere nuove normalizzazioni ad hoc.
 
 ---
 
-## 📈 Strategia di Ottimizzazione Dataset
+## Strategia di Ottimizzazione Dataset
 
 ### Il Limite dei Dati Troppo Omogenei
 Se il dataset contiene unicamente giri perfetti lungo l'identica traiettoria ideale, l'agente non apprenderà mai cosa fare fuori da quella linea → **Covariate Shift**.
@@ -324,7 +324,7 @@ Un meccanismo che pesava di più i campioni di una curva nella loss BC è stato 
 
 ---
 
-## 🐛 Bug Risolti (Workflow Tracking)
+## Bug Risolti (Workflow Tracking)
 
 Le voci più vecchie sono cronologia tecnica: possono citare SAC o nomi checkpoint storici, ma la fonte di verità operativa attuale è la sezione TD3+BC sopra e ARCHITECTURE.md.
 

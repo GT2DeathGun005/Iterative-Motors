@@ -3,7 +3,7 @@
 Questo documento descrive in dettaglio l'architettura del modello e le scelte implementative per il fine-tuning tramite TD3+BC (Twin Delayed DDPG con Behavioral Cloning) partendo da un modello addestrato via Behavioral Cloning (BC).
 
 ## 1. Actor (La Policy) e Il Passaggio a TD3+BC
-A causa di persistenti problemi di *Catastrophic Forgetting* ed *Escalation Entropica* riscontrati con il framework SAC, l'architettura è stata migrata al **TD3+BC** (Twin Delayed DDPG con Behavioral Cloning), progettato appositamente per il fine-tuning offline-to-online da Fujimoto & Gu (2021). 
+A causa di persistenti problemi di *Catastrophic Forgetting* ed *Escalation Entropica* riscontrati con il framework SAC, l'architettura è stata migrata al **TD3+BC** (Twin Delayed DDPG con Behavioral Cloning), progettato appositamente per il fine-tuning offline-to-online da Fujimoto & Gu (2021).
 
 L'Actor è ora una rete completamente **deterministica**:
 - **Rimozione Entropia**: Il campionamento gaussiano è stato rimosso, eliminando il rumore distruttivo dalla policy di base.
@@ -65,7 +65,7 @@ Per proteggere l'esplorazione nei primissimi secondi di un episodio, il motore f
 - **Update Frequency 1:1**: un aggiornamento del Critic ad ogni step di simulazione (standard TD3), con Delayed Policy Update dell'Actor ogni 2 step. Il buffer è ampio e diversificato (1M online + expert permanente), quindi l'overfitting su transizioni correlate non è un problema; il 1:1 sfrutta al meglio i dati raccolti e velocizza l'apprendimento.
 
 ## 5. Memory Safety (TORCS C++ Engine)
-L'ambiente TORCS nativo soffre di un grave memory leak interno quando si riavvia la gara via socket (UDP). 
+L'ambiente TORCS nativo soffre di un grave memory leak interno quando si riavvia la gara via socket (UDP).
 
 > **Soluzione Relaunch**: Abbiamo bypassato il memory leak a livello di sistema operativo. Passando `relaunch=True` ad ogni episodio, il server TORCS viene ucciso (`pkill -9 torcs`), le porte UDP vengono svuotate, e viene lanciata una nuova istanza pulita all'interno di un server display virtuale isolato (`xvfb-run`). Questo rende l'ambiente **100% memory safe** anche per addestramenti di giorni interi.
 
@@ -123,14 +123,14 @@ Per mitigare la *Sample Inefficiency* e il *Catastrophic Forgetting* intrinseco 
 ## 10. Prevenzione del Collasso (Masking Rigoroso e Causal Confusion)
 Durante l'addestramento ibrido, l'architettura risolve due problematiche critiche intrinseche al Self-Imitation Learning:
 
-1. **Masking Rigoroso per Prevenire il Covariate Shift**: 
-   Nel buffer standard (75% del batch esplorativo), i gradienti RL puri possono degenerare se affiancati ad un'imitazione impropria.
-   L'agente sfrutta una **Maschera Esperta** (`expert_mask=1.0` per Elite, `0.0` per Online). La BC Penalty calcola l'MSE tra l'azione umana e l'azione deterministica **solo sui campioni esperti**, azzerandosi per quelli online. 
-   Questo elimina la necessità di interrogare una rete BC per gli stati OOD, annullando le allucinazioni e rimuovendo i milioni di parametri extra della vecchia ancora Behavioral Cloning congelata.
+1. **Masking Rigoroso per Prevenire il Covariate Shift**:
+ Nel buffer standard (75% del batch esplorativo), i gradienti RL puri possono degenerare se affiancati ad un'imitazione impropria.
+ L'agente sfrutta una **Maschera Esperta** (`expert_mask=1.0` per Elite, `0.0` per Online). La BC Penalty calcola l'MSE tra l'azione umana e l'azione deterministica **solo sui campioni esperti**, azzerandosi per quelli online.
+ Questo elimina la necessità di interrogare una rete BC per gli stati OOD, annullando le allucinazioni e rimuovendo i milioni di parametri extra della vecchia ancora Behavioral Cloning congelata.
 
-2. **Terminal State Mimicry (Sgancio Pre-Schianto)**: 
-   Quando un episodio record (salvato nell'Elite Buffer) termina con uno schianto, le ultime azioni sono la causa diretta del fallimento. Forzare l'Actor a imitarle (tramite Self-Imitation) indurrebbe una *Causal Confusion*. 
-   Il sistema risolve questo paradosso azzerando la maschera di imitazione (`expert=0.0`) negli ultimi 50 step (esattamente 1 secondo a 50Hz) di un record schiantato. In quella "finestra di evasione", l'agente smette di imitare il suo vecchio errore e torna istantaneamente sotto l'influenza del Reinforcement Learning puro, riuscendo così a frenare e a sopravvivere per estendere ulteriormente il record.
+2. **Terminal State Mimicry (Sgancio Pre-Schianto)**:
+ Quando un episodio record (salvato nell'Elite Buffer) termina con uno schianto, le ultime azioni sono la causa diretta del fallimento. Forzare l'Actor a imitarle (tramite Self-Imitation) indurrebbe una *Causal Confusion*.
+ Il sistema risolve questo paradosso azzerando la maschera di imitazione (`expert=0.0`) negli ultimi 50 step (esattamente 1 secondo a 50Hz) di un record schiantato. In quella "finestra di evasione", l'agente smette di imitare il suo vecchio errore e torna istantaneamente sotto l'influenza del Reinforcement Learning puro, riuscendo così a frenare e a sopravvivere per estendere ulteriormente il record.
 
 ## 11. Evaluation Periodica Deterministica
 Ogni 5 episodi di training, il sistema esegue automaticamente un **episodio di valutazione deterministica** (`evaluate=True`, zero rumore). Da questo eval si salvano due record distinti: la **distanza** migliore (`td3_det_best_dist_run.pth`, e il globale `td3_det_best_dist.pth`) e — quando l'agente chiude un giro intero — il **tempo sul giro valido** più veloce (`td3_det_best_lap.pth`, vedi §14). Questo garantisce che il checkpoint usato per la presentazione video sia sempre la policy migliore *riproducibile* — non quella del miglior episodio esplorativo (che potrebbe essere un outlier fortunato con rumore stocastico).
@@ -163,13 +163,13 @@ I checkpoint (in `train_set/checkpoints/`) seguono una **convenzione esplicita a
 ### Tabella di riferimento rapido
 | File | Sorgente | Metrica | Sopravvive a `--clean`? | Scopo |
 |---|---|---|---|---|
-| **`td3_det_best_lap.pth`** (+`.txt`) | DETERMINISTICA | tempo giro valido | ✅ sì | **CANDIDATO SUBMISSION** (giro valido più veloce, riproducibile). Priorità massima nell'auto-detect di `test_agent.py`. |
-| **`td3_det_best_dist.pth`** (+`.txt`) | DETERMINISTICA | distanza (assoluta tra run) | ✅ sì | Miglior distanza deterministica mai raggiunta; non si perde con un `--clean` sfortunato. |
-| `td3_det_best_dist_run.pth` | DETERMINISTICA | distanza (run corrente) | ❌ no | Miglior distanza det. del run in corso. |
-| `td3_expl_best_lap.pth` | esplorativa (rumore) | tempo giro valido | ❌ no | Giro valido completato in esplorazione (non riproducibile det.). Solo riferimento. |
-| `td3_expl_best_dist.pth` | esplorativa (rumore) | distanza | ❌ no | Distanza max in esplorazione (>500m). Solo riferimento. |
-| `td3_policy.pth` | — | — | ❌ no | Ultimi pesi Actor (fine di ogni episodio). |
-| `td3_checkpoint.pth` | — | — | ❌ no | Stato globale completo (ottimizzatori, step, record) per il resume. |
+| **`td3_det_best_lap.pth`** (+`.txt`) | DETERMINISTICA | tempo giro valido | sì | **CANDIDATO SUBMISSION** (giro valido più veloce, riproducibile). Priorità massima nell'auto-detect di `test_agent.py`. |
+| **`td3_det_best_dist.pth`** (+`.txt`) | DETERMINISTICA | distanza (assoluta tra run) | sì | Miglior distanza deterministica mai raggiunta; non si perde con un `--clean` sfortunato. |
+| `td3_det_best_dist_run.pth` | DETERMINISTICA | distanza (run corrente) | no | Miglior distanza det. del run in corso. |
+| `td3_expl_best_lap.pth` | esplorativa (rumore) | tempo giro valido | no | Giro valido completato in esplorazione (non riproducibile det.). Solo riferimento. |
+| `td3_expl_best_dist.pth` | esplorativa (rumore) | distanza | no | Distanza max in esplorazione (>500m). Solo riferimento. |
+| `td3_policy.pth` | — | — | no | Ultimi pesi Actor (fine di ogni episodio). |
+| `td3_checkpoint.pth` | — | — | no | Stato globale completo (ottimizzatori, step, record) per il resume. |
 
 > **Nota sui log storici**: eventuali nomi checkpoint precedenti alla convenzione `det/expl` sono solo cronologia. La nomenclatura operativa attuale è quella della tabella sopra.
 
@@ -203,9 +203,9 @@ Quando la policy deterministica si **stabilizza in un plateau** sotto il giro co
 
 - **Trigger conservativo e STATISTICO**: la refinement automatica e' attiva di default e si attiva SOLO quando la **MEDIA della finestra recente (ultimi 8 eval)** — la performance *tipica*, non un singolo colpo di fortuna — **smette di salire** (incremento < 2%) per **4 valutazioni** (~20 episodi) E l'episodio ≥ 200. Usare la media (e non il singolo `best`) evita di attivarsi prematuramente quando la performance tipica sta ancora migliorando pur sotto un picco fortunato precoce. *(Attivarla troppo presto → collasso, Ablation 1 del paper.)* Durante il congelamento dell'Actor il trigger è sospeso e le eval non alimentano la finestra plateau, perché l'Actor non può ancora migliorare. Su **resume** la finestra eval viene pre-popolata leggendo lo storico dal log (`load_recent_evals_from_log`), così il rilevamento parte già informato. `--no-auto-refine` disattiva solo questo trigger automatico quando il Critic deve recuperare stabilita'; il flag `--refine` resta manuale e la avvia **subito** quando l'operatore sa già di essere in plateau. Il `riferimento rollback` viene fissato immediatamente dalla mediana dello storico, o da `td3_det_best_dist` in caso di rollback.
 - **Azione**: il Critic resta fisso perché il suo aggiornamento viene disattivato, e il peso Behavioral Cloning scende da `1.0` a `0.3`, lasciando l'Actor più libero di raffinarsi verso i Q-Value del Critic già appreso. La loss del Critic continua a comparire solo come diagnostica. Ogni riga `[EVAL]` del log riporta lo stato compatto, ad esempio: `Refine: ON (BC=0.3, Critic=OFF, rollback_ref=Xm)`.
-- **Avviso di recupero**: quando un eval supera il riferimento di plateau di oltre il 10%, viene loggato una-tantum `🚀 PLATEAU SUPERATO` — segnale esplicito che la refinement sta funzionando (la policy ha rotto il muro).
+- **Avviso di recupero**: quando un eval supera il riferimento di plateau di oltre il 10%, viene loggato una-tantum `PLATEAU SUPERATO` — segnale esplicito che la refinement sta funzionando (la policy ha rotto il muro).
 - **Uscita di consolidamento**: se il breakout è vicino al miglior deterministico assoluto già preservato (`td3_det_best_dist`, margine 5m), la refinement termina subito anche se non supera il record di oltre la soglia anti-jitter. Il peso Behavioral Cloning torna a `1.0`, il Critic viene riattivato e l'Actor può essere congelato temporaneamente per riallineare la Value Function. Questo evita di lasciare il Critic spento dopo un eval quasi-best.
-- **🛡️ Rete di sicurezza (auto-rollback)**: se durante la refinement l'eval crolla sotto il **60% del riferimento di plateau** (la **MEDIANA** della finestra recente — più robusta del max al singolo picco stocastico) per **3 valutazioni consecutive**, l'Actor viene **ripristinato da `td3_det_best_dist.pth`**, il peso Behavioral Cloning torna a `1.0` e l'aggiornamento del Critic viene riattivato. La policy migliore non si perde MAI (è sempre su disco).
+- **Rete di sicurezza (auto-rollback)**: se durante la refinement l'eval crolla sotto il **60% del riferimento di plateau** (la **MEDIANA** della finestra recente — più robusta del max al singolo picco stocastico) per **3 valutazioni consecutive**, l'Actor viene **ripristinato da `td3_det_best_dist.pth`**, il peso Behavioral Cloning torna a `1.0` e l'aggiornamento del Critic viene riattivato. La policy migliore non si perde MAI (è sempre su disco).
 - **Anti-loop**: massimo **3 tentativi** di refinement; oltre, il training prosegue normale. La logica della macchina a stati è validata offline (plateau→attiva, collasso→rollback, ancora-in-salita→non attiva, bimodale→nessun rollback spurio).
 
 ## 19. Possibili Miglioramenti Futuri (non bloccanti)

@@ -211,7 +211,7 @@ def flatten_state(state_dict: dict) -> np.ndarray:
         return apply_state_norm(s)  # mean-0/std-1, coerente col training
     except Exception as e:
         # NON silenziare: uno stato a zero falsa l'inferenza ed è difficilissimo da diagnosticare.
-        print(f"⚠️  flatten_state fallita (stato a zero): {e}")
+        print(f"flatten_state fallita (stato a zero): {e}")
         return apply_state_norm(np.zeros(29, dtype=np.float32))
 
 
@@ -285,32 +285,32 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
             try:
                 with open(_lt_txt) as f: _lt = f' ({float(f.read().strip()):.3f}s)'
             except Exception: pass
-        print(f"  🔍 Auto-detect: trovato td3_det_best_lap.pth (Miglior GIRO VALIDO deterministico{_lt} — candidato submission!)")
+        print(f"  Auto-detect: trovato td3_det_best_lap.pth (Miglior GIRO VALIDO deterministico{_lt} — candidato submission!)")
     elif os.path.exists(td3_det_best_dist_path):
         load_path = td3_det_best_dist_path
-        print(f"  🔍 Auto-detect: trovato td3_det_best_dist.pth (Miglior policy ASSOLUTA per distanza, sopravvive ai --clean!)")
+        print(f"  Auto-detect: trovato td3_det_best_dist.pth (Miglior policy ASSOLUTA per distanza, sopravvive ai --clean!)")
     elif os.path.exists(td3_det_best_dist_run_path):
         load_path = td3_det_best_dist_run_path
-        print(f"  🔍 Auto-detect: trovato td3_det_best_dist_run.pth (Miglior checkpoint deterministico TD3!)")
+        print(f"  Auto-detect: trovato td3_det_best_dist_run.pth (Miglior checkpoint deterministico TD3!)")
     elif os.path.exists(td3_expl_best_lap_path):
         load_path = td3_expl_best_lap_path
-        print(f"  🔍 Auto-detect: trovato td3_expl_best_lap.pth (Record sul giro TD3!)")
+        print(f"  Auto-detect: trovato td3_expl_best_lap.pth (Record sul giro TD3!)")
     elif os.path.exists(td3_expl_best_dist_path):
         load_path = td3_expl_best_dist_path
-        print(f"  🔍 Auto-detect: trovato td3_expl_best_dist.pth (Record di distanza TD3!)")
+        print(f"  Auto-detect: trovato td3_expl_best_dist.pth (Record di distanza TD3!)")
     elif os.path.exists(td3_path):
         load_path = td3_path
-        print(f"  🔍 Auto-detect: trovato td3_policy.pth (Ultimo step TD3)")
+        print(f"  Auto-detect: trovato td3_policy.pth (Ultimo step TD3)")
 
     elif os.path.exists(bc_path):
         load_path = bc_path
-        print(f"  🔍 Auto-detect: fallback su bc_policy.pth")
+        print(f"  Auto-detect: fallback su bc_policy.pth")
     else:
-        print(f"  ❌ Nessun file pesi trovato!")
+        print(f"  Nessun file pesi trovato!")
         sys.exit(1)
 
     if not os.path.exists(load_path):
-        print(f"  ❌ File pesi non trovato: {load_path}")
+        print(f"  File pesi non trovato: {load_path}")
         sys.exit(1)
 
     try:
@@ -337,12 +337,12 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
         elif 'bc' in fname:
             is_rl = False
         else:
-            print("  ⚠️  Tipo pesi non deducibile dal nome file: assumo "
+            print("   Tipo pesi non deducibile dal nome file: assumo "
                   f"{'RL' if has_log_std else 'BC'}. Usa --kind rl|bc per essere esplicito.")
             is_rl = has_log_std
 
     weight_type = "RL (TD3)" if is_rl else "BC"
-    print(f"  ✅ Pesi [{weight_type}] caricati da: {load_path}")
+    print(f"  Pesi [{weight_type}] caricati da: {load_path}")
 
     return model, is_rl
 
@@ -366,10 +366,10 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"\n{'=' * 64}")
-    print(f"  🏁 TEST AGENTE AUTONOMO (BC/TD3) — TORCS")
+    print(f"  TEST AGENTE AUTONOMO (BC/TD3) — TORCS")
     print(f"  Device: {device}")
     print(f"  Stride Type: static (k=6, 0.24s)")
-    print(f"  🎯 Modalità: DETERMINISTICA (evaluate=True, Zero Noise)")
+    print(f"  Modalità: DETERMINISTICA (evaluate=True, Zero Noise)")
     print(f"{'=' * 64}\n")
 
     # ── Carica modello con auto-detect ──
@@ -379,7 +379,7 @@ def main():
     # Seleziona la funzione di denormalizzazione corretta
     denormalize_fn = denormalize_action_rl if is_rl else denormalize_action_bc
     inference_mode = "RL (sample evaluate=True)" if is_rl else "BC (forward diretto)"
-    print(f"  📐 Inference mode: {inference_mode}")
+    print(f"  Inference mode: {inference_mode}")
 
     # ── Ambiente ──
     print("  Inizializzazione TORCS...")
@@ -418,7 +418,7 @@ def main():
             stall_low_speed_steps = 0  # contatore stallo (#3: semantica allineata al training)
 
             print(f"\n  {'─' * 50}")
-            print(f"  🏁 Tentativo #{total_attempts} (giri completati: {len(lap_times)}/{args.laps})")
+            print(f"  Tentativo #{total_attempts} (giri completati: {len(lap_times)}/{args.laps})")
 
             for step in range(1, args.max_steps + 1):
                 # Costruisce il vettore di stato 87D concatenando t-12 (index 0), t-6 (index 6), t (index 12)
@@ -492,10 +492,10 @@ def main():
 
                 # ── Giro NON valido oltre |trackPos| > 1.25 (taglio/muro), coerente col training e coi limiti di raccolta dati ──
                 if abs(track_pos) > 1.25:
-                    print(f"  ⚠️  Fuori pista / giro non valido allo step {step} (trackPos={track_pos:.3f})")
+                    print(f"   Fuori pista / giro non valido allo step {step} (trackPos={track_pos:.3f})")
                     break
                 if np.cos(angle) < 0:
-                    print(f"  ⚠️  Spin allo step {step} (angle={angle:.3f})")
+                    print(f"   Spin allo step {step} (angle={angle:.3f})")
                     break
 
                 # ── Stallo (#3: semantica allineata al training) ──
@@ -508,7 +508,7 @@ def main():
                 else:
                     stall_low_speed_steps = 0
                 if stall_low_speed_steps >= 50:
-                    print(f"  ⚠️  Stallo allo step {step} (vel. avanti {fwd_kmh:.1f} km/h)")
+                    print(f"   Stallo allo step {step} (vel. avanti {fwd_kmh:.1f} km/h)")
                     break
 
                 # ── Telemetria ogni 200 passi ──
@@ -541,24 +541,24 @@ def main():
                 writer = csv.DictWriter(f_csv, fieldnames=['step', 'dist', 'speed', 'trackPos', 'angle', 'steer', 'accel', 'brake', 'gear'])
                 writer.writeheader()
                 writer.writerows(telemetry_data)
-            print(f"  📊 Telemetria del tentativo salvata in: {csv_path}")
+            print(f"  Telemetria del tentativo salvata in: {csv_path}")
 
             if lap_completed:
                 lap_times.append(lap_time)
-                print(f"  ✅ GIRO COMPLETATO: {lap_time:.3f}s")
+                print(f"  GIRO COMPLETATO: {lap_time:.3f}s")
             else:
-                print(f"  ❌ Fallito (step: {step})")
-                print("  ⚠️  Tentativo fallito. Prossimo tentativo...")
+                print(f"  Fallito (step: {step})")
+                print("   Tentativo fallito. Prossimo tentativo...")
                 # Continua con il prossimo tentativo (il while loop riproverà con relaunch=True)
 
     except KeyboardInterrupt:
-        print(f"\n  🛑 Test interrotto.")
+        print(f"\n  Test interrotto.")
     finally:
         env.end()
 
     # ── Riepilogo ──
     print(f"\n{'=' * 64}")
-    print(f"  📊 RIEPILOGO TEST")
+    print(f"  RIEPILOGO TEST")
     if lap_times:
         print(f"  Giri completati: {len(lap_times)}/{args.laps}")
         print(f"  Best:  {min(lap_times):.3f}s | Media: {sum(lap_times)/len(lap_times):.3f}s")
