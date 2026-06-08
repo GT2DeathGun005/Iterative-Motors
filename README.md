@@ -161,7 +161,7 @@ python td3_bc.py \
     --seed 42
 ```
 
-Il training è **resume-safe**: ad ogni episodio salva buffer e checkpoint in modo atomico, mantenendo anche `*.bak` e `*.prev` come ultime due copie complete recuperabili dentro `train_set/checkpoints/backups/`. Puoi interromperlo con `Ctrl+C` e riprenderlo in qualsiasi momento; se il checkpoint principale è corrotto, il loader prova automaticamente i backup recenti prima di cadere sul recupero minimo da log.
+Il training è **resume-safe**: ad ogni episodio salva buffer e checkpoint in modo atomico, mantenendo anche `*.bak` e `*.prev` come ultime due copie complete recuperabili dentro `train_set/checkpoints/backups/`. `Ctrl+C`/`SIGTERM` non interrompono più la scrittura a metà: chiedono uno stop ordinato dopo il prossimo checkpoint completo. Se il checkpoint principale è corrotto, il loader prova automaticamente i backup recenti; se un buffer risulta più nuovo del checkpoint caricato, viene ignorato in favore del backup coerente col `.pth` usato come commit finale.
 
 Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per prevenire problemi di focus con il desktop dell'host.
 

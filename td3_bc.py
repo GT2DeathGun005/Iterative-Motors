@@ -26,6 +26,7 @@ import sys
 import argparse
 import random
 import re
+import signal
 import shutil
 import numpy as np
 import torch
@@ -642,30 +643,48 @@ class TD3BCAgent:
         buffer_path = os.path.join(buffer_dir, f"{base_name}_buffer.npz")
         elite_buffer_path = os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz")
 
-        for candidate in _checkpoint_candidates(buffer_path):
-            if not os.path.exists(candidate):
-                continue
-            try:
-                memory.load(candidate)
-                if candidate != buffer_path:
-                    print(f"Replay Buffer recuperato dal backup: {candidate}")
-                break
-            except Exception as e:
-                print(f"Impossibile caricare Replay Buffer da {candidate}: {e}")
+        def _load_buffer_aligned(buffer_obj, path, label, loaded_checkpoint_path=None):
+            """Carica il buffer più recente non più nuovo del checkpoint scelto.
 
-        if elite_memory:
-            for candidate in _checkpoint_candidates(elite_buffer_path):
+            Se il processo muore dopo aver promosso il buffer ma prima di promuovere
+            il .pth, il buffer principale è valido come file ma appartiene a un commit
+            non completato. In quel caso il resume usa .bak/.prev coerenti col .pth.
+            """
+            if buffer_obj is None:
+                return False
+            max_mtime = None
+            if loaded_checkpoint_path and os.path.exists(loaded_checkpoint_path):
+                max_mtime = os.path.getmtime(loaded_checkpoint_path)
+
+            skipped_newer = []
+            for candidate in _checkpoint_candidates(path):
                 if not os.path.exists(candidate):
                     continue
+                if max_mtime is not None and os.path.getmtime(candidate) > max_mtime + 1e-3:
+                    skipped_newer.append(candidate)
+                    continue
                 try:
-                    elite_memory.load(candidate)
-                    if candidate != elite_buffer_path:
-                        print(f"Elite Buffer recuperato dal backup: {candidate}")
-                    break
+                    buffer_obj.load(candidate)
+                    if candidate != path:
+                        print(f"{label} recuperato dal backup coerente: {candidate}")
+                    if skipped_newer:
+                        print(f"{label}: ignorati file più nuovi del checkpoint caricato: {skipped_newer}")
+                    return True
                 except Exception as e:
-                    print(f"Impossibile caricare Elite Buffer da {candidate}: {e}")
+                    print(f"Impossibile caricare {label} da {candidate}: {e}")
+
+            # Fallback estremo: meglio un buffer valido ma segnalato come più nuovo che nessun replay.
+            for candidate in skipped_newer:
+                try:
+                    buffer_obj.load(candidate)
+                    print(f"{label}: nessun backup allineato trovato; uso {candidate} (più nuovo del checkpoint).")
+                    return True
+                except Exception as e:
+                    print(f"Impossibile caricare {label} da {candidate}: {e}")
+            return False
 
         loaded_ok = False
+        loaded_checkpoint_path = None
         for candidate in _checkpoint_candidates(filepath):
             if not os.path.exists(candidate):
                 continue
@@ -702,6 +721,7 @@ class TD3BCAgent:
                     episode = 0
                     global_step = 0
                 loaded_ok = True
+                loaded_checkpoint_path = candidate
                 break
             except Exception as e:
                 print(f"Checkpoint non utilizzabile da {candidate}: {e}")
@@ -732,6 +752,10 @@ class TD3BCAgent:
             det_best_dist_txt = 'train_set/checkpoints/td3_det_best_dist.txt'
             best_eval_dist = safe_read_float(det_best_dist_txt, 0.0)
             best_distance = best_eval_dist
+
+        _load_buffer_aligned(memory, buffer_path, "Replay Buffer", loaded_checkpoint_path if loaded_ok else None)
+        if elite_memory:
+            _load_buffer_aligned(elite_memory, elite_buffer_path, "Elite Buffer", loaded_checkpoint_path if loaded_ok else None)
 
         # NB: nessun fallback hardcoded sui record storici. Valori hardcoded (es. 84.3s/3619m
         # di una run specifica) corrompevano l'Elite Buffer su un resume weights-only:
@@ -926,6 +950,25 @@ def train():
     os.makedirs('train_set/checkpoints', exist_ok=True)
     os.makedirs('train_set/session_logs', exist_ok=True)
     log_file = 'train_set/session_logs/td3_training.log'
+
+    def _control_log(message):
+        print(message)
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(message + "\n")
+
+    stop_requested = False
+
+    def _request_stop(signum, frame):
+        nonlocal stop_requested
+        if not stop_requested:
+            stop_requested = True
+            print("\nRichiesta di arresto ricevuta: il training si fermerà dopo il prossimo checkpoint completo.")
+        else:
+            print("\nArresto già richiesto: attendi il checkpoint completo o usa kill -9 solo come ultima risorsa.")
+
+    signal.signal(signal.SIGINT, _request_stop)
+    signal.signal(signal.SIGTERM, _request_stop)
+
     # Conferma nel LOG (non solo stdout) se la refinement è stata armata da --refine, così è
     # tracciabile a posteriori senza ambiguità con l'AUTO-REFINEMENT che scatta da solo.
     if getattr(args, 'refine', False):
@@ -1107,6 +1150,10 @@ def train():
                               best_eval_dist=best_eval_dist,
                               best_distance=best_distance)
         safe_save(agent.actor.state_dict(), 'train_set/checkpoints/td3_policy.pth')
+        if stop_requested:
+            _control_log(f"[{datetime.now().strftime('%H:%M:%S')}] STOP richiesto: "
+                         f"checkpoint completo salvato all'episodio {episode + 1}; uscita pulita.")
+            break
 
         if (episode + 1) % 5 == 0 and global_step > 15000:
             def _rlog(m):
@@ -1351,6 +1398,11 @@ def train():
                     refine_plateau_level = 0.0
                     _rlog(f"  TIMEOUT REFINEMENT (40 episodi in refinement senza superare il record) "
                           f"→ Uscita automatica, peso Behavioral Cloning→1.0, aggiornamento Critic riattivato. Tentativi: {refine_attempts}/{REFINE_MAX_ATTEMPTS}")
+
+        if stop_requested:
+            _control_log(f"[{datetime.now().strftime('%H:%M:%S')}] STOP richiesto durante/ dopo eval: "
+                         f"ultimo checkpoint completo episodio {episode + 1}; uscita pulita.")
+            break
 
     env.end()
 
