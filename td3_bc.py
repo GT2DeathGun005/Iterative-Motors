@@ -816,6 +816,7 @@ def train():
     REFINE_MIN_EP = 200            # episodio minimo per l'auto-trigger
     REFINE_IMPROVE_FRAC = 1.02     # la media deve salire >2% per contare come "miglioramento"
     REFINE_BREAKOUT_FRAC = 1.10    # breakout reale: eval > riferimento rollback del 10%
+    REFINE_GOOD_EVALS_TO_CONSOLIDATE = 3  # 3 breakout consecutivi bastano: non lasciare il Critic spento troppo a lungo
     REFINE_NEAR_BEST_MARGIN = 5.0  # metri: se il breakout è vicino al best globale, consolidiamo subito
     BEST_DIST_EPS = 1.0            # evita di risalvare/loggare record identici per jitter sub-metrico
     agent.refine_mode = False
@@ -842,6 +843,7 @@ def train():
     refine_plateau_level = 0.0     # 0 = riferimento rollback non ancora impostato
     refine_collapse_count = 0
     refine_evals_count = 0
+    refine_good_eval_count = 0
     refine_breakout_logged = False  # per loggare UNA volta il superamento del plateau
     if getattr(args, 'refine', False):
         # Avvio mirato quando l'operatore SA già che è in plateau: refinement attiva da subito.
@@ -1197,6 +1199,7 @@ def train():
                     refine_best_mean = 0.0
                     refine_plateau_level = 0.0
                     refine_evals_count = 0
+                    refine_good_eval_count = 0
                     recent_eval_window.clear()
                     _rlog("  REFINEMENT CONCLUSA CON SUCCESSO! Nuovo record deterministico rilevato.")
                     if actor_freeze_episodes > 0:
@@ -1251,6 +1254,7 @@ def train():
                         refine_plateau_level = float(np.median(list(recent_eval_window)))
                         refine_collapse_count = 0
                         refine_evals_count = 0
+                        refine_good_eval_count = 0
                         refine_breakout_logged = False
                         _rlog(f"  AUTO-REFINEMENT ATTIVA (tentativo {refine_attempts+1}/{REFINE_MAX_ATTEMPTS}): "
                               f"media recente in plateau a {cur_mean:.0f}m, aggiornamento Critic disattivato, "
@@ -1263,14 +1267,19 @@ def train():
                 if len(recent_eval_window) >= 4:
                     refine_plateau_level = float(np.median(list(recent_eval_window)))
                     refine_evals_count = 0
+                    refine_good_eval_count = 0
                     _rlog(f"  refinement: riferimento rollback = {refine_plateau_level:.0f}m "
                           f"(MEDIANA degli ultimi {len(recent_eval_window)} eval, max={max(recent_eval_window):.0f}m)")
             elif agent.refine_mode:
                 # In REFINEMENT.
                 refine_evals_count += 1
-                # ① Avviso di RECUPERO: la refinement ha rotto il plateau (eval
+                # Avviso di RECUPERO: la refinement ha rotto il plateau (eval
                 # oltre +10% del riferimento) → log una-tantum, è il segnale che sta funzionando.
                 breakout_detected = eval_dist > refine_plateau_level * REFINE_BREAKOUT_FRAC
+                if breakout_detected:
+                    refine_good_eval_count += 1
+                else:
+                    refine_good_eval_count = 0
                 if not refine_breakout_logged and breakout_detected:
                     refine_breakout_logged = True
                     _rlog(f"  PLATEAU SUPERATO: eval {eval_dist:.0f}m "
@@ -1278,7 +1287,11 @@ def train():
                 # Se il breakout è già vicino al miglior deterministico assoluto, uscire subito
                 # dalla refinement è più sicuro che lasciare il Critic spento: consolidiamo con
                 # bc_weight=1.0 e, se configurato, congeliamo l'Actor per riallineare il Critic.
-                if breakout_detected and prev_det_best_dist > 0.0 and eval_dist >= prev_det_best_dist - REFINE_NEAR_BEST_MARGIN:
+                near_best_breakout = breakout_detected and prev_det_best_dist > 0.0 and eval_dist >= prev_det_best_dist - REFINE_NEAR_BEST_MARGIN
+                stable_breakout = refine_good_eval_count >= REFINE_GOOD_EVALS_TO_CONSOLIDATE
+                if near_best_breakout or stable_breakout:
+                    ref_lvl = refine_plateau_level
+                    good_eval_count = refine_good_eval_count
                     agent.refine_mode = False
                     agent.refine_bc_weight = 1.0
                     agent.actor_frozen = actor_freeze_episodes > 0
@@ -1288,16 +1301,22 @@ def train():
                     refine_best_mean = 0.0
                     refine_plateau_level = 0.0
                     refine_evals_count = 0
+                    refine_good_eval_count = 0
                     recent_eval_window.clear()
-                    _rlog(f"  REFINEMENT CONSOLIDATA: breakout vicino al miglior deterministico "
-                          f"(eval {eval_dist:.0f}m, best {prev_det_best_dist:.0f}m). "
-                          "Peso Behavioral Cloning→1.0, aggiornamento Critic riattivato.")
+                    if near_best_breakout:
+                        _rlog(f"  REFINEMENT CONSOLIDATA: breakout vicino al miglior deterministico "
+                              f"(eval {eval_dist:.0f}m, best {prev_det_best_dist:.0f}m). "
+                              "Peso Behavioral Cloning→1.0, aggiornamento Critic riattivato.")
+                    else:
+                        _rlog(f"  REFINEMENT CONSOLIDATA: {good_eval_count} eval buone consecutive "
+                              f"sopra il riferimento rollback (ultima {eval_dist:.0f}m, riferimento {ref_lvl:.0f}m). "
+                              "Peso Behavioral Cloning→1.0, aggiornamento Critic riattivato.")
                     if actor_freeze_episodes > 0:
                         _rlog(f"  Rientro in modalità allineamento Critic: "
                               f"Actor congelato per {actor_freeze_episodes} episodi.")
                     else:
                         _rlog("  Rientro in training normale: congelamento Actor disattivato.")
-                # ② Rete di sicurezza. Se l'eval crolla sotto il 60% del livello recente per 3
+                # Rete di sicurezza. Se l'eval crolla sotto il 60% del livello recente per 3
                 # valutazioni consecutive → ROLLBACK al miglior deterministico (td3_det_best_dist) e training normale.
                 elif eval_dist < refine_plateau_level * REFINE_COLLAPSE_FRAC:
                     refine_collapse_count += 1
@@ -1314,11 +1333,12 @@ def train():
                     refine_evals_no_improve = 0
                     refine_collapse_count = 0
                     refine_evals_count = 0
+                    refine_good_eval_count = 0
                     refine_best_mean = 0.0          # ricomincia a misurare il plateau da capo
                     refine_plateau_level = 0.0
                     _rlog(f"  REFINEMENT collassata (<{int(REFINE_COLLAPSE_FRAC*100)}% di {ref_lvl:.0f}m) "
                           f"→ ROLLBACK al miglior deterministico (td3_det_best_dist), peso Behavioral Cloning→1.0, aggiornamento Critic riattivato. Tentativi: {refine_attempts}/{REFINE_MAX_ATTEMPTS}")
-                # ③ Timeout del refinement: 40 episodi (8 valutazioni) senza nuovi record.
+                # Timeout del refinement: 40 episodi (8 valutazioni) senza nuovi record.
                 elif refine_evals_count >= 8:
                     agent.refine_mode = False
                     agent.refine_bc_weight = 1.0
@@ -1326,6 +1346,7 @@ def train():
                     refine_evals_no_improve = 0
                     refine_collapse_count = 0
                     refine_evals_count = 0
+                    refine_good_eval_count = 0
                     refine_best_mean = 0.0
                     refine_plateau_level = 0.0
                     _rlog(f"  TIMEOUT REFINEMENT (40 episodi in refinement senza superare il record) "
