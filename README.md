@@ -206,7 +206,7 @@ Durante il training RL, il log stampa metriche fondamentali per diagnosticare la
 ### 1. Loss del Critic
 * **Cos'è:** Misura l'errore (MSE) del Critic nel prevedere le reward future.
 * **Valori Sani:** Grazie al *Reward Scaling* implementato, i valori ottimali oscillano **tra `0.01` e `5.0`** (con occasionali picchi isolati a `10-20` quando la macchina scopre porzioni di pista inedite). 
-* **Diagnosi:** Un valore stabilmente basso significa che il Critic sta fornendo stime coerenti. Se la loss del Critic schizza permanentemente a centinaia, c'è un'esplosione dei gradienti (o mancano i dati Behavioral Cloning nel replay buffer). In refinement il log scrive `Aggiornamento Critic: disattivato (refinement: loss solo diagnostica)`: in quel caso la loss è calcolata e mostrata, ma il Critic **non** viene aggiornato.
+* **Diagnosi:** Un valore stabilmente basso significa che il Critic sta fornendo stime coerenti. Se la loss del Critic schizza permanentemente a centinaia, c'è un'esplosione dei gradienti (o mancano i dati Behavioral Cloning nel replay buffer). In refinement le righe episodio mostrano `CriticL: ... (OFF)`: in quel caso la loss è calcolata e mostrata solo come diagnostica, ma il Critic **non** viene aggiornato.
 
 ### 2. Loss dell'Actor
 * **Cos'è:** Misura quanto l'Actor sta massimizzando le reward stimate dal Critic. 
@@ -218,7 +218,7 @@ Durante il training RL, il log stampa metriche fondamentali per diagnosticare la
 * **Peso Behavioral Cloning costante = 1.0:** $\lambda$ resta **fisso a `2.5`** (normalizzazione di Fujimoto & Gu, 2021) e il peso della penalità imitativa è **costante** — niente decay. La loss è esattamente quella del TD3+BC originale ($-\lambda Q + (\pi-a)^2$). Un decay del vincolo nella fase fragile causava "troppo RL troppo presto" → collasso (Beeson & Montana 2022, Ablation 1). L'ancora umana è inoltre **garantita in ogni batch** dal buffer expert separato (quota 25%).
 
 ### 4. Refinement (`--refine`)
-La refinement è una fase separata per plateau stabili: il peso Behavioral Cloning scende a `0.3` e l'aggiornamento del Critic viene disattivato. Il trigger automatico è attivo di default dopo plateau statistico, ma può essere disattivato con `./train_rl.sh --no-auto-refine` quando il Critic deve recuperare stabilità dopo rollback, checkpoint corrotto o nuovi dati expert. `./train_rl.sh --refine` resta il comando manuale per avviarla subito; il log usa `riferimento rollback=...` per indicare la soglia della rete di sicurezza, non un target da inseguire.
+La refinement è una fase separata per plateau stabili: il peso Behavioral Cloning scende a `0.3` e l'aggiornamento del Critic viene disattivato. Il trigger automatico è attivo di default dopo plateau statistico, ma può essere disattivato con `./train_rl.sh --no-auto-refine` quando il Critic deve recuperare stabilità dopo rollback, checkpoint corrotto o nuovi dati expert. `./train_rl.sh --refine` resta il comando manuale per avviarla subito; nelle righe `[EVAL]` il log usa `rollback_ref=...` per indicare la soglia della rete di sicurezza, non un target da inseguire.
 
 ---
 
