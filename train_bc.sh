@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════
-#  train_all.sh — Avvia l'addestramento AIcar (Behavioral Cloning)
+#  train_bc.sh — Avvia l'addestramento AIcar (Behavioral Cloning)
 #
 #  L'agente imita i dati esperti raccolti durante la Fase 1.
 #
 #  Uso:
-#    ./train_all.sh                         # Avvia il training BC
+#    ./train_bc.sh                          # Avvia il training BC
 #
 #  Nota: La Fase 1 (Data Collection) richiede guida umana e va eseguita
 #        manualmente con: python data_collection.py
@@ -49,15 +49,16 @@ log_phase() { echo -e "\n${BOLD}${BLUE}═════════════�
 # ── Pre-check ──
 log_phase "🏎️  AIcar BC Training Pipeline"
 
-# Controlla che i demo esistano
-if [[ ! -d "$DEMO_DIR" ]] || [[ -z "$(ls "$DEMO_DIR"/lap_*.h5 2>/dev/null)" ]]; then
-    log_error "Nessun file demo trovato in $DEMO_DIR"
+# Controlla che esistano giri completi. Il BC esclude i segmenti lap_seg_*.h5:
+# quei file vengono usati solo dall'expert buffer del TD3+BC.
+if [[ ! -d "$DEMO_DIR" ]] || [[ -z "$(ls "$DEMO_DIR"/lap_[0-9]*.h5 2>/dev/null)" ]]; then
+    log_error "Nessun giro completo lap_[0-9]*.h5 trovato in $DEMO_DIR"
     log_error "Esegui prima la Fase 1: python data_collection.py"
     exit 1
 fi
 
-DEMO_COUNT=$(ls "$DEMO_DIR"/lap_*.h5 2>/dev/null | wc -l)
-log_info "Demo trovate: ${BOLD}${DEMO_COUNT} giri${NC} in $DEMO_DIR"
+DEMO_COUNT=$(ls "$DEMO_DIR"/lap_[0-9]*.h5 2>/dev/null | wc -l)
+log_info "Demo trovate: ${BOLD}${DEMO_COUNT} giri completi${NC} in $DEMO_DIR"
 
 # Crea directory necessarie
 mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR"
@@ -66,7 +67,7 @@ mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR"
 #  Behavioral Cloning Training
 # ═══════════════════════════════════════════════════════════════════════
 log_phase "🧠  Training: Behavioral Cloning"
-log_info "Dataset: $DEMO_DIR ($DEMO_COUNT giri)"
+log_info "Dataset: $DEMO_DIR ($DEMO_COUNT giri completi; segmenti esclusi dal BC)"
 log_info "Epochs: $BC_EPOCHS | Batch: $BC_BATCH_SIZE"
 log_info "Output: $BC_WEIGHTS"
 
@@ -91,11 +92,10 @@ fi
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Prossimo Step: TD3+BC Reinforcement Learning
+#  Prossimo passo: fine-tuning TD3+BC
 # ═══════════════════════════════════════════════════════════════════════
 log_info ""
-log_info "Per avviare il Fine-Tuning TD3+BC (Warm-Start dal BC appena addestrato):"
+log_info "Per avviare il fine-tuning TD3+BC (warm-start dal BC appena addestrato):"
 log_info "${BOLD}./train_rl.sh${NC}"
 log_info ""
 log_ok "${BOLD}Pipeline BC completata!${NC}"
-

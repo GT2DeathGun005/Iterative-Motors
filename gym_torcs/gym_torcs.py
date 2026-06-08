@@ -1,11 +1,8 @@
 import gym
 from gym import spaces
 import numpy as np
-# from os import path
 import snakeoil3_gym as snakeoil3
-import numpy as np
 import copy
-import collections as col
 import os
 import time
 
@@ -38,7 +35,6 @@ class TorcsEnv:
 
 
     def __init__(self, vision=False, throttle=False, gear_change=False, early_termination=True):
-       #print("Init")
         import shutil
         if shutil.which('xvfb-run') is None:
             raise EnvironmentError("xvfb-run non trovato. Installa il pacchetto 'xvfb' per l'esecuzione headless isolata di TORCS.")
@@ -50,7 +46,6 @@ class TorcsEnv:
 
         self.initial_run = True
 
-        ##print("launch torcs")
         _kill_torcs()
         time.sleep(1.5)
         
@@ -64,18 +59,7 @@ class TorcsEnv:
             xvfb_cmd = f'xvfb-run -a -s "-screen 0 640x480x24" sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1"'
             os.system(f"{xvfb_cmd} &")
         
-        time.sleep(3.0) # Attendi l'inizializzazione del server X virtuale, torcs e della macro
-
-        """
-        # Modify here if you use multiple tracks in the environment
-        self.client = snakeoil3.Client(p=3101, vision=self.vision)  # Open new UDP in vtorcs
-        self.client.MAX_STEPS = np.inf
-
-        client = self.client
-        client.get_servers_input()  # Get the initial input from torcs
-
-        obs = client.S.d  # Get the current full-observation from torcs
-        """
+        time.sleep(3.0)  # Attende Xvfb/TORCS e la macro di autostart.
         if throttle is False:
             self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,))
         else:
@@ -91,8 +75,7 @@ class TorcsEnv:
             self.observation_space = spaces.Box(low=low, high=high)
 
     def step(self, u):
-       #print("Step")
-        # convert thisAction to the actual torcs actionstr
+        # Converte l'azione dell'agente nel formato richiesto dal server TORCS.
         client = self.client
 
         this_action = self.agent_to_torcs(u)
@@ -103,7 +86,7 @@ class TorcsEnv:
         # Steering
         action_torcs['steer'] = this_action['steer']  # in [-1, 1]
 
-        #  Simple Autnmatic Throttle Control by Snakeoil
+        # Controllo automatico minimale di Snakeoil, usato solo se throttle=False.
         if self.throttle is False:
             target_speed = self.default_speed
             if client.S.d['speedX'] < target_speed - (client.R.d['steer']*50):
@@ -125,29 +108,26 @@ class TorcsEnv:
             action_torcs['accel'] = this_action['accel']
             action_torcs['brake'] = this_action.get('brake', 0.0)
 
-        #  Automatic Gear Change by Snakeoil
+        # Cambio marcia: in AIcar è gestito dall'agente/gearing.py quando gear_change=True.
         if self.gear_change is True:
             action_torcs['gear'] = this_action['gear']
         else:
             action_torcs['gear'] = 1
 
 
-        # Save the privious full-obs from torcs for the reward calculation
+        # Osservazione precedente: serve a rilevare nuovo danno/muro nel reward.
         obs_pre = copy.deepcopy(client.S.d)
 
-        # One-Step Dynamics Update #################################
-        # Apply the Agent's action into torcs
+        # Step fisico: invia l'azione e legge la nuova telemetria dal server.
         client.respond_to_server()
-        # Get the response of TORCS
         client.get_servers_input()
 
-        # Get the current full-observation from torcs
         obs = client.S.d
 
-        # Make an obsevation from a raw observation vector from TORCS
+        # Converte la telemetria grezza TORCS nel dizionario normalizzato usato dagli script.
         self.observation = self.make_observaton(obs)
 
-        # ─── Reward Reshaping Unificato (SAC-Compatible) ───────────────────────
+        # ─── Reward Reshaping condiviso dal TD3+BC ───────────────────────
         sp_norm = obs['speedX'] / 50.0  # Range ~[0, 6]
         progress = sp_norm * np.cos(obs['angle'])
         
@@ -214,7 +194,7 @@ class TorcsEnv:
                 episode_terminate = True
                 client.R.d['meta'] = True
 
-        if client.R.d['meta'] is True: # Send a reset signal
+        if client.R.d['meta'] is True:
             self.initial_run = False
             client.respond_to_server()
 
@@ -223,15 +203,12 @@ class TorcsEnv:
         return self.get_obs(), reward, client.R.d['meta'] or client.so is None, info
 
     def reset(self, relaunch=False):
-        #print("Reset")
-
         self.time_step = 0
 
         if self.initial_reset is not True:
             self.client.R.d['meta'] = True
             self.client.respond_to_server()
 
-            ## TENTATIVE. Restarting TORCS every episode suffers the memory leak bug!
             if relaunch is True:
                 # Chiudiamo esplicitamente il socket UDP client precedente per evitare conflitti di porta bindata
                 if hasattr(self, 'client') and self.client is not None:
@@ -242,14 +219,13 @@ class TorcsEnv:
                 self.reset_torcs()
                 print("### TORCS is RELAUNCHED ###")
 
-        # Modify here if you use multiple tracks in the environment
-        self.client = snakeoil3.Client(p=3001, vision=self.vision)  # Open new UDP in vtorcs
+        self.client = snakeoil3.Client(p=3001, vision=self.vision)  # Socket UDP SCR standard.
         self.client.MAX_STEPS = np.inf
 
         client = self.client
-        client.get_servers_input()  # Get the initial input from torcs
+        client.get_servers_input()
 
-        obs = client.S.d  # Get the current full-observation from torcs
+        obs = client.S.d
         self.observation = self.make_observaton(obs)
 
         self.last_u = None
@@ -265,7 +241,6 @@ class TorcsEnv:
         return self.observation
 
     def reset_torcs(self):
-       #print("relaunch torcs")
         _kill_torcs()
         time.sleep(1.5)  # Garantisce che il sistema operativo liberi la porta UDP
         
@@ -283,11 +258,11 @@ class TorcsEnv:
     def agent_to_torcs(self, u):
         torcs_action = {'steer': u[0]}
 
-        if self.throttle is True:  # throttle action is enabled
+        if self.throttle is True:
             torcs_action.update({'accel': u[1]})
             torcs_action.update({'brake': u[2]})
 
-        if self.gear_change is True: # gear change action is enabled
+        if self.gear_change is True:
             torcs_action.update({'gear': int(u[3])})
 
         return torcs_action
@@ -297,9 +272,7 @@ class TorcsEnv:
         image_vec =  obs_image_vec
         rgb = []
         temp = []
-        # convert size 64x64x3 = 12288 to 64x64=4096 2-D list 
-        # with rgb values grouped together.
-        # Format similar to the observation in openai gym
+        # Converte il vettore immagine 64x64x3 in righe RGB, formato Gym-like.
         for i in range(0,12286,3):
             temp.append(image_vec[i])
             temp.append(image_vec[i+1])
@@ -329,7 +302,7 @@ class TorcsEnv:
         }
 
         if self.vision is True:
-            # Get RGB from observation
+            # Converte la visione grezza in RGB solo se vision=True.
             image_rgb = self.obs_vision_to_image_rgb(raw_obs['img'])
             obs_dict['img'] = image_rgb
 

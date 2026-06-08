@@ -10,9 +10,11 @@
 #    TD3_EPISODES=500 ./train_rl.sh     # Override episodi
 #    ./train_rl.sh --clean              # Riparte da zero (cancella checkpoint TD3)
 #    ./train_rl.sh --rollback           # Rollback alla migliore policy DETERMINISTICA (det_best_lap →
-#                                       #   det_best_dist → det_best_dist_run) e congela l'Actor per ~10 ep (recupero)
-#    ./train_rl.sh --refine             # Avvia in REFINEMENT (Critic congelato + bc_weight ridotto): usare in
-#                                       #   resume quando il training è già in plateau stabile (vedi ARCHITECTURE §17.2)
+#                                       #   det_best_dist → det_best_dist_run) e congela l'Actor per 30 ep (recupero)
+#    ./train_rl.sh --refine             # Avvia in refinement: aggiornamento del Critic disattivato,
+#                                       #   loss Critic solo diagnostica e peso Behavioral Cloning
+#                                       #   ridotto; usare in resume quando il training è già in
+#                                       #   plateau stabile (vedi ARCHITECTURE §18)
 #
 #  Per interrompere il training in sicurezza:
 #    Ctrl+C  oppure  ./stop_training.sh
@@ -40,7 +42,7 @@ TD3_ELITE_BUFFER="train_set/checkpoints/buffers/td3_checkpoint_elite_buffer.npz"
 TD3_POLICY="train_set/checkpoints/td3_policy.pth"
 LOG_DIR="train_set/session_logs"
 CHECKPOINT_DIR="train_set/checkpoints"
-BUFFER_DIR="train_set/checkpoints/buffers"
+BACKUP_DIR="train_set/checkpoints/backups"
 
 # TD3 Hyperparameters (override con variabili d'ambiente)
 TD3_EPISODES="${TD3_EPISODES:-1000}"
@@ -59,9 +61,36 @@ log_phase() { echo -e "\n${BOLD}${BLUE}═════════════�
               echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}\n"; }
 
 # ── Gestione flag --clean ──
-if [[ "${1:-}" == "--clean" ]]; then
+CLEAN_REQUESTED=0
+for arg in "$@"; do
+    if [[ "$arg" == "--clean" ]]; then
+        CLEAN_REQUESTED=1
+    fi
+done
+
+if [[ "$CLEAN_REQUESTED" == "1" ]]; then
     log_warn "Flag --clean rilevato: cancellazione checkpoint TD3 precedenti..."
-    rm -f "$TD3_CHECKPOINT" "$TD3_BUFFER" "$TD3_ELITE_BUFFER" "$TD3_POLICY" "train_set/checkpoints/td3_expl_best_lap.pth" "train_set/checkpoints/td3_expl_best_dist.pth" "train_set/checkpoints/td3_det_best_dist_run.pth"
+    rm -f \
+        "$TD3_CHECKPOINT" "$TD3_CHECKPOINT.bak" "$TD3_CHECKPOINT.prev" \
+        "$BACKUP_DIR/td3_checkpoint.pth.bak" "$BACKUP_DIR/td3_checkpoint.pth.prev" \
+        "$TD3_BUFFER" "$TD3_BUFFER.bak" "$TD3_BUFFER.prev" \
+        "$BACKUP_DIR/buffers/td3_checkpoint_buffer.npz.bak" "$BACKUP_DIR/buffers/td3_checkpoint_buffer.npz.prev" \
+        "$TD3_ELITE_BUFFER" "$TD3_ELITE_BUFFER.bak" "$TD3_ELITE_BUFFER.prev" \
+        "$BACKUP_DIR/buffers/td3_checkpoint_elite_buffer.npz.bak" "$BACKUP_DIR/buffers/td3_checkpoint_elite_buffer.npz.prev" \
+        "$TD3_POLICY" "$TD3_POLICY.bak" "$TD3_POLICY.prev" \
+        "$BACKUP_DIR/td3_policy.pth.bak" "$BACKUP_DIR/td3_policy.pth.prev" \
+        "train_set/checkpoints/td3_expl_best_lap.pth" \
+        "train_set/checkpoints/td3_expl_best_lap.pth.bak" \
+        "train_set/checkpoints/td3_expl_best_lap.pth.prev" \
+        "$BACKUP_DIR/td3_expl_best_lap.pth.bak" "$BACKUP_DIR/td3_expl_best_lap.pth.prev" \
+        "train_set/checkpoints/td3_expl_best_dist.pth" \
+        "train_set/checkpoints/td3_expl_best_dist.pth.bak" \
+        "train_set/checkpoints/td3_expl_best_dist.pth.prev" \
+        "$BACKUP_DIR/td3_expl_best_dist.pth.bak" "$BACKUP_DIR/td3_expl_best_dist.pth.prev" \
+        "train_set/checkpoints/td3_det_best_dist_run.pth" \
+        "train_set/checkpoints/td3_det_best_dist_run.pth.bak" \
+        "train_set/checkpoints/td3_det_best_dist_run.pth.prev" \
+        "$BACKUP_DIR/td3_det_best_dist_run.pth.bak" "$BACKUP_DIR/td3_det_best_dist_run.pth.prev"
     log_ok "Checkpoint TD3 cancellati. Ripartenza pulita."
 fi
 
@@ -77,7 +106,7 @@ done
 log_phase "🧠  AIcar TD3+BC Training (Reinforcement Learning)"
 
 # Crea directory necessarie
-mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR"
+mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR" "train_set/checkpoints/buffers" "$BACKUP_DIR/buffers"
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Warm-Start Detection
@@ -98,26 +127,26 @@ elif [[ -f "$BC_WEIGHTS" ]]; then
     log_phase "🚀  Warm-Start da Behavioral Cloning"
     BC_SIZE=$(du -h "$BC_WEIGHTS" | cut -f1)
     log_info "Pesi BC trovati: ${BOLD}$BC_WEIGHTS${NC} ($BC_SIZE)"
-    log_info "L'Actor TD3 inizializzerà backbone e teste dal BC."
+    log_info "L'Actor TD3 inizializzerà backbone e continuous_head dal BC."
     log_info "Il Critic partirà da zero (Twin Q-Network)."
-    log_info "Gradient Freezing attivo: backbone + gear_head congelati."
+    log_info "Actor trainabile: backbone + continuous_head; gear_head congelata e ignorata da gearing.py."
 else
     log_phase "⚠️  Cold-Start (Nessun Peso Trovato)"
     log_warn "Nessun peso BC trovato in: $BC_WEIGHTS"
     log_warn "Il TD3 partirà da ZERO — l'addestramento sarà molto più lungo."
-    log_warn "Consiglio: esegui prima './train_all.sh' per addestrare il BC."
+    log_warn "Consiglio: esegui prima './train_bc.sh' per addestrare il BC."
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
-#  TD3 Training
+#  Addestramento TD3
 # ═══════════════════════════════════════════════════════════════════════
 
-log_info "Episodi: ${BOLD}$TD3_EPISODES${NC} | Seed: $TD3_SEED | Max Steps/ep: $TD3_MAX_STEPS"
-log_info "Output policy: $TD3_POLICY"
-log_info "Output checkpoint: $TD3_CHECKPOINT"
+log_info "Episodi: ${BOLD}$TD3_EPISODES${NC} | Seme: $TD3_SEED | Passi massimi/episodio: $TD3_MAX_STEPS"
+log_info "Policy in uscita: $TD3_POLICY"
+log_info "Checkpoint in uscita: $TD3_CHECKPOINT"
 log_info ""
 log_info "Per interrompere il training: Ctrl+C o ./stop_training.sh"
-log_info "Il checkpoint viene salvato ad ogni episodio (resume-safe)."
+log_info "Il checkpoint viene salvato ad ogni episodio; i backup .bak/.prev stanno in $BACKUP_DIR."
 echo ""
 
 python -u td3_bc.py \

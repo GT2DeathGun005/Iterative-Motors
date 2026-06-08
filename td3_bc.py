@@ -6,7 +6,7 @@ Architettura Ibrida BC-RL per TORCS (Offline-to-Online), allineata al TD3+BC min
   - L'Actor eredita backbone + gear_head dal BC (warm-start). Il TD3 allena TUTTO l'Actor
     (backbone + continuous_head); resta congelata solo la gear_head (marcia discreta).
   - Il Critic (Twin Q-Network) è addestrato da zero.
-  - BC weight COSTANTE = 1.0 → loss = -λ·Q + (π - a)²  (λ = 2.5 / mean|Q|).
+  - Peso Behavioral Cloning COSTANTE = 1.0 → loss = -λ·Q + (π - a)²  (λ = 2.5 / mean|Q|).
   - Normalizzazione stati mean-0/std-1 (state_norm.npz) applicata prima della rete.
   - Buffer EXPERT separato e permanente (anti-FIFO) + sampling 3-vie 25/15/60.
   - Delayed Policy Update (ogni 2 step), Target Policy Smoothing, update ratio 1:1.
@@ -25,7 +25,8 @@ import os
 import sys
 import argparse
 import random
-import time
+import re
+import shutil
 import numpy as np
 import torch
 import torch.nn as nn
@@ -42,6 +43,124 @@ except ImportError:
     print("Warning: gym_torcs non trovato.")
 
 from gearing import compute_gear  # cambio marcia deterministico (anti-hunting)
+
+_PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
+_CHECKPOINT_ROOT = os.path.join(_PROJECT_ROOT, 'train_set', 'checkpoints')
+_CHECKPOINT_BACKUP_ROOT = os.path.join(_CHECKPOINT_ROOT, 'backups')
+
+def _fsync_file(path):
+    """Forza su disco il contenuto del file appena scritto."""
+    with open(path, 'rb') as f:
+        os.fsync(f.fileno())
+
+def _fsync_dir(path):
+    """Forza su disco anche il rename atomico nella directory."""
+    dir_fd = os.open(path or '.', os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+def _backup_paths(filepath):
+    """Restituisce i path dei backup, ordinati in una cartella dedicata ai checkpoint."""
+    abs_filepath = os.path.abspath(filepath)
+    backup_base = None
+    try:
+        if os.path.commonpath([abs_filepath, _CHECKPOINT_ROOT]) == _CHECKPOINT_ROOT:
+            relative_path = os.path.relpath(abs_filepath, _CHECKPOINT_ROOT)
+            if relative_path != 'backups' and not relative_path.startswith('backups' + os.sep):
+                backup_base = os.path.join(_CHECKPOINT_BACKUP_ROOT, relative_path)
+    except ValueError:
+        backup_base = None
+
+    if backup_base is None:
+        backup_base = filepath
+
+    return backup_base + ".bak", backup_base + ".prev"
+
+def _rotate_backup(filepath):
+    """Mantiene due copie precedenti in backups/: .bak (ultima valida) e .prev (penultima valida)."""
+    if not os.path.exists(filepath):
+        return
+    backup_path, previous_path = _backup_paths(filepath)
+    backup_directory = os.path.dirname(backup_path) or '.'
+    os.makedirs(backup_directory, exist_ok=True)
+
+    if os.path.exists(backup_path):
+        os.replace(backup_path, previous_path)
+
+    temp_backup = backup_path + ".tmp"
+    shutil.copy2(filepath, temp_backup)
+    _fsync_file(temp_backup)
+    os.replace(temp_backup, backup_path)
+    _fsync_dir(backup_directory)
+
+def _checkpoint_candidates(filepath):
+    """Ordine di recupero: principale, backup ordinati, poi vecchi backup adiacenti legacy."""
+    backup_path, previous_path = _backup_paths(filepath)
+    candidates = [filepath, backup_path, previous_path, filepath + ".bak", filepath + ".prev"]
+    unique_candidates = []
+    seen = set()
+    for candidate in candidates:
+        key = os.path.abspath(candidate)
+        if key not in seen:
+            unique_candidates.append(candidate)
+            seen.add(key)
+    return unique_candidates
+
+def safe_save(obj, filepath, keep_backup=True):
+    """Salva in modo atomico e conserva backup recenti contro interruzioni nel momento peggiore."""
+    directory = os.path.dirname(filepath) or '.'
+    os.makedirs(directory, exist_ok=True)
+    temp_filepath = filepath + ".tmp"
+    torch.save(obj, temp_filepath)
+    _fsync_file(temp_filepath)
+    if keep_backup:
+        _rotate_backup(filepath)
+    os.replace(temp_filepath, filepath)
+    _fsync_dir(directory)
+
+def safe_write_text(filepath, text, keep_backup=True):
+    """Scrive un sidecar testuale in modo atomico, con backup recente."""
+    directory = os.path.dirname(filepath) or '.'
+    os.makedirs(directory, exist_ok=True)
+    temp_filepath = filepath + ".tmp"
+    with open(temp_filepath, 'w', encoding='utf-8') as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    if keep_backup:
+        _rotate_backup(filepath)
+    os.replace(temp_filepath, filepath)
+    _fsync_dir(directory)
+
+def safe_read_float(filepath, default):
+    """Legge un numero da un sidecar testuale, provando anche backup recenti."""
+    for candidate in _checkpoint_candidates(filepath):
+        if not os.path.exists(candidate):
+            continue
+        try:
+            with open(candidate, 'r', encoding='utf-8') as f:
+                return float(f.read().strip())
+        except Exception as e:
+            print(f"⚠️ Impossibile leggere valore numerico da {candidate}: {e}")
+    return default
+
+def safe_save_npz(buffer_obj, filepath, keep_backup=True):
+    """Salva il buffer in modo atomico e conserva backup recenti del file .npz."""
+    if len(buffer_obj.buffer) == 0:
+        return
+    os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+    # np.savez_compressed appende automaticamente '.npz' se non presente.
+    # Per evitarlo, facciamo terminare il file temporaneo con '.tmp.npz'.
+    temp_filepath = filepath.replace(".npz", "") + ".tmp.npz"
+    buffer_obj.save(temp_filepath)
+    if os.path.exists(temp_filepath):
+        _fsync_file(temp_filepath)
+        if keep_backup:
+            _rotate_backup(filepath)
+        os.replace(temp_filepath, filepath)
+        _fsync_dir(os.path.dirname(filepath) or '.')
 
 # ──────────────────────────────────────────────────────────────────────
 #  Normalizzazione stati mean-0 / std-1 (Fujimoto & Gu, 2021)
@@ -177,12 +296,27 @@ class ReplayBuffer:
 
     def load(self, filepath: str):
         if not os.path.exists(filepath): return
-        data = np.load(filepath)
-        states, actions, rewards, next_states, dones = data['states'], data['actions'], data['rewards'], data['next_states'], data['dones']
-        expert_masks_data = data.get('expert_masks', np.zeros(len(states)))
+        with np.load(filepath) as data:
+            states = data['states']
+            actions = data['actions']
+            rewards = data['rewards']
+            next_states = data['next_states']
+            dones = data['dones']
+            expert_masks_data = data['expert_masks'] if 'expert_masks' in data.files else np.zeros(len(states))
+            states, actions, rewards, next_states, dones, expert_masks_data = [
+                np.asarray(x) for x in (states, actions, rewards, next_states, dones, expert_masks_data)
+            ]
+        lengths = {len(states), len(actions), len(rewards), len(next_states), len(dones), len(expert_masks_data)}
+        if len(lengths) != 1:
+            raise ValueError(f"Replay Buffer non coerente in {filepath}: lunghezze diverse {sorted(lengths)}")
+
+        new_buffer = deque(maxlen=self.buffer.maxlen)
+        new_expert_masks = deque(maxlen=self.expert_masks.maxlen)
         for i in range(len(states)):
-            self.buffer.append((states[i], actions[i], float(rewards[i]), next_states[i], float(dones[i])))
-            self.expert_masks.append(float(expert_masks_data[i]))
+            new_buffer.append((states[i], actions[i], float(rewards[i]), next_states[i], float(dones[i])))
+            new_expert_masks.append(float(expert_masks_data[i]))
+        self.buffer = new_buffer
+        self.expert_masks = new_expert_masks
         print(f"  📦 Replay Buffer caricato: {len(self.buffer)} transizioni")
 
     def __len__(self):
@@ -302,7 +436,7 @@ class TD3BCAgent:
         self.actor_target = Actor().to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
         
-        # Rimuoviamo il Frozen BC Anchor: il target d'imitazione sarà
+        # Rimuoviamo la vecchia ancora Behavioral Cloning congelata: il target d'imitazione sarà
         # solo l'azione empirica (expert_mask=1.0) e non la predizione OOD.
         
         self.critic = Critic().to(self.device)
@@ -310,7 +444,8 @@ class TD3BCAgent:
         self.critic_target.load_state_dict(self.critic.state_dict())
 
         # Backbone SCONGELATO (TIER 3b): come in TD3+BC originale si allena tutta la rete
-        # dell'Actor. È sicuro perché l'ancora BC è forte e costante (bc_weight=1.0, niente decay),
+        # dell'Actor. È sicuro perché l'ancora Behavioral Cloning è forte e costante
+        # (peso = 1.0, variabile bc_weight nel codice, niente decay),
         # e sblocca capacità di apprendimento prima limitata alla sola testa lineare.
         # Resta congelata solo la gear_head (marcia discreta, ereditata dal BC, non soggetta a RL).
         for param in self.actor.gear_head.parameters(): param.requires_grad = False
@@ -365,7 +500,7 @@ class TD3BCAgent:
         mask_b = torch.FloatTensor(mask_b).to(self.device).unsqueeze(1)
         expert_mask_b = torch.FloatTensor(expert_mask_b).to(self.device).unsqueeze(1)
 
-        # ── Critic Update (Bellman Equation con Twin Q-Network) ──
+        # ── Aggiornamento del Critic (Bellman equation con Twin Q-Network) ──
         # Il Critic stima il valore Q(s,a) di ogni coppia stato-azione.
         # Usiamo due reti Q indipendenti (Twin) e prendiamo il minimo
         # per mitigare l'Overestimation Bias tipico del Q-learning.
@@ -385,8 +520,10 @@ class TD3BCAgent:
         q1, q2 = self.critic(state_b, action_b)
         critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
 
-        # In REFINEMENT (Paper 2) il Critic è CONGELATO: l'Actor si raffina verso una value
-        # function fissa con vincolo BC ridotto. critic_loss resta calcolata solo per logging.
+        # In refinement (Paper 2) l'aggiornamento del Critic è disattivato:
+        # l'Actor si raffina verso una value function fissa con vincolo BC ridotto.
+        # critic_loss viene comunque calcolata come diagnostica, ma NON viene fatto
+        # backward/step sul Critic.
         if not getattr(self, 'refine_mode', False):
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
@@ -441,14 +578,15 @@ class TD3BCAgent:
             Q_abs_mean = q1_pi.abs().mean().detach().clamp(min=1e-5)
             dynamic_alpha = lambda_val / Q_abs_mean
 
-            # ── BC weight COSTANTE = 1.0 (niente decay) ──
+            # ── Peso Behavioral Cloning COSTANTE = 1.0 (niente decay) ──
             # Questo riproduce ESATTAMENTE la loss del TD3+BC originale:
             #   L = -λ·Q + (π - a)²  (qui bc_penalty è la nostra MSE pesata).
             # Il decay precedente (1.0→0.5) indeboliva la BC nella fase fragile post-warm-up
             # → "troppo RL troppo presto" → collasso (Beeson & Montana 2022, Ablation 1;
             # Fujimoto & Gu 2021, ablation su α). L'eventuale rilassamento del vincolo va fatto
-            # in una FASE separata dopo il training stabile, con il Critic congelato (vedi
-            # AUTO-REFINEMENT nel loop di train): lì bc_weight scende a refine_bc_weight.
+            # in una FASE separata dopo il training stabile, con aggiornamento del Critic
+            # disattivato (vedi AUTO-REFINEMENT nel loop di train): lì il peso Behavioral
+            # Cloning scende a refine_bc_weight.
             bc_weight = self.refine_bc_weight if getattr(self, 'refine_mode', False) else 1.0
 
             total_actor_loss = dynamic_alpha * actor_loss_td3 + (bc_weight * bc_penalty)
@@ -472,6 +610,8 @@ class TD3BCAgent:
 
     def save_checkpoint(self, filepath, episode, global_step, memory, elite_memory=None, best_lap_time=float('inf'), best_eval_dist=0.0, best_distance=0.0):
         checkpoint = {
+            'checkpoint_version': 2,
+            'saved_at': datetime.now().isoformat(),
             'actor': self.actor.state_dict(),
             'actor_target': self.actor_target.state_dict(),
             'critic': self.critic.state_dict(),
@@ -484,48 +624,114 @@ class TD3BCAgent:
             'best_eval_dist': best_eval_dist,
             'best_distance': best_distance,
         }
-        torch.save(checkpoint, filepath)
         buffer_dir = os.path.join(os.path.dirname(filepath), 'buffers')
         os.makedirs(buffer_dir, exist_ok=True)
         base_name = os.path.basename(filepath).replace('.pth', '')
-        memory.save(os.path.join(buffer_dir, f"{base_name}_buffer.npz"))
-        if elite_memory: elite_memory.save(os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz"))
+
+        # I buffer vengono salvati prima: il checkpoint .pth è il commit marker finale.
+        # Se il processo viene interrotto a metà, il resume userà il checkpoint completo
+        # precedente invece di uno stato neurale più nuovo con buffer ancora vecchi.
+        safe_save_npz(memory, os.path.join(buffer_dir, f"{base_name}_buffer.npz"))
+        if elite_memory:
+            safe_save_npz(elite_memory, os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz"))
+        safe_save(checkpoint, filepath)
 
     def load_checkpoint(self, filepath, memory, elite_memory=None):
         buffer_dir = os.path.join(os.path.dirname(filepath), 'buffers')
         base_name = os.path.basename(filepath).replace('.pth', '')
-        if os.path.exists(os.path.join(buffer_dir, f"{base_name}_buffer.npz")):
-            memory.load(os.path.join(buffer_dir, f"{base_name}_buffer.npz"))
-        if elite_memory and os.path.exists(os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz")):
-            elite_memory.load(os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz"))
+        buffer_path = os.path.join(buffer_dir, f"{base_name}_buffer.npz")
+        elite_buffer_path = os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz")
 
-        if not os.path.exists(filepath): return 0, 0, float('inf'), 0.0, 0.0
+        for candidate in _checkpoint_candidates(buffer_path):
+            if not os.path.exists(candidate):
+                continue
+            try:
+                memory.load(candidate)
+                if candidate != buffer_path:
+                    print(f"🛡️ Replay Buffer recuperato dal backup: {candidate}")
+                break
+            except Exception as e:
+                print(f"⚠️ Impossibile caricare Replay Buffer da {candidate}: {e}")
 
-        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
-        if isinstance(checkpoint, dict) and 'actor' in checkpoint:
-            self.actor.load_state_dict(checkpoint['actor'])
-            if 'actor_target' in checkpoint: self.actor_target.load_state_dict(checkpoint['actor_target'])
-            self.critic.load_state_dict(checkpoint['critic'])
-            self.critic_target.load_state_dict(checkpoint['critic_target'])
-            self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
-            self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+        if elite_memory:
+            for candidate in _checkpoint_candidates(elite_buffer_path):
+                if not os.path.exists(candidate):
+                    continue
+                try:
+                    elite_memory.load(candidate)
+                    if candidate != elite_buffer_path:
+                        print(f"🛡️ Elite Buffer recuperato dal backup: {candidate}")
+                    break
+                except Exception as e:
+                    print(f"⚠️ Impossibile caricare Elite Buffer da {candidate}: {e}")
 
-            best_lap_time = checkpoint.get('best_lap_time', float('inf'))
-            best_eval_dist = checkpoint.get('best_eval_dist', 0.0)
-            best_distance = checkpoint.get('best_distance', 0.0)
-            episode = checkpoint['episode']
-            global_step = checkpoint['global_step']
-            print(f"✅ Checkpoint caricato: ripresa dall'Episodio {episode}")
-        else:
-            # È un file di soli pesi dell'actor (come td3_expl_best_dist.pth)
-            print("ℹ️ Checkpoint contiene solo pesi dell'Actor (formato weights-only). Inizializzazione degli altri componenti.")
-            self.actor.load_state_dict(checkpoint)
-            self.actor_target.load_state_dict(self.actor.state_dict())
+        loaded_ok = False
+        for candidate in _checkpoint_candidates(filepath):
+            if not os.path.exists(candidate):
+                continue
+            try:
+                checkpoint = torch.load(candidate, map_location=self.device, weights_only=False)
+                if isinstance(checkpoint, dict) and 'actor' in checkpoint:
+                    required_keys = ['actor', 'critic', 'critic_target', 'actor_optimizer', 'critic_optimizer', 'episode', 'global_step']
+                    missing_keys = [k for k in required_keys if k not in checkpoint]
+                    if missing_keys:
+                        raise KeyError(f"checkpoint incompleto, chiavi mancanti: {missing_keys}")
+                    self.actor.load_state_dict(checkpoint['actor'])
+                    if 'actor_target' in checkpoint: self.actor_target.load_state_dict(checkpoint['actor_target'])
+                    self.critic.load_state_dict(checkpoint['critic'])
+                    self.critic_target.load_state_dict(checkpoint['critic_target'])
+                    self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
+                    self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
+
+                    best_lap_time = checkpoint.get('best_lap_time', float('inf'))
+                    best_eval_dist = checkpoint.get('best_eval_dist', 0.0)
+                    best_distance = checkpoint.get('best_distance', 0.0)
+                    episode = checkpoint['episode']
+                    global_step = checkpoint['global_step']
+                    if candidate != filepath:
+                        print(f"🛡️ Checkpoint principale non usato: recupero da backup {candidate}")
+                    print(f"✅ Checkpoint caricato: ripresa dall'Episodio {episode}")
+                else:
+                    # È un file di soli pesi dell'actor (come td3_expl_best_dist.pth).
+                    print(f"ℹ️ {candidate} contiene solo pesi dell'Actor. Inizializzazione degli altri componenti.")
+                    self.actor.load_state_dict(checkpoint)
+                    self.actor_target.load_state_dict(self.actor.state_dict())
+                    best_lap_time = float('inf')
+                    best_eval_dist = 0.0
+                    best_distance = 0.0
+                    episode = 0
+                    global_step = 0
+                loaded_ok = True
+                break
+            except Exception as e:
+                print(f"⚠️ Checkpoint non utilizzabile da {candidate}: {e}")
+
+        if not loaded_ok:
+            if not any(os.path.exists(candidate) for candidate in _checkpoint_candidates(filepath)):
+                return 0, 0, float('inf'), 0.0, 0.0
+            print("❌ Nessun checkpoint completo valido trovato tra principale e backup recenti.")
+            print("⚠️ Tentativo di recupero minimo delle informazioni dal log...")
+            log_file = 'train_set/session_logs/td3_training.log'
+            last_ep = 0
+            if os.path.exists(log_file):
+                try:
+                    with open(log_file, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            match = re.search(r'\b(?:Episode|Episodio)\s+(\d+)', line)
+                            if match:
+                                ep_num = int(match.group(1))
+                                last_ep = max(last_ep, ep_num)
+                except Exception:
+                    pass
+            print(f"🔄 Ripristinato ultimo episodio: {last_ep}. Il training riprenderà dall'episodio {last_ep + 1}.")
+            episode = last_ep + 1
+            global_step = episode * 1500
             best_lap_time = float('inf')
+
             best_eval_dist = 0.0
-            best_distance = 0.0
-            episode = 0
-            global_step = 0
+            det_best_dist_txt = 'train_set/checkpoints/td3_det_best_dist.txt'
+            best_eval_dist = safe_read_float(det_best_dist_txt, 0.0)
+            best_distance = best_eval_dist
 
         # NB: nessun fallback hardcoded sui record storici. Valori hardcoded (es. 84.3s/3619m
         # di una run specifica) corrompevano l'Elite Buffer su un resume weights-only:
@@ -539,12 +745,11 @@ def load_recent_evals_from_log(log_path, max_len=8):
         try:
             with open(log_path, 'r', encoding='utf-8') as f:
                 for line in f:
-                    if '🔍 [EVAL] Result: Dist' in line:
+                    if '🔍 [EVAL]' in line:
                         try:
-                            parts = line.split('Dist ')
-                            if len(parts) > 1:
-                                dist_str = parts[1].split('m')[0].strip()
-                                evals.append(float(dist_str))
+                            match = re.search(r'\b(?:Dist|Distanza)\s+([0-9]+(?:\.[0-9]+)?)m', line)
+                            if match:
+                                evals.append(float(match.group(1)))
                         except Exception:
                             pass
         except Exception as e:
@@ -557,8 +762,9 @@ def train():
     parser.add_argument('--episodes', type=int, default=1000)
     parser.add_argument('--max_steps', type=int, default=5000)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--rollback', action='store_true', help="Forza il rollback dell'Actor all'ultimo miglior giro storico e lo congela per 10 episodi")
-    parser.add_argument('--refine', action='store_true', help="Avvia subito in modalità REFINEMENT (Critic congelato + bc_weight ridotto): usare in resume quando il training è già in plateau stabile")
+    parser.add_argument('--rollback', action='store_true', help="Forza il rollback dell'Actor alla migliore policy deterministica e lo congela per 30 episodi")
+    parser.add_argument('--refine', action='store_true', help="Avvia subito la refinement: aggiornamento del Critic disattivato, loss Critic solo diagnostica, peso Behavioral Cloning ridotto")
+    parser.add_argument('--pretrain_critic', action='store_true', help="Esegue il pre-training offline del Critic per 50k passi in caso di emergenza (da usare con --rollback)")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -598,6 +804,7 @@ def train():
     REFINE_PLATEAU_EVALS = 4       # valutazioni con MEDIA recente NON in salita → plateau (auto)
     REFINE_MIN_EP = 200            # episodio minimo per l'auto-trigger
     REFINE_IMPROVE_FRAC = 1.02     # la media deve salire >2% per contare come "miglioramento"
+    BEST_DIST_EPS = 1.0            # evita di risalvare/loggare record identici per jitter sub-metrico
     agent.refine_mode = False
     agent.refine_bc_weight = 1.0
     recent_eval_window = deque(maxlen=REFINE_WINDOW)  # ultimi eval → media/max recenti
@@ -617,9 +824,10 @@ def train():
     refine_attempts = 0
     refine_plateau_level = 0.0     # 0 = riferimento rollback non ancora impostato
     refine_collapse_count = 0
+    refine_evals_count = 0
     refine_breakout_logged = False  # per loggare UNA volta il superamento del plateau
     if getattr(args, 'refine', False):
-        # Avvio mirato quando l'operatore SA già che è in plateau: refinement ON da subito.
+        # Avvio mirato quando l'operatore SA già che è in plateau: refinement attiva da subito.
         agent.refine_mode = True
         agent.refine_bc_weight = REFINE_BC_WEIGHT
         
@@ -632,19 +840,19 @@ def train():
         else:
             refine_plateau_level = best_eval_dist
             det_best_dist_txt = 'train_set/checkpoints/td3_det_best_dist.txt'
-            if refine_plateau_level <= 0.0 and os.path.exists(det_best_dist_txt):
-                try:
-                    with open(det_best_dist_txt) as f_be:
-                        refine_plateau_level = float(f_be.read().strip())
-                except Exception:
-                    pass
+            if refine_plateau_level <= 0.0:
+                refine_plateau_level = safe_read_float(det_best_dist_txt, 0.0)
 
         if refine_plateau_level > 0.0:
-            print(f"🔧 --refine attivo: refinement ON da subito (Critic congelato, bc_weight={REFINE_BC_WEIGHT}). "
-                  f"Riferimento rollback impostato a {refine_plateau_level:.0f}m.")
+            print(f"🔧 --refine attivo: refinement attiva da subito "
+                  f"(aggiornamento Critic disattivato, peso Behavioral Cloning={REFINE_BC_WEIGHT}). "
+                  f"Riferimento rollback={refine_plateau_level:.0f}m. Loss Critic solo diagnostica.")
         else:
-            print(f"🔧 --refine attivo: refinement ON da subito (Critic congelato, bc_weight={REFINE_BC_WEIGHT}). "
-                  f"Riferimento rollback impostato dopo i primi eval (MAX recente).")
+            print(f"🔧 --refine attivo: refinement attiva da subito "
+                  f"(aggiornamento Critic disattivato, peso Behavioral Cloning={REFINE_BC_WEIGHT}). "
+                  f"Riferimento rollback impostato dopo i primi eval (mediana recente). Loss Critic solo diagnostica.")
+
+    batch_size = 256
 
     # Warm-Start: se è il primo avvio (nessun checkpoint), inizializza l'Actor con i pesi BC.
     if start_episode == 0:
@@ -655,6 +863,10 @@ def train():
         # PRIORITÀ DETERMINISTICA (la competizione/submission usa la policy senza rumore):
         # si riparte dalla migliore policy DETERMINISTICA, non dal giro esplorativo (rumoroso,
         # "fortunato"). Gli esplorativi (best_lap/best_dist) sono solo un ripiego estremo.
+        # ── PROCEDURA DI EMERGENZA (SAFETY-NET) ──
+        # Questa procedura scatta SOLO se viene esplicitamente passato il parametro --rollback.
+        # Serve per recuperare da corruzioni del checkpoint principale (Critic degradato o crash)
+        # riallineando il Critic sui dati offline storici prima di riprendere il training normale.
         if args.rollback:
             rollback_candidates = [
                 'train_set/checkpoints/td3_det_best_lap.pth',  # 1) giro VALIDO deterministico più veloce
@@ -665,7 +877,7 @@ def train():
             ]
             best_path = next((p for p in rollback_candidates if os.path.exists(p)), None)
             if best_path:
-                print(f"♻️  Rollback Actor: caricamento della migliore policy deterministica da {best_path}")
+                print(f"♻️  [EMERGENZA] Rollback Actor: caricamento della migliore policy deterministica da {best_path}")
                 agent.actor.load_state_dict(torch.load(best_path, map_location=agent.device))
                 agent.actor_target.load_state_dict(agent.actor.state_dict())
                 import torch.optim as optim
@@ -674,6 +886,15 @@ def train():
                 # Attiviamo il congelamento temporaneo dell'Actor post-rollback
                 agent.actor_frozen = True
                 print("🧊 Actor congelato temporaneamente per stabilizzazione post-rollback.")
+
+                # Eseguiamo il pre-training del Critic sui dati offline del buffer (procedura di sicurezza una-tantum, solo con flag dedicato)
+                if getattr(args, 'pretrain_critic', False) and (len(memory) > batch_size or len(expert_memory) > batch_size):
+                    print("🏋️ [EMERGENZA] Pre-addestramento del Critic in corso sui dati offline del Replay Buffer (50,000 passi)...")
+                    for pretrain_step in range(50000):
+                        critic_loss_val, _, _ = agent.update(memory, elite_memory, expert_memory, batch_size, global_step=0)
+                        if (pretrain_step + 1) % 10000 == 0:
+                            print(f"  [Pre-addestramento] Passo {pretrain_step + 1}/50000 | Loss del Critic: {critic_loss_val:.4f}")
+                    print("✅ Pre-addestramento del Critic completato con successo!")
             else:
                 print("⚠️  Rollback richiesto ma nessun checkpoint valido trovato! Avvio ripresa normale.")
         else:
@@ -686,8 +907,11 @@ def train():
     # tracciabile a posteriori senza ambiguità con l'AUTO-REFINEMENT che scatta da solo.
     if getattr(args, 'refine', False):
         with open(log_file, 'a', encoding='utf-8') as f:
+            initial_ref = f"{refine_plateau_level:.0f}m" if refine_plateau_level > 0.0 else "da impostare"
             f.write(f"🔧 AVVIO con --refine: REFINEMENT armata da subito "
-                    f"(Critic congelato, bc_weight={REFINE_BC_WEIGHT}, ep iniziale {start_episode})\n")
+                    f"(aggiornamento Critic disattivato, loss Critic solo diagnostica, "
+                    f"peso Behavioral Cloning={REFINE_BC_WEIGHT}, riferimento rollback={initial_ref}, "
+                    f"episodio iniziale {start_episode})\n")
 
     batch_size = 256
     elite_threshold = 500.0
@@ -696,7 +920,7 @@ def train():
 
     for episode in range(start_episode, args.episodes):
         # Gestione dello scongelamento dell'Actor dopo la fase di stabilizzazione post-rollback
-        if agent.actor_frozen and episode >= start_episode + 10:
+        if agent.actor_frozen and episode >= start_episode + 30:
             agent.actor_frozen = False
             print("🔥 Actor scongelato: riavvio aggiornamenti Actor con gradienti del Critic stabilizzati.")
 
@@ -728,7 +952,7 @@ def train():
         while True:
             # NB: niente actor.eval()/train() qui — sarebbe un no-op fuorviante (nessun dropout;
             # il LayerNorm è indipendente dal batch). select_action usa già torch.no_grad().
-            cont_action, raw_gear = agent.select_action(stacked_state, evaluate=False)
+            cont_action, _raw_gear = agent.select_action(stacked_state, evaluate=False)
 
             # Mappatura Action Space: l'Actor emette azioni in [-1,1] (spazio tanh),
             # ma TORCS si aspetta accel/brake in [0,1]. La conversione (x+1)/2
@@ -743,7 +967,7 @@ def train():
             torcs_action[1] = torcs_action[1] * (1.0 - torcs_action[2])
 
             # Marcia DETERMINISTICA (anti-hunting): da velocità/rpm correnti + il gas applicato.
-            # raw_gear (gear_head congelata) è ignorato. Vedi gearing.py.
+            # _raw_gear (gear_head congelata) è ignorato. Vedi gearing.py.
             current_gear, _shifted = compute_gear(cur_speed_kmh, torcs_action[1], cur_rpm, current_gear, steps_since_shift)
             steps_since_shift = 0 if _shifted else steps_since_shift + 1
             torcs_action[3] = current_gear
@@ -766,7 +990,7 @@ def train():
                 if last_lap_time < best_lap_time:
                     best_lap_time = last_lap_time
                     new_record = True
-                    torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_expl_best_lap.pth')
+                    safe_save(agent.actor.state_dict(), 'train_set/checkpoints/td3_expl_best_lap.pth')
                 
             if info.get('crash', False):
                 done, termination_reason = True, "CRASH"
@@ -774,7 +998,7 @@ def train():
 
             if max_dist > best_distance and max_dist > 500.0:
                 best_distance = max_dist
-                torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_expl_best_dist.pth')
+                safe_save(agent.actor.state_dict(), 'train_set/checkpoints/td3_expl_best_dist.pth')
 
             next_stacked_state = np.concatenate([state_stack[0], state_stack[6], state_stack[12]])
             mask = 0.0 if info.get('crash', False) else 1.0
@@ -821,11 +1045,19 @@ def train():
         time_str = datetime.now().strftime("%H:%M:%S")
         avg_critic_loss = np.mean(critic_losses) if len(critic_losses) > 0 else 0.0
         avg_actor_loss = np.mean(actor_losses) if len(actor_losses) > 0 else 0.0
-        log_msg = (f"[{time_str}] Episode {episode+1:03d} | [{termination_reason}] | "
-                   f"Reward: {episode_reward:7.1f} | Steps: {step:4d} | "
-                   f"Time: {lap_time:5.1f}s | Dist: {int(max_dist):5d}m | "
-                   f"CriticL: {avg_critic_loss:.3f} | ActorL: {avg_actor_loss:.3f}")
-        if new_record: log_msg += f" | 🏆 NEW RECORD"
+        critic_update_status = "disattivato (refinement: loss solo diagnostica)" if getattr(agent, 'refine_mode', False) else "attivo"
+        if global_step < 15000:
+            actor_update_status = "disattivato (riscaldamento iniziale del Critic)"
+        elif getattr(agent, 'actor_frozen', False):
+            actor_update_status = "disattivato (Actor congelato)"
+        else:
+            actor_update_status = "attivo (aggiornamento TD3 ritardato)"
+        log_msg = (f"[{time_str}] Episodio {episode+1:03d} | [{termination_reason}] | "
+                   f"Ricompensa: {episode_reward:7.1f} | Passi: {step:4d} | "
+                   f"Tempo: {lap_time:5.1f}s | Distanza: {int(max_dist):5d}m | "
+                   f"Loss del Critic: {avg_critic_loss:.3f} | Aggiornamento Critic: {critic_update_status} | "
+                   f"Loss dell'Actor: {avg_actor_loss:.3f} | Aggiornamento Actor: {actor_update_status}")
+        if new_record: log_msg += f" | 🏆 NUOVO RECORD"
         print(f"🏁 {log_msg}")
 
         with open(log_file, 'a', encoding='utf-8') as f: f.write(log_msg + "\n")
@@ -834,10 +1066,13 @@ def train():
                               best_lap_time=best_lap_time,
                               best_eval_dist=best_eval_dist,
                               best_distance=best_distance)
-        torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_policy.pth')
+        safe_save(agent.actor.state_dict(), 'train_set/checkpoints/td3_policy.pth')
 
         if (episode + 1) % 5 == 0 and global_step > 15000:
-            print(f"\n  🔍 [EVAL] Valutazione deterministica...")
+            def _rlog(m):
+                print(m)
+                with open(log_file, 'a', encoding='utf-8') as f: f.write(m + "\n")
+            _rlog("\n  🔍 [EVAL] Valutazione deterministica...")
             eval_ob = env.reset(relaunch=True)
             eval_stack = deque([flatten_state(eval_ob)]*13, maxlen=13)
             eval_stacked = np.concatenate([eval_stack[0], eval_stack[6], eval_stack[12]])
@@ -854,7 +1089,7 @@ def train():
             while eval_step < args.max_steps:
                 eval_step += 1
                 with torch.no_grad():
-                    eval_action, eval_gear = agent.select_action(eval_stacked, evaluate=True)
+                    eval_action, _eval_gear = agent.select_action(eval_stacked, evaluate=True)
                 eval_env = np.zeros(4)
                 eval_env[0:3] = eval_action
                 eval_env[1], eval_env[2] = np.clip((eval_env[1]+1)/2, 0, 1), np.clip((eval_env[2]+1)/2, 0, 1)
@@ -886,17 +1121,20 @@ def train():
 
             refine_status = ""
             if getattr(agent, 'refine_mode', False):
-                refine_status = f" | Refine: ON (bc_weight={agent.refine_bc_weight:.1f}, Critic Frozen, target={refine_plateau_level:.0f}m)"
+                riferimento_rollback = f"{refine_plateau_level:.0f}m" if refine_plateau_level > 0.0 else "da impostare"
+                refine_status = (f" | Refinement: attiva (peso Behavioral Cloning={agent.refine_bc_weight:.1f}, "
+                                 f"aggiornamento Critic disattivato, loss Critic solo diagnostica, "
+                                 f"riferimento rollback={riferimento_rollback})")
             else:
-                refine_status = " | Refine: OFF"
+                refine_status = " | Refinement: non attiva"
             
-            eval_msg = f"[{time_str}] 🔍 [EVAL] Result: Dist {int(eval_dist)}m | Reward: {eval_reward:.1f}{refine_status}"
+            eval_msg = f"[{time_str}] 🔍 [EVAL] Risultato: Distanza {int(eval_dist)}m | Ricompensa: {eval_reward:.1f}{refine_status}"
             print(f"  {eval_msg}")
             with open(log_file, 'a', encoding='utf-8') as f: f.write(eval_msg + "\n")
             
             if eval_dist > best_eval_dist:
                 best_eval_dist = eval_dist
-                torch.save(agent.actor.state_dict(), 'train_set/checkpoints/td3_det_best_dist_run.pth')
+                safe_save(agent.actor.state_dict(), 'train_set/checkpoints/td3_det_best_dist_run.pth')
 
             # ── Best-Ever (sopravvive a --clean) ──
             # td3_det_best_dist_run.pth viene cancellato da --clean. Per non perdere MAI la migliore
@@ -904,44 +1142,46 @@ def train():
             # con la sua distanza. train_rl.sh --clean NON cancella questi due file.
             det_best_dist_pth = 'train_set/checkpoints/td3_det_best_dist.pth'
             det_best_dist_txt = 'train_set/checkpoints/td3_det_best_dist.txt'
-            prev_det_best_dist = 0.0
-            if os.path.exists(det_best_dist_txt):
-                try:
-                    with open(det_best_dist_txt) as f: prev_det_best_dist = float(f.read().strip())
-                except Exception: pass
-            if eval_dist > prev_det_best_dist:
-                torch.save(agent.actor.state_dict(), det_best_dist_pth)
-                with open(det_best_dist_txt, 'w') as f: f.write(f"{eval_dist:.2f}")
-                msg = f"  🏅 NUOVO BEST-EVER: {int(eval_dist)}m (preservato anche dopo --clean)"
+            prev_det_best_dist = safe_read_float(det_best_dist_txt, 0.0)
+            if eval_dist > prev_det_best_dist + BEST_DIST_EPS:
+                safe_save(agent.actor.state_dict(), det_best_dist_pth)
+                safe_write_text(det_best_dist_txt, f"{eval_dist:.2f}")
+                msg = (f"  🏅 NUOVO MIGLIOR DETERMINISTICO ASSOLUTO: {int(eval_dist)}m "
+                       f"(precedente {int(prev_det_best_dist)}m, preservato anche dopo --clean)")
                 print(msg)
                 with open(log_file, 'a', encoding='utf-8') as f: f.write(msg + "\n")
+                if getattr(agent, 'refine_mode', False):
+                    agent.refine_mode = False
+                    agent.refine_bc_weight = 1.0
+                    agent.actor_frozen = True
+                    start_episode = episode  # Congela l'Actor per i prossimi 30 episodi a partire da ora
+                    refine_evals_no_improve = 0
+                    refine_collapse_count = 0
+                    refine_best_mean = 0.0
+                    refine_plateau_level = 0.0
+                    refine_evals_count = 0
+                    recent_eval_window.clear()
+                    _rlog("  🎉 REFINEMENT CONCLUSA CON SUCCESSO! Nuovo record deterministico rilevato.")
+                    _rlog("  🔄 Rientro in modalità allineamento Critic: Actor congelato per 30 episodi.")
 
-            # ── Best-Eval-LapTime: miglior GIRO VALIDO deterministico (candidato submission) ──
+            # ── Miglior tempo su giro valido in eval deterministica (candidato submission) ──
             # A differenza di td3_det_best_dist (basato sulla DISTANZA), questo cattura il GIRO VALIDO più
             # VELOCE chiuso in eval deterministica: esattamente la policy da sottomettere. Sidecar
             # .txt col tempo; train_rl.sh --clean NON lo cancella (preservato tra run).
             if eval_best_lap_in_run < float('inf'):
                 det_best_lap_pth = 'train_set/checkpoints/td3_det_best_lap.pth'
                 det_best_lap_txt = 'train_set/checkpoints/td3_det_best_lap.txt'
-                prev_det_best_lap = float('inf')
-                if os.path.exists(det_best_lap_txt):
-                    try:
-                        with open(det_best_lap_txt) as f: prev_det_best_lap = float(f.read().strip())
-                    except Exception: pass
+                prev_det_best_lap = safe_read_float(det_best_lap_txt, float('inf'))
                 if eval_best_lap_in_run < prev_det_best_lap:
-                    torch.save(agent.actor.state_dict(), det_best_lap_pth)
-                    with open(det_best_lap_txt, 'w') as f: f.write(f"{eval_best_lap_in_run:.3f}")
+                    safe_save(agent.actor.state_dict(), det_best_lap_pth)
+                    safe_write_text(det_best_lap_txt, f"{eval_best_lap_in_run:.3f}")
                     msg = f"  🏆 NUOVO MIGLIOR GIRO VALIDO (eval deterministica): {eval_best_lap_in_run:.3f}s (preservato anche dopo --clean)"
                     print(msg)
                     with open(log_file, 'a', encoding='utf-8') as f: f.write(msg + "\n")
 
             # ── AUTO-REFINEMENT: macchina a stati (plateau → refine; collasso → rollback) ──
-            def _rlog(m):
-                print(m)
-                with open(log_file, 'a', encoding='utf-8') as f: f.write(m + "\n")
-
             recent_eval_window.append(eval_dist)
-            if not agent.refine_mode:
+            if not agent.refine_mode and not getattr(agent, 'actor_frozen', False):
                 # Rilevamento PLATEAU su STATISTICA (non sul singolo best, robusto ai colpi di
                 # fortuna): la MEDIA della finestra recente smette di salire. Serve la finestra piena.
                 if len(recent_eval_window) >= REFINE_WINDOW:
@@ -958,18 +1198,25 @@ def train():
                         # Riferimento rollback = MEDIANA recente (modo 'buono' del bimodale), non il singolo max stocastico
                         refine_plateau_level = float(np.median(list(recent_eval_window)))
                         refine_collapse_count = 0
+                        refine_evals_count = 0
                         refine_breakout_logged = False
-                        _rlog(f"  🔧 AUTO-REFINEMENT ON (tentativo {refine_attempts+1}/{REFINE_MAX_ATTEMPTS}): "
-                              f"media recente in plateau a {cur_mean:.0f}m, Critic congelato, "
-                              f"bc_weight→{REFINE_BC_WEIGHT}, riferimento (mediana)={refine_plateau_level:.0f}m (max recente={max(recent_eval_window):.0f}m)")
-            elif refine_plateau_level <= 0.0:
-                # --refine: refinement già ON, ma il riferimento rollback si fissa dopo i primi eval
+                        _rlog(f"  🔧 AUTO-REFINEMENT ATTIVA (tentativo {refine_attempts+1}/{REFINE_MAX_ATTEMPTS}): "
+                              f"media recente in plateau a {cur_mean:.0f}m, aggiornamento Critic disattivato, "
+                              f"loss Critic solo diagnostica, peso Behavioral Cloning→{REFINE_BC_WEIGHT}, "
+                              f"riferimento rollback (mediana)={refine_plateau_level:.0f}m "
+                              f"(max recente={max(recent_eval_window):.0f}m)")
+            elif agent.refine_mode and refine_plateau_level <= 0.0:
+                # --refine: refinement già attiva, ma il riferimento rollback si fissa dopo i primi eval
                 # (MEDIANA recente per robustezza), così la rete di sicurezza non usa un valore casuale/fortunato.
                 if len(recent_eval_window) >= 4:
                     refine_plateau_level = float(np.median(list(recent_eval_window)))
-                    _rlog(f"  🔧 refinement: riferimento rollback = {refine_plateau_level:.0f}m (MEDIANA degli ultimi {len(recent_eval_window)} eval, max={max(recent_eval_window):.0f}m)")
-            else:
-                # In REFINEMENT. ① Avviso di RECUPERO: la refinement ha rotto il plateau (eval
+                    refine_evals_count = 0
+                    _rlog(f"  🔧 refinement: riferimento rollback = {refine_plateau_level:.0f}m "
+                          f"(MEDIANA degli ultimi {len(recent_eval_window)} eval, max={max(recent_eval_window):.0f}m)")
+            elif agent.refine_mode:
+                # In REFINEMENT.
+                refine_evals_count += 1
+                # ① Avviso di RECUPERO: la refinement ha rotto il plateau (eval
                 # oltre +10% del riferimento) → log una-tantum, è il segnale che sta funzionando.
                 if not refine_breakout_logged and eval_dist > refine_plateau_level * 1.1:
                     refine_breakout_logged = True
@@ -991,10 +1238,23 @@ def train():
                     refine_attempts += 1
                     refine_evals_no_improve = 0
                     refine_collapse_count = 0
+                    refine_evals_count = 0
                     refine_best_mean = 0.0          # ricomincia a misurare il plateau da capo
                     refine_plateau_level = 0.0
                     _rlog(f"  🛡️ REFINEMENT collassata (<{int(REFINE_COLLAPSE_FRAC*100)}% di {ref_lvl:.0f}m) "
-                          f"→ ROLLBACK al miglior deterministico (td3_det_best_dist), bc_weight→1.0, Critic scongelato. Tentativi: {refine_attempts}/{REFINE_MAX_ATTEMPTS}")
+                          f"→ ROLLBACK al miglior deterministico (td3_det_best_dist), peso Behavioral Cloning→1.0, aggiornamento Critic riattivato. Tentativi: {refine_attempts}/{REFINE_MAX_ATTEMPTS}")
+                # ③ Timeout del refinement: 40 episodi (8 valutazioni) senza nuovi record.
+                elif refine_evals_count >= 8:
+                    agent.refine_mode = False
+                    agent.refine_bc_weight = 1.0
+                    refine_attempts += 1
+                    refine_evals_no_improve = 0
+                    refine_collapse_count = 0
+                    refine_evals_count = 0
+                    refine_best_mean = 0.0
+                    refine_plateau_level = 0.0
+                    _rlog(f"  ⚠️ TIMEOUT REFINEMENT (40 episodi in refinement senza superare il record) "
+                          f"→ Uscita automatica, peso Behavioral Cloning→1.0, aggiornamento Critic riattivato. Tentativi: {refine_attempts}/{REFINE_MAX_ATTEMPTS}")
 
     env.end()
 

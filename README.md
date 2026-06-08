@@ -14,8 +14,13 @@ Questa fase RL sfrutta il **Warm-Start** dal BC e segue il **TD3+BC minimalista*
 
 ### Punti di forza della pipeline Ibrida BC-RL:
 1. **Sample Efficiency**: Il BC fornisce un ottimo punto di partenza, abbattendo drasticamente i tempi di esplorazione del RL.
-2. **Prevenzione del Latent Shift**: Il backbone e il cambio marce rimangono quelli perfetti del BC. Il RL affina unicamente sterzo, acceleratore e freno.
-3. **Determinismo della Policy**: La policy di inferenza è rigorosamente deterministica (output `tanh(mean)` senza rumore, `LayerNorm` indipendente dal batch, nessun dropout, seed fissati). L'**ambiente** TORCS, comunicando via UDP real-time con relaunch ad ogni episodio, è *near-deterministico* (stessa griglia di partenza, ma soggetto a jitter di timing): la riproducibilità è praticamente alta ma **non bit-esatta**.
+2. **Ancora Behavioral Cloning stabile**: il TD3 allena backbone e testa continua, ma ogni batch contiene dati umani e mantiene il peso Behavioral Cloning a `1.0` nel training normale. La marcia è fuori dalla rete e viene calcolata da `gearing.py`.
+3. **Determinismo della Policy**: la policy di inferenza è deterministica (output `tanh(mean)` senza rumore, `LayerNorm` indipendente dal batch, nessun dropout). L'**ambiente** TORCS, comunicando via UDP real-time con relaunch ad ogni episodio, è *near-deterministico* (stessa griglia di partenza, ma soggetto a jitter di timing): la riproducibilità è alta ma **non bit-esatta**.
+
+### Stato locale verificato (2026-06-08)
+- Miglior checkpoint deterministico per distanza: `td3_det_best_dist.pth` (~3289m, preservato anche dopo `--clean`).
+- Giro valido deterministico: non ancora presente (`td3_det_best_lap.pth` verrà creato al primo giro valido in eval).
+- Giro completo esplorativo: già osservato (`td3_expl_best_lap.pth`, solo riferimento non deterministico).
 
 ---
 
@@ -26,7 +31,7 @@ La pipeline si compone di quattro fasi sequenziali:
 ```
 ┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
 │  Fase 1              │     │  Fase 2              │     │  Fase 3              │     │  Fase 4              │
-│  DATA COLLECTION     │────▶│  BC TRAINING         │────▶│  TD3 RL FINE-TUNING  │────▶│  TEST / INFERENCE    │
+│  RACCOLTA DATI       │────▶│  TRAINING BC         │────▶│  RIFINITURA TD3+BC   │────▶│  TEST / INFERENZA    │
 │                      │     │                      │     │                      │     │                      │
 │  🎮 PS5 / Tastiera   │     │  behavioral_cloning  │     │  td3_bc.py           │     │  test_agent.py       │
 │  data_collection.py  │     │  .py                 │     │  (Warm-Start)        │     │  Deterministico      │
@@ -53,7 +58,7 @@ AIcar/
 ├── behavioral_cloning.py      # Fase 2: Training della Deep Policy Network
 ├── td3_bc.py                  # Fase 3: TD3 Fine-Tuning (Warm-Start da BC)
 ├── test_agent.py              # Fase 4: Inferenza deterministica (BC o RL)
-├── train_all.sh               # 🚀 Script per lanciare il training BC
+├── train_bc.sh                # 🚀 Script per lanciare il training BC
 ├── train_rl.sh                # 🚀 Script per lanciare il training TD3
 ├── stop_training.sh           # 🛑 Ferma i processi di training/TORCS
 ├── README.md
@@ -65,6 +70,8 @@ AIcar/
 └── train_set/                 # Dati e Checkpoint
     ├── laps/                  #   File HDF5 dei giri registrati (lap_001.h5 ...)
     ├── checkpoints/           #   Pesi: bc_policy.pth, td3_policy.pth, td3_expl_best_lap.pth, td3_expl_best_dist.pth, td3_det_best_dist_run.pth, td3_det_best_dist.pth, td3_det_best_lap.pth
+    │   ├── backups/           #   Copie .bak/.prev ordinate per recupero anti-interruzione
+    │   │   └── buffers/       #   Backup .bak/.prev dei replay buffer
     │   └── buffers/
     │       ├── td3_checkpoint_buffer.npz        # Replay Buffer standard compresso (numpy)
     │       └── td3_checkpoint_elite_buffer.npz  # Elite Buffer compresso (numpy)
@@ -103,13 +110,13 @@ python data_collection.py --output_dir train_set --device controller --segment_o
 
 **Feedback aptico (non log)**: entrando in una zona-curva target il **controller vibra brevemente** (gentile, ~30%) — così sai quando sei nella curva senza leggere lo schermo mentre guidi. Le zone sono le **curve strette auto-rilevate dalla geometria** della pista (sensore frontale `<0.25`, ~9 tornanti su Corkscrew), **robuste ai tuoi errori di guida** (frenate/sterzate fuori posto: contano solo la forma della pista, non i tuoi input). Con `--segment_only` la raccolta è **parziale**: guidi giri interi ma vengono tenuti solo i segmenti dentro le zone (file `lap_seg_*.h5`, con margine di approccio per lo stacking).
 
-**Output:** un file `train_set/laps/lap_NNN.h5` per ogni giro valido. Ogni file contiene `states` (29D), `actions` e il **metadato `dist_from_start`** (posizione per step). ⚠️ `dist_from_start` è solo un'etichetta di posizione per analisi/corner-emphasis — **NON** entra nella rete, che resta **29D**.
+**Output:** un file `train_set/laps/lap_NNN.h5` per ogni giro valido. Ogni file contiene `states` (29D), `actions` e il **metadato `dist_from_start`** (posizione per step). ⚠️ `dist_from_start` è solo un'etichetta di posizione per le analisi — **NON** entra nella rete, che resta **29D**.
 
 ### 2. Addestramento BC (Behavioral Cloning)
 
 ```bash
 # Metodo rapido
-./train_all.sh
+./train_bc.sh
 
 # Oppure direttamente con parametri personalizzati
 python behavioral_cloning.py \
@@ -134,6 +141,12 @@ TD3_EPISODES=500 ./train_rl.sh
 # Ripartenza pulita (cancella checkpoint TD3 precedenti)
 ./train_rl.sh --clean
 
+# Ripartenza di recupero: carica la migliore policy deterministica e congela l'Actor per 30 episodi
+./train_rl.sh --rollback
+
+# Refinement immediata: aggiornamento del Critic disattivato, loss Critic solo diagnostica, peso Behavioral Cloning ridotto
+./train_rl.sh --refine
+
 # Lancio diretto
 python td3_bc.py \
     --bc_weights train_set/checkpoints/bc_policy.pth \
@@ -142,11 +155,11 @@ python td3_bc.py \
     --seed 42
 ```
 
-Il training è **resume-safe**: il checkpoint viene salvato ad ogni episodio. Puoi interromperlo con `Ctrl+C` e riprenderlo in qualsiasi momento.
+Il training è **resume-safe**: ad ogni episodio salva buffer e checkpoint in modo atomico, mantenendo anche `*.bak` e `*.prev` come ultime due copie complete recuperabili dentro `train_set/checkpoints/backups/`. Puoi interromperlo con `Ctrl+C` e riprenderlo in qualsiasi momento; se il checkpoint principale è corrotto, il loader prova automaticamente i backup recenti prima di cadere sul recupero minimo da log.
 
 Il training avviene in modo isolato in un Virtual Framebuffer (`Xvfb`) per prevenire problemi di focus con il desktop dell'host. 
 
-**Output:** `train_set/checkpoints/td3_policy.pth` + `td3_expl_best_lap.pth` + `td3_expl_best_dist.pth` + `td3_det_best_dist_run.pth` + `td3_checkpoint.pth` + `buffers/td3_checkpoint_buffer.npz` + `buffers/td3_checkpoint_elite_buffer.npz`
+**Output:** `train_set/checkpoints/td3_policy.pth` + `td3_expl_best_lap.pth` + `td3_expl_best_dist.pth` + `td3_det_best_dist_run.pth` + `td3_det_best_dist.pth` + `td3_det_best_lap.pth` (quando chiude un giro valido deterministico) + `td3_checkpoint.pth` + `buffers/td3_checkpoint_buffer.npz` + `buffers/td3_checkpoint_elite_buffer.npz` + backup automatici in `backups/`.
 
 ### 4. Test Deterministico (Inference)
 
@@ -162,13 +175,13 @@ Il test agent auto-rileva i migliori pesi disponibili: `td3_det_best_lap.pth` �
 # Esecuzione standard con bypass Xvfb (visibile a schermo)
 SHOW_GUI=1 python test_agent.py
 
-# Vedere a schermo il MIGLIOR GIRO in assoluto (best lap storico)
-SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_expl_best_lap.pth --laps 1
+# Vedere a schermo il miglior giro valido deterministico, quando disponibile
+SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_det_best_lap.pth --laps 1
 
-# Vedere la policy con la distanza maggiore raggiunta in addestramento
-SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_expl_best_dist.pth --laps 1
+# Vedere la migliore policy deterministica per distanza
+SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_det_best_dist.pth --laps 1
 
-# Vedere la policy migliore ottenuta in fase di valutazione deterministica
+# Vedere la policy migliore ottenuta nel run corrente
 SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_det_best_dist_run.pth --laps 3
 ```
 
@@ -184,19 +197,22 @@ SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_det_best_dis
 
 Durante il training RL, il log stampa metriche fondamentali per diagnosticare la salute dell'addestramento. Ecco i valori corretti da aspettarsi:
 
-### 1. Critic Loss (`CriticL`)
+### 1. Loss del Critic
 * **Cos'è:** Misura l'errore (MSE) del Critic nel prevedere le reward future.
 * **Valori Sani:** Grazie al *Reward Scaling* implementato, i valori ottimali oscillano **tra `0.01` e `5.0`** (con occasionali picchi isolati a `10-20` quando la macchina scopre porzioni di pista inedite). 
-* **Diagnosi:** Un valore stabilmente basso significa che il Critic comprende perfettamente la fisica del gioco e sta fornendo valutazioni accurate. Se la `CriticL` schizza permanentemente a centinaia, c'è un'esplosione dei gradienti (o mancano i dati BC nel replay buffer).
+* **Diagnosi:** Un valore stabilmente basso significa che il Critic sta fornendo stime coerenti. Se la loss del Critic schizza permanentemente a centinaia, c'è un'esplosione dei gradienti (o mancano i dati Behavioral Cloning nel replay buffer). In refinement il log scrive `Aggiornamento Critic: disattivato (refinement: loss solo diagnostica)`: in quel caso la loss è calcolata e mostrata, ma il Critic **non** viene aggiornato.
 
-### 2. Actor Loss (`ActorL`)
+### 2. Loss dell'Actor
 * **Cos'è:** Misura quanto l'Actor sta massimizzando le reward stimate dal Critic. 
-* **Valori Sani:** con `bc_weight=1.0` costante, dopo il warm-up l'ActorL si assesta intorno a **`-2.5`** (= `-λ`, dominanza del termine RL normalizzato). È il comportamento atteso del TD3+BC.
+* **Valori Sani:** con peso Behavioral Cloning costante a `1.0`, dopo il warm-up la loss dell'Actor si assesta intorno a **`-2.5`** (= `-λ`, dominanza del termine RL normalizzato). È il comportamento atteso del TD3+BC.
 * **Diagnosi:** Una discesa progressiva della loss è segno che l'Actor sta abbandonando l'imitazione forte iniziale per capitalizzare sul Q-Value. 
 
 ### 3. Dinamiche TD3+BC (Decay di Lambda)
 * In TD3+BC l'entropia del SAC è rimossa, l'agente è completamente deterministico.
-* **BC weight costante = 1.0:** $\lambda$ resta **fisso a `2.5`** (normalizzazione di Fujimoto & Gu, 2021) e il peso della BC penalty è **costante** — niente decay. La loss è esattamente quella del TD3+BC originale ($-\lambda Q + (\pi-a)^2$). Un decay del vincolo nella fase fragile causava "troppo RL troppo presto" → collasso (Beeson & Montana 2022, Ablation 1). L'ancora umana è inoltre **garantita in ogni batch** dal buffer expert separato (quota 25%).
+* **Peso Behavioral Cloning costante = 1.0:** $\lambda$ resta **fisso a `2.5`** (normalizzazione di Fujimoto & Gu, 2021) e il peso della penalità imitativa è **costante** — niente decay. La loss è esattamente quella del TD3+BC originale ($-\lambda Q + (\pi-a)^2$). Un decay del vincolo nella fase fragile causava "troppo RL troppo presto" → collasso (Beeson & Montana 2022, Ablation 1). L'ancora umana è inoltre **garantita in ogni batch** dal buffer expert separato (quota 25%).
+
+### 4. Refinement (`--refine`)
+La refinement è una fase separata per plateau stabili: il peso Behavioral Cloning scende a `0.3` e l'aggiornamento del Critic viene disattivato. Parte automaticamente dopo plateau statistico, oppure subito con `./train_rl.sh --refine`; il log usa `riferimento rollback=...` per indicare la soglia della rete di sicurezza, non un target da inseguire.
 
 ---
 
@@ -215,23 +231,25 @@ La rete adotta un'architettura **Multi-Head** per elaborare lo storico temporale
 | Log Std Head (Legacy) | 3 neuroni (mantenuta per retrocompatibilità coi vecchi test_agent, ma isolata in TD3) |
 | Parametri totali | ~843,000 |
 
+**Perché 3 frame stacked:** l'input concatena `t-12`, `t-6`, `t` (circa 0.24s a 50Hz). Lo stato 29D contiene già velocità e rpm, ma lo stacking aggiunge la tendenza recente dei sensori pista, della posizione laterale e delle rotazioni ruota: aiuta a distinguere ingresso curva, correzione in corso e uscita curva senza introdurre feature derivate a mano. È una scelta compatibile con tutti i checkpoint attuali (BC, TD3, test); passare a 29D single-frame richiederebbe retrain BC + rivalidazione completa, quindi resta un'ablazione futura.
+
 ### TD3+BC Architecture
 
 ```
 Actor (Warm-Start da BC)                    Critic (Twin Q-Network, da zero)
 ┌─────────────────────────┐                 ┌──────────────────────────┐
-│  backbone [FROZEN]      │                 │  Q1: (state+action) → 1 │
+│  backbone [ALLENATO]    │                 │  Q1: (state+action) → 1 │
 │  4×512 LayerNorm+ReLU   │                 │  512 → 512 → 1          │
 │                         │                 ├──────────────────────────┤
-│  continuous_head [TRAIN] │ ←── TD3 ───→  │  Q2: (state+action) → 1 │
-│  log_std_head   [TRAIN] │    updates     │  512 → 512 → 1          │
-│  gear_head      [FROZEN]│                 └──────────────────────────┘
+│  continuous_head [ALLENATA] │ ←── TD3 ───→  │  Q2: (state+action) → 1 │
+│  log_std_head   [CONGELATA] │    aggiorna    │  512 → 512 → 1          │
+│  gear_head      [CONGELATA] │                 └──────────────────────────┘
 └─────────────────────────┘                 + Target Q (Polyak τ=0.005)
 ```
 
-**Training dell'Actor:** come nel TD3+BC originale, il TD3 allena **tutto l'Actor** (backbone + `continuous_head`) con LR=`3e-4`. La `gear_head` resta congelata ed è ormai **inutilizzata** (la marcia è calcolata dalla logica deterministica `gearing.py`, non più dalla rete); la `log_std_head` è legacy (retro-compatibilità). L'ancora BC costante (`bc_weight=1.0`) previene il *Latent Shift* del backbone.
+**Training dell'Actor:** come nel TD3+BC originale, il TD3 allena **tutto l'Actor** (backbone + `continuous_head`) con LR=`3e-4`. La `gear_head` resta congelata ed è ormai **inutilizzata** (la marcia è calcolata dalla logica deterministica `gearing.py`, non più dalla rete); la `log_std_head` è legacy (retro-compatibilità). L'ancora Behavioral Cloning costante (`bc_weight=1.0` nel codice) previene il *Latent Shift* del backbone.
 
-> **Marcia deterministica (`gearing.py`)**: la marcia non è predetta dalla rete ma da una funzione velocità-primaria anti-hunting (downshift sulla velocità, upshift solo sul gas+rpm), validata sui giri umani (±1 marcia 99%, ~9.7 cambi/1000 step vs 322 della testa appresa). Identica in training/eval/test. Vedi ARCHITECTURE §17.1.
+> **Marcia deterministica (`gearing.py`)**: la marcia non è predetta dalla rete ma da una funzione velocità-primaria anti-hunting (downshift sulla velocità, upshift solo sul gas+rpm), validata sui giri umani (±1 marcia 99%, ~9.7 cambi/1000 step vs 322 della testa appresa). Identica in training/eval/test. Vedi ARCHITECTURE §17.
 
 **Critic Warm-Up (15.000 step):** I primi 15.000 step aggiornano solo il Critic. Questo protegge i pesi BC dai gradienti randomici di un Critic non ancora calibrato.
 
@@ -255,14 +273,14 @@ $$r_t = \underbrace{\tfrac{v_x}{50} \cos(\theta) \times 1.5}_{\text{progress}} \
 Il Replay Buffer viene salvato separatamente in formato `np.savez_compressed`:
 - **File**: `buffers/td3_checkpoint_buffer.npz` e `buffers/td3_checkpoint_elite_buffer.npz` (~50-100MB compressi vs >1GB con pickle)
 - **Previene il Catastrophic Forgetting** quando il training viene interrotto e ripreso
-- **Resume-safe**: Ad ogni episodio vengono salvati sia il checkpoint PyTorch che il buffer numpy
+- **Resume-safe reale**: i buffer vengono salvati prima del checkpoint `.pth`, che agisce da commit finale. Ogni file mantiene `main` nella sua posizione operativa e `.bak`/`.prev` in `train_set/checkpoints/backups/`; al resume vengono provati in questo ordine.
 
 ### Done Masking
 
-Nel TD3+BC, il flag `done` nel Replay Buffer è cruciale per la Bellman equation:
-- **done=True** → Solo per terminazioni reali (fuoripista, spin, stallo, collisione)
-- **done=False** → Per il time-limit (`max_steps`) e il completamento giro, perché il vero state-value non è zero
-- **Dati expert** → `mask=1.0` per tutti i campioni (giri completati, non crash)
+Nel TD3+BC il buffer salva un `mask` per la Bellman equation:
+- **`mask=0.0`** → solo per terminazioni reali: fuoripista, spin, stallo o collisione.
+- **`mask=1.0`** → time-limit (`max_steps`) e completamento giro, perché non sono crash.
+- **Dati expert** → `mask=1.0` per tutti i campioni: un giro umano completato non azzera il valore futuro.
 
 ### Vettore di Osservazione (29D)
 
@@ -277,7 +295,7 @@ Nel TD3+BC, il flag `done` nel Replay Buffer è cruciale per la Bellman equation
 | 24–27 | `wheelSpinVel[4]` | /100 | [0, ~2.6] |
 | 28 | `rpm` | /10000 | [0.5, 2.0] |
 
-> ⚠️ **IMPORTANTE:** La normalizzazione avviene in due punti: `gym_torcs.make_observaton()` e `flatten_state()`. NON duplicare!
+> ⚠️ **IMPORTANTE:** ci sono due livelli distinti: scaling fisso fisico (`gym_torcs.make_observaton()` + `flatten_state()`) e normalizzazione statistica mean/std (`state_norm.npz`) applicata prima della rete. Non aggiungere nuove normalizzazioni ad hoc.
 
 ---
 
@@ -295,24 +313,20 @@ Registrare **5-10 giri aggiuntivi** con:
 ### Bojarski-Style Recovery Augmentation (con gating 50%)
 Il training BC include perturbazione laterale dello stato (`trackPos ±0.4`) e angolare (`angle ±0.08 rad`) con correzione proporzionale dello sterzo e del freno target. **La perturbazione è applicata solo al 50% di ogni batch** (gating per-campione): l'altra metà resta pulita, così la rete impara *sia* la guida precisa sulla linea ideale *sia* il recupero da stati OOD. Senza il gating (perturbazione al 100%) la fedeltà di sterzo degradava (steer MAE 0.116 → 0.062 col gating).
 
-### Corner Emphasis — Oversampling Pesato per Posizione (⚠️ disattivato di default)
-Meccanismo opzionale per pesare di più, nella loss BC, i campioni in **intervalli di `distFromStart`** (la curva si identifica per *posizione*, non per tempo). Config in `behavioral_cloning.py`:
-
-```python
-CORNER_EMPHASIS_ZONES = []   # disattivato. Es. per riattivare: [(675.0, 720.0, 2.0)]
-```
-
-**È disattivato** perché il ripeso artificiale degradava il closed-loop (la policy regrediva, uscendo prima). Il bilanciamento curva/resto-pista si ottiene invece con la **quantità di dati reali** raccolti sulla curva (`data_collection --segment_only`). La posizione per step si legge dal metadato `dist_from_start` (o dal backup 30D). ⚠️ `distFromStart` è **solo un'etichetta**: NON entra nella rete, che resta **29D**.
+### Nota storica: oversampling pesato per posizione (rimosso)
+Un meccanismo che pesava di più i campioni di una curva nella loss BC è stato **testato e RIMOSSO**: degradava il closed-loop (la policy regrediva, ~236m invece di ~811m). Il bilanciamento si fa con la **quantità di dati reali** raccolti sulla curva (`data_collection --segment_only` → solo expert buffer RL). Il metadato `dist_from_start` resta nei giri solo come etichetta per analisi: **NON** entra nella rete, che resta **29D**.
 
 ---
 
 ## 🐛 Bug Risolti (Workflow Tracking)
 
+Le voci più vecchie sono cronologia tecnica: possono citare SAC o nomi checkpoint storici, ma la fonte di verità operativa attuale è la sezione TD3+BC sopra e ARCHITECTURE.md.
+
 ### [2026-06-07] Cambio Marcia Deterministico + Falso Stallo in Test
 
 **Problema 1 — Hunting del cambio:** La `gear_head` appresa (congelata durante l'RL) produceva hunting estremo (fino a ~322 cambi ogni 1000 step, con assurdità tipo 1ª a 150 km/h) che destabilizzava l'intero giro e spezzava la trazione. Essendo congelata, l'RL non poteva correggerla.
 
-**Fix:** Sostituita con `gearing.compute_gear`, logica deterministica **velocità-primaria** (vedi ARCHITECTURE §17.1). Il downshift guarda la velocità (monotòna in frenata) → il classico problema del picco-rpm in staccata (che fa ri-salire di marcia gli shifter ingenui) sparisce per costruzione; l'upshift scatta solo sul gas. Soglie derivate e validate sui 75 giri umani (**±1 marcia 99%**, 0% fuorigiri) **e dal vivo sulla policy RL** (10.5 cambi/1000, 0 oscillazioni rapide). Usata identica in training/eval/test.
+**Fix:** Sostituita con `gearing.compute_gear`, logica deterministica **velocità-primaria** (vedi ARCHITECTURE §17). Il downshift guarda la velocità (monotòna in frenata) → il classico problema del picco-rpm in staccata (che fa ri-salire di marcia gli shifter ingenui) sparisce per costruzione; l'upshift scatta solo sul gas. Soglie derivate e validate sui 75 giri umani (**±1 marcia 99%**, 0% fuorigiri) **e dal vivo sulla policy RL** (10.5 cambi/1000, 0 oscillazioni rapide). Usata identica in training/eval/test.
 
 **Problema 2 — Falso stallo in test:** `test_agent.py` rilevava uno stallo fasullo a ~550 step. Causa: leggeva la velocità da `next_state[21]*50`, ma `next_state` è ora **normalizzato** (`apply_state_norm`, mean/std) → a velocità sotto-media il valore diventa negativo → `fwd_kmh < 5` fasullo. **Fix:** leggere la velocità dall'obs grezzo `next_obs['speedX']*50`. *(Bug presente solo nel test, non nel training.)*
 
@@ -320,9 +334,9 @@ CORNER_EMPHASIS_ZONES = []   # disattivato. Es. per riattivare: [(675.0, 720.0, 
 
 ### [2026-06-04] Risoluzione OOD BC Bug e Relaxed Policy Constraint
 
-**Problema:** L'Actor dimenticava come guidare in modo deterministico (Catastrophic Forgetting), esibendo un plateau fisso della `ActorL` a ~2.516 durante i crash.
+**Problema:** L'Actor dimenticava come guidare in modo deterministico (Catastrophic Forgetting), esibendo un plateau fisso della loss dell'Actor a ~2.516 durante i crash.
 
-**Root Cause:** Il *Frozen BC Anchor* (la `bc_policy` congelata) veniva interrogato per calcolare la penalità imitativa anche durante gli stati OOD (fuoripista, muri). La rete restituiva azioni allucinate, bloccando l'apprendimento delle manovre di recupero.
+**Root Cause:** L'ancora Behavioral Cloning congelata (la `bc_policy`) veniva interrogata per calcolare la penalità imitativa anche durante gli stati OOD (fuoripista, muri). La rete restituiva azioni allucinate, bloccando l'apprendimento delle manovre di recupero.
 
 **Fix applicati:**
 1. **Masking Rigoroso**: La BC Penalty è calcolata esclusivamente sui campioni empirici registrati nell'Elite Buffer (dove `expert_mask=1.0`). È azzerata durante le fasi esplorative online, liberando l'Actor.
@@ -343,16 +357,16 @@ CORNER_EMPHASIS_ZONES = []   # disattivato. Es. per riattivare: [(675.0, 720.0, 
 
 **Fix applicati:**
 1. **LR Differenziati**: `continuous_head` = `1e-5`, `log_std_head` = `1e-4`. Protegge i pesi BC calibrati.
-2. **BC Weight Fisso = 5.0**: Nessun decay. L'Actor resta permanentemente ancorato al BC (Residual RL).
+2. **Peso Behavioral Cloning fisso = 5.0**: Nessun decay. L'Actor resta permanentemente ancorato al BC (Residual RL).
 3. **Done Masking Corretto**: I dati expert usano `mask=1.0` per tutti i campioni (giri completati ≠ crash).
 4. **Alpha Fisso = 0.01**: Disattivato l'auto-tuning dell'entropia.
 5. **Update Ratio 1:4**: Aggiornamento ogni 4 step per ridurre l'overfitting.
 6. **Bonus Completamento Giro = +50.0**: Segnale esplicito per il Critic.
-7. **Evaluation Periodica Deterministica**: Ogni 25 episodi, checkpoint riproducibile `sac_best_eval.pth`.
+7. **Evaluation Periodica Deterministica**: Ogni 25 episodi, checkpoint deterministico riproducibile per il sistema SAC storico.
 
 ### [2026-05-31] Risoluzione del Collasso della Policy (Stall Trap & Q-Value Explosion)
 
-**Problema:** L'agente soffriva di uno "Stall Trap" alla partenza a causa di un *overestimation bias* critico (Critic Loss > 2000), seguito dal collasso della rete. Questo era indotto da Alpha azzerato forzatamente, iniezione di rumore scorretta e una soglia dell'elite buffer degenerata.
+**Problema:** L'agente soffriva di uno "Stall Trap" alla partenza a causa di un *overestimation bias* critico (loss del Critic > 2000), seguito dal collasso della rete. Questo era indotto da Alpha azzerato forzatamente, iniezione di rumore scorretta e una soglia dell'elite buffer degenerata.
 
 **Fix applicati:**
 1. **Riattivazione Auto-Tuning Entropia**: Ripristinata l'ottimizzazione dinamica di `alpha`. L'entropia agisce ora come regolarizzatore nell'equazione di Bellman per frenare l'overestimation bias causata da Q-Values asintotici in stati *OOD*.
@@ -387,8 +401,8 @@ CORNER_EMPHASIS_ZONES = []   # disattivato. Es. per riattivare: [(675.0, 720.0, 
 **Fix applicati:**
 1. **Ambiente Isolato Xvfb:** TORCS e le macro girano confinati in un virtual display senza rubare focus. Usare `SHOW_GUI=1` per lo sblocco in rendering locale.
 2. **Auto-Entropy Tuning**: Introdotto tuning automatico del `log_alpha` per un corretto calcolo del SAC.
-3. **Pure SAC Actor Loss**: Rimossa la logica fallata TD3+BC dalla fase Online. L'Actor massimizza unicamente entropia e Q-Value target senza auto-imitare il proprio rumore di addestramento.
-4. **Dual Checkpointing**: L'agente salva `sac_best_policy.pth` ad ogni giro da record. Durante l'esplorazione, salva anche `sac_best_dist.pth` ad ogni nuovo record di distanza percorsa prima dello schianto (se > 500m). Logging semantico per gli episodi `[SUCCESS]`, `[CRASH]` o `[TIMEOUT]`.
+3. **Loss dell'Actor SAC puro**: Rimossa la logica fallata TD3+BC dalla fase Online. L'Actor massimizza unicamente entropia e Q-Value target senza auto-imitare il proprio rumore di addestramento.
+4. **Dual Checkpointing**: Il sistema SAC storico salvava checkpoint separati per giro da record e distanza massima prima dello schianto. Logging semantico per gli episodi `[SUCCESS]`, `[CRASH]` o `[TIMEOUT]`.
 5. **Permanent BC Adherence (Residual RL)**: Implementata una strategia di "guinzaglio" asintotico per la penalità di Behavioral Cloning. Il peso decade lentissimamente (da 10.0 a 2.0 in 500.000 step) ma non arriva *mai* a zero. Questo previene il *Policy Collapse* causato dall'Extrapolation Error, obbligando l'Actor a restare ancorato alla fisica della policy BC, e sfruttando i gradienti Q-Value del SAC unicamente come affinamento locale (Residual RL) per ottimizzare le curve in cui la media umana fallisce.
 6. **Alpha Math-Fix e Reward Scaling**: Disattivata l'Entropia SAC (`alpha = 0.0`) per curare in via definitiva l'esplosione dei gradienti ai confini del dominio `tanh` (`gas a tavoletta`). Per compensare l'iper-ottimismo del Critic (che porta all'Extrapolation Error summenzionato), la `reward_scale` è stata abbattuta a `0.002`, armonizzando i Q-value generati da un `gamma = 0.999`.
 7. **Gamma Horizon Fix (50Hz Myopia)**: Aumentato il discount factor `gamma` da `0.99` a `0.999`. In un simulatore a 50Hz, `gamma=0.99` limitava l'orizzonte visivo del Q-Value a soli 2 secondi (100 step), rendendo la partenza (speed=0) indistinguibile da uno stallo e portando l'Actor a massimizzare l'entropia (0.5 gas, 0.5 freno). Con `gamma=0.999`, l'orizzonte si espande a 20 secondi, permettendo al Critic di ricompensare l'accelerazione a lungo termine.

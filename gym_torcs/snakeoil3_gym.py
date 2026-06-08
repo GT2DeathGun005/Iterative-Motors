@@ -188,7 +188,7 @@ class Client():
                         'episodes=','track=','stage=',
                         'debug','help','version'])
         except getopt.error:
-            # Quando usato come libreria (es. da sac_rl.py), sys.argv contiene
+            # Quando usato come libreria (es. da td3_bc.py/test_agent.py), sys.argv contiene
             # argomenti dello script chiamante: ignora silenziosamente.
             return
         try:

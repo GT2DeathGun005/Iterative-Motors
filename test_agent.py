@@ -16,10 +16,10 @@ Priorità di caricamento automatica:
   5. td3_expl_best_dist.pth   (record di distanza TD3)
   6. td3_policy.pth      (ultimo step TD3)
   7. bc_policy.pth       (fallback supervisionato)
-  6. --weights path      (override esplicito)
+  --weights path      (override esplicito, se fornito)
 
 Determinismo:
-  - Seeding globale (torch, numpy, random) a 42
+  - Determinismo per costruzione (policy evaluate=True senza rumore, gearing/fisica deterministici)
   - model.eval() per disabilitare dropout/batchnorm stocastiche
   - actor.sample(state, evaluate=True) bypassa il campionamento gaussiano
 
@@ -32,8 +32,6 @@ Uso:
 import os
 import sys
 import argparse
-import time
-import datetime
 import csv
 import numpy as np
 import torch
@@ -44,21 +42,17 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'gym_
 
 from gym_torcs import TorcsEnv
 from gearing import compute_gear  # cambio marcia deterministico (anti-hunting), condiviso col training
-import random
 
 # ──────────────────────────────────────────────────────────────────────
-#  Determinismo Assoluto
+#  Riproducibilità
 # ──────────────────────────────────────────────────────────────────────
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
+# Il test è già deterministico PER COSTRUZIONE: la policy gira con evaluate=True
+# (output tanh(mean), zero rumore), il cambio marcia è deterministico (gearing.py) e
+# la fisica TORCS è near-deterministica → NESSUN RNG nel percorso di inferenza, quindi
+# non serve seedare random/numpy/torch. Pinniamo solo cuDNN per un forward-pass GPU
+# bit-riproducibile (no-op su CPU).
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-os.environ['PYTHONHASHSEED'] = str(SEED)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -245,12 +239,6 @@ def denormalize_action_rl(cont_action: np.ndarray, gear: int) -> np.ndarray:
     env_action[2] = np.clip((cont_action[2] + 1.0) / 2.0, 0.0, 1.0) # brake
     env_action[3] = float(max(0, min(6, gear)))                      # gear
     return env_action
-
-
-# NB: la marcia in inferenza usa il SOLO vincolo sequenziale ±1 (inline nel loop),
-# identico al training (td3_bc.py). Una funzione di isteresi con conferma temporale
-# esisteva qui ma non era mai chiamata ed avrebbe introdotto un mismatch train/inferenza:
-# è stata rimossa.
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -448,12 +436,12 @@ def main():
                         # RL: usa sample(evaluate=True) per determinismo assoluto
                         tanh_action, _, gear_idx = model.sample(state_t, evaluate=True)
                         cont_action = tanh_action.cpu().numpy()[0]
-                        raw_gear = int(gear_idx.item())
+                        _raw_gear = int(gear_idx.item())
                     else:
                         # BC: usa forward() con Tanh steer + Sigmoid accel/brake
                         pred_cont, gear_logits = model(state_t)
                         cont_action = pred_cont.cpu().numpy()[0]
-                        raw_gear = int(gear_logits.argmax(dim=1).item())
+                        _raw_gear = int(gear_logits.argmax(dim=1).item())
 
                 # ── Mutual exclusion accel/brake (come l'esperto umano) ──
                 # Per i pesi BC, cont_action[1:3] sono già [0,1] (Sigmoid)
@@ -469,7 +457,7 @@ def main():
                     env_action[1] = env_action[1] * (1.0 - env_action[2])
 
                 # ── Marcia DETERMINISTICA (anti-hunting), identica a training/eval (gearing.py) ──
-                # raw_gear (gear_head congelata) è ignorato. Usa il gas APPLICATO (env_action[1]).
+                # _raw_gear (gear_head congelata) è ignorato. Usa il gas APPLICATO (env_action[1]).
                 current_gear, _shifted = compute_gear(cur_speed_kmh, float(env_action[1]), cur_rpm, current_gear, steps_since_shift)
                 steps_since_shift = 0 if _shifted else steps_since_shift + 1
                 env_action[3] = current_gear
@@ -523,9 +511,14 @@ def main():
                     print(f"  ⚠️  Stallo allo step {step} (vel. avanti {fwd_kmh:.1f} km/h)")
                     break
 
-                # ── Telemetria ogni 200 step ──
+                # ── Telemetria ogni 200 passi ──
                 if step % 200 == 0:
-                    print(f"    [Step {step:4d}] tp={track_pos:+.3f} | spd={spd_kmh:.0f}km/h | steer={env_action[0]:+.3f} | accel={env_action[1]:.2f} | brake={env_action[2]:.2f} | gear={int(env_action[3])}")
+                    print(
+                        f"    [Passo {step:4d}] posizione pista={track_pos:+.3f} | "
+                        f"velocità={spd_kmh:.0f} km/h | sterzo={env_action[0]:+.3f} | "
+                        f"acceleratore={env_action[1]:.2f} | freno={env_action[2]:.2f} | "
+                        f"marcia={int(env_action[3])}"
+                    )
 
                 # ── Check completamento giro ──
                 current_last_lap = float(raw.get('lastLapTime', 0.0))

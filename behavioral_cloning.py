@@ -37,58 +37,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, random_split
-import math
 from datetime import datetime
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  Corner Emphasis (Idea #1) — oversampling pesato per zona del tracciato
-# ──────────────────────────────────────────────────────────────────────
-# I campioni la cui posizione (distFromStart in metri) cade in una zona
-# ricevono un peso maggiore nella loss BC, per rinforzare manovre critiche.
-# Bersaglio attuale: staccata + tornante stretto ~680-810m, dove l'agente
-# arriva troppo veloce e esce di pista (trackPos +1.5).
-# NB: la posizione è SOLO un'etichetta per pesare — NON entra nella rete (resta 29D).
-# DISATTIVATO di default (lista vuota → tutti i pesi = 1.0).
-# Decisione: NON applichiamo un peso artificiale ai campioni in curva. Il ripeso
-# della loss ha mostrato di degradare il comportamento closed-loop (la policy
-# regrediva, uscendo prima). Il bilanciamento curva/resto-pista va ottenuto in modo
-# naturale, con la QUANTITÀ di dati reali raccolti sulla curva (data_collection
-# --segment_only), non con un moltiplicatore. L'infrastruttura resta disponibile:
-# per riattivarla basta popolare la lista con tuple (start_m, end_m, peso).
-CORNER_EMPHASIS_ZONES = []  # es. [(675.0, 720.0, 2.0)] per riattivare
-DIST_NORM_DIVISOR = 4012.0  # backup col[29] normalizzato: metri = col * D (track ~3619m)
-
-
-def _lap_positions(file_path, states_tensor):
-    """Posizione (distFromStart, metri) per ogni step del giro.
-
-    Ordine di preferenza (tutto in scala metri raw, coerente con CORNER_EMPHASIS_ZONES):
-      1. metadato `dist_from_start` salvato nel giro stesso (nuove raccolte di data_collection);
-      2. backup 30D (`dataset_backup/.../<nome>`, colonna 29 normalizzata × DIST_NORM_DIVISOR);
-      3. None → nessuna enfasi (peso uniforme di fallback).
-    """
-    n = states_tensor.shape[0]
-    # 1) Metadato diretto nel file del giro (metri raw)
-    try:
-        with h5py.File(file_path, 'r') as h:
-            if 'dist_from_start' in h:
-                d = h['dist_from_start'][:].astype(np.float32)
-                if d.shape[0] == n:
-                    return d
-    except Exception:
-        pass
-    # 2) Backup 30D allineato per numero di step
-    base = os.path.basename(file_path)
-    for c in glob.glob(os.path.join('dataset_backup', '**', base), recursive=True):
-        try:
-            with h5py.File(c, 'r') as h:
-                bs = h['states'][:]
-            if bs.shape[1] >= 30 and bs.shape[0] == n:
-                return bs[:, 29].astype(np.float32) * DIST_NORM_DIVISOR
-        except Exception:
-            pass
-    return None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -142,14 +91,6 @@ class TorcsHDF5Dataset(Dataset):
 
         self.length = self.states.shape[0]
 
-        # ── Corner Emphasis: peso per campione in base alla posizione sul tracciato ──
-        w = np.ones(self.length, dtype=np.float32)
-        pos = _lap_positions(file_path, self.states)
-        if pos is not None:
-            for (a, b, wz) in CORNER_EMPHASIS_ZONES:
-                w[(pos >= a) & (pos <= b)] = wz
-        self.weight = torch.tensor(w, dtype=torch.float32)
-
     def __len__(self) -> int:
         return self.length
 
@@ -163,7 +104,7 @@ class TorcsHDF5Dataset(Dataset):
             self.states[idx_t6],
             self.states[idx]
         ])
-        return stacked, self.actions[idx], self.weight[idx]
+        return stacked, self.actions[idx]
 
 
 def load_dataset(path: str) -> Dataset:
@@ -173,7 +114,7 @@ def load_dataset(path: str) -> Dataset:
         # BC: una distribuzione concentrata su poche curve sbilancia il BC (che minimizza l'errore
         # medio ed è cieco alla posizione → la sterzata di una curva "trabocca" su stati simili
         # altrove). I segmenti vengono usati SOLO dall'expert buffer dell'RL (che ha la value
-        # function ed è robusto). Vedi ARCHITECTURE §7/§17.1.
+        # function ed è robusto). Vedi ARCHITECTURE §7.
         h5_files = sorted(glob.glob(os.path.join(path, "**/lap_[0-9]*.h5"), recursive=True))
 
         if not h5_files:
@@ -315,7 +256,7 @@ class BehaviorCloningTrainer:
 
         print(f"  Dataset split: {train_size} train / {val_size} val")
 
-    def _combined_loss(self, pred_continuous, pred_gear_logits, target_actions, sample_weight=None):
+    def _combined_loss(self, pred_continuous, pred_gear_logits, target_actions):
         # target_actions ha dimensione: [batch_size, 4]
         # [0] steer, [1] accel, [2] brake, [3] gear (float)
 
@@ -347,23 +288,15 @@ class BehaviorCloningTrainer:
 
         # Combinazione bilanciata: la CrossEntropy ha un peso di 2.0 per allinearsi alla scala del MSE
         per_sample = cont_ps + 2.0 * gear_ps
-
-        # Corner Emphasis: media pesata per campione (con sample_weight=1 ovunque
-        # coincide esattamente con la media semplice → scala/val-loss invariati).
-        if sample_weight is not None:
-            total_loss = (per_sample * sample_weight).sum() / sample_weight.sum().clamp(min=1e-6)
-        else:
-            total_loss = per_sample.mean()
-        return total_loss
+        return per_sample.mean()
 
     def train_epoch(self) -> float:
         self.model.train()
         total_loss = 0.0
 
-        for states, targets, weights in self.train_loader:
+        for states, targets in self.train_loader:
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
-            weights = weights.to(self.device, non_blocking=True)
 
             # Reshape temporaneo per applicare l'augmentation su ciascuno dei 3 frame in modo coerente
             batch_size = states.size(0)
@@ -483,7 +416,7 @@ class BehaviorCloningTrainer:
 
             self.optimizer.zero_grad()
             pred_cont, pred_gear = self.model(states)
-            loss = self._combined_loss(pred_cont, pred_gear, targets, sample_weight=weights)
+            loss = self._combined_loss(pred_cont, pred_gear, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
@@ -497,7 +430,7 @@ class BehaviorCloningTrainer:
         self.model.eval()
         total_loss = 0.0
 
-        for states, targets, _weights in self.val_loader:
+        for states, targets in self.val_loader:
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
@@ -507,7 +440,6 @@ class BehaviorCloningTrainer:
                 states = (states - self.state_mean) / (self.state_std + 1e-3)
                 states = states.view(states.size(0), 87)
 
-            # Val-loss uniforme (sample_weight=None) per restare comparabile tra run
             pred_cont, pred_gear = self.model(states)
             loss = self._combined_loss(pred_cont, pred_gear, targets)
             total_loss += loss.item()
@@ -607,7 +539,7 @@ def main():
     dataset, total_samples = load_dataset(args.dataset)
 
     # ── Rileva dimensioni ──
-    sample_state, sample_action, _sample_w = dataset[0]
+    sample_state, _sample_action = dataset[0]
     state_dim = sample_state.shape[0]
     print(f"  Dimensioni: state={state_dim}, action_dim=4 (steer, accel, brake, gear)")
 
@@ -667,7 +599,6 @@ def main():
         f.write(f"Avvio:        {datetime.now().isoformat()}\n")
         f.write(f"Dataset:      {args.dataset} | Campioni: {total_samples} | Device: {device}\n")
         f.write(f"Iperparam:    epochs={args.epochs} batch={args.batch_size} lr={args.lr} state_dim={state_dim}\n")
-        f.write(f"CornerEmph:   {CORNER_EMPHASIS_ZONES}\n")
         f.write(f"Output:       {args.output}\n")
     print(f"  📝 Log di sessione: {log_path}")
 

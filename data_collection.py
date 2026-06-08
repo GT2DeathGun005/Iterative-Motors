@@ -21,13 +21,11 @@ import numpy as np
 import h5py
 import pygame
 from datetime import datetime
-from typing import Optional
-from collections import deque
 
 # Forza la visualizzazione della GUI di TORCS per la data collection
 os.environ['SHOW_GUI'] = '1'
 
-# Aggiungo gym_torcs al path
+# Aggiunge il wrapper TORCS locale al path di import.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'gym_torcs')))
 
 try:
@@ -320,7 +318,7 @@ def flatten_state(state_dict: dict) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  Funzione helper: estrai trackPos come scalare
+#  Helper: estrazione robusta di tempi e posizione dal dizionario TORCS
 # ──────────────────────────────────────────────────────────────────────
 
 def _get_dist_from_start(obs: dict) -> float:
@@ -550,7 +548,7 @@ def main():
                 if args.tcs:
                     action = apply_tcs(action, ob, slip_threshold=args.tcs_slip)
 
-                # ── Step simulazione ──
+                # ── Passo di simulazione ──
                 ob_next, reward, done, info = env.step(action)
                 next_state_vec = flatten_state(ob_next)
 
@@ -603,12 +601,17 @@ def main():
                         lap_completed = True
                         lap_valid = True
                         lap_time = current_cur_lap
-                        print(f"\n  ✅ [TARGET COMPLETATO] Zona completata (distanza: {current_dist:.1f}m > limit: {max_zone_bound + 10.0:.1f}m). Termino il giro anticipatamente!")
+                        print(f"\n  ✅ [ZONA COMPLETATA] Zona completata (distanza: {current_dist:.1f}m > limite: {max_zone_bound + 10.0:.1f}m). Termino il giro anticipatamente!")
 
                 # Log ogni 2 secondi circa (100 step) — indicatore zona (solo per il record)
                 if step % 100 == 0:
                     zone_tag = "  🎯 ZONA TARGET" if cur_zone is not None else ""
-                    print(f"    [Step {step:4d}] CurTime: {current_cur_lap:6.2f} | LastLap: {current_last_lap:6.2f} | Dist: {current_dist:7.1f}{zone_tag} | OffTrack: {went_off_track}", end='\r')
+                    print(
+                        f"    [Passo {step:4d}] Tempo giro corrente: {current_cur_lap:6.2f}s | "
+                        f"Ultimo giro: {current_last_lap:6.2f}s | Distanza: {current_dist:7.1f}m"
+                        f"{zone_tag} | Fuori pista: {went_off_track}",
+                        end='\r'
+                    )
 
                 # CONDIZIONE A: TORCS aggiorna il lastLapTime (Metodo primario e più affidabile)
                 if current_last_lap > 0.0 and abs(current_last_lap - prev_last_lap_time) > 0.0001:
@@ -666,7 +669,7 @@ def main():
                 states_np = np.stack(lap_states)
                 actions_np = np.stack(lap_actions)
                 # Metadato posizione (allineato agli stati). NON è una feature di rete:
-                # serve solo per analisi/corner-emphasis esatti senza dipendere dal backup 30D.
+                # serve solo per le analisi (es. dove l'agente esce di pista), mai nello stato 29D.
                 dists_np = np.asarray(lap_dists[:len(states_np)], dtype=np.float32)
 
                 def _write_h5(path, st, ac, di):
@@ -713,10 +716,10 @@ def main():
                 session_saved += 1
 
                 log_entry = (
-                    f"[SAVED] | Lap Time: {lap_time:.3f}s | "
-                    f"Steps: {log_steps} | {datetime.now().isoformat()}"
+                    f"[SALVATO] | Tempo giro: {lap_time:.3f}s | "
+                    f"Passi salvati: {log_steps} | {datetime.now().isoformat()}"
                 )
-                print(f"     Lap Time: {lap_time:.3f}s | Steps salvati: {log_steps}")
+                print(f"     Tempo giro: {lap_time:.3f}s | Passi salvati: {log_steps}")
 
             else:
                 # ── Giro scartato ──
@@ -727,8 +730,8 @@ def main():
                     reason = invalidation_reason if invalidation_reason else "Tempo non valido"
 
                 log_entry = (
-                    f"[DISCARDED] Tentativo #{lap_attempt} | Motivo: {reason} | "
-                    f"Steps: {len(lap_states)} | {datetime.now().isoformat()}"
+                    f"[SCARTATO] Tentativo #{lap_attempt} | Motivo: {reason} | "
+                    f"Passi: {len(lap_states)} | {datetime.now().isoformat()}"
                 )
                 print(f"  ❌ GIRO SCARTATO — {reason}")
 
