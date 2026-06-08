@@ -839,7 +839,8 @@ def train():
     REFINE_PLATEAU_EVALS = 4       # valutazioni con MEDIA recente NON in salita → plateau (auto)
     REFINE_MIN_EP = 200            # episodio minimo per l'auto-trigger
     REFINE_IMPROVE_FRAC = 1.02     # la media deve salire >2% per contare come "miglioramento"
-    REFINE_BREAKOUT_FRAC = 1.10    # breakout reale: eval > riferimento rollback del 10%
+    REFINE_BREAKOUT_FRAC = 1.10    # breakout reale: eval > riferimento plateau del 10%
+    REFINE_NEW_PLATEAU_FRAC = 1.10 # plateau più alto di almeno il 10% → nuovo regime, reset tentativi
     REFINE_GOOD_EVALS_TO_CONSOLIDATE = 3  # 3 breakout consecutivi bastano: non lasciare il Critic spento troppo a lungo
     REFINE_NEAR_BEST_MARGIN = 5.0  # metri: se il breakout è vicino al best globale, consolidiamo subito
     BEST_DIST_EPS = 1.0            # evita di risalvare/loggare record identici per jitter sub-metrico
@@ -864,7 +865,9 @@ def train():
 
     refine_evals_no_improve = 0
     refine_attempts = 0
-    refine_plateau_level = 0.0     # 0 = riferimento rollback non ancora impostato
+    refine_attempt_plateau_ref = 0.0  # budget anti-loop riferito al plateau corrente, non a tutto il run
+    refine_attempt_limit_logged = False
+    refine_plateau_level = 0.0     # 0 = riferimento plateau non ancora impostato
     refine_collapse_count = 0
     refine_evals_count = 0
     refine_good_eval_count = 0
@@ -887,13 +890,14 @@ def train():
                 refine_plateau_level = safe_read_float(det_best_dist_txt, 0.0)
 
         if refine_plateau_level > 0.0:
+            refine_attempt_plateau_ref = refine_plateau_level
             print(f"--refine attivo: refinement attiva da subito "
                   f"(aggiornamento Critic disattivato, peso Behavioral Cloning={REFINE_BC_WEIGHT}). "
-                  f"Riferimento rollback={refine_plateau_level:.0f}m. Loss Critic solo diagnostica.")
+                  f"Riferimento plateau={refine_plateau_level:.0f}m. Loss Critic solo diagnostica.")
         else:
             print(f"--refine attivo: refinement attiva da subito "
                   f"(aggiornamento Critic disattivato, peso Behavioral Cloning={REFINE_BC_WEIGHT}). "
-                  f"Riferimento rollback impostato dopo i primi eval (mediana recente). Loss Critic solo diagnostica.")
+                  f"Riferimento plateau impostato dopo i primi eval (mediana recente). Loss Critic solo diagnostica.")
 
     batch_size = 256
 
@@ -976,7 +980,7 @@ def train():
             initial_ref = f"{refine_plateau_level:.0f}m" if refine_plateau_level > 0.0 else "da impostare"
             f.write(f"AVVIO con --refine: REFINEMENT armata da subito "
                     f"(aggiornamento Critic disattivato, loss Critic solo diagnostica, "
-                    f"peso Behavioral Cloning={REFINE_BC_WEIGHT}, riferimento rollback={initial_ref}, "
+                    f"peso Behavioral Cloning={REFINE_BC_WEIGHT}, riferimento plateau={initial_ref}, "
                     f"episodio iniziale {start_episode})\n")
     if getattr(args, 'rollback', False):
         with open(log_file, 'a', encoding='utf-8') as f:
@@ -1063,7 +1067,9 @@ def train():
             max_dist = max(max_dist, current_dist)
 
             done = False
-            if last_lap_time > 0.0 and abs(last_lap_time - prev_last_lap) > 0.01 and step > 500:
+            if stop_requested:
+                done, termination_reason = True, "STOP"
+            elif last_lap_time > 0.0 and abs(last_lap_time - prev_last_lap) > 0.01 and step > 500:
                 done, termination_reason = True, "SUCCESS"
                 completed_lap_time = last_lap_time
                 reward += 50.0
@@ -1072,7 +1078,7 @@ def train():
                     new_record = True
                     safe_save(agent.actor.state_dict(), 'train_set/checkpoints/td3_expl_best_lap.pth')
 
-            if info.get('crash', False):
+            if info.get('crash', False) and termination_reason != "STOP":
                 done, termination_reason = True, "CRASH"
 
 
@@ -1101,24 +1107,25 @@ def train():
                     actor_losses.append(actor_loss_val)
 
             if done or env_done or time_limit_reached:
-                for t in episode_transitions:
-                    memory.push(t[0], t[1], t[2], t[3], t[4], expert=0.0)
+                if termination_reason != "STOP":
+                    for t in episode_transitions:
+                        memory.push(t[0], t[1], t[2], t[3], t[4], expert=0.0)
 
-                # ── Elite Buffer Injection ──
-                # Se la distanza supera la soglia (best_distance * 0.7), l'episodio viene clonato
-                # nell'Elite Buffer per Self-Imitation. Gli ultimi 50 step di un crash sono flaggati
-                # expert=0.0 per evitare Causal Confusion (imitare azioni pre-schianto).
-                # NB: moltiplicatore abbassato da 0.9 a 0.7. Con 0.9 un singolo colpo fortunato
-                # precoce (es. 2793m all'ep2) bloccava la soglia troppo in alto: l'Elite Buffer
-                # si riempiva ~3 volte su 144 episodi e il Self-Imitation rinforzava solo poche
-                # traiettorie irriproducibili (instabilità). Con 0.7 si riempie più spesso pur
-                # richiedendo episodi "buoni", restando monotonicamente non decrescente.
-                if max_dist >= elite_threshold:
-                    n_trans = len(episode_transitions)
-                    for i, t in enumerate(episode_transitions):
-                        is_danger = (termination_reason == "CRASH") and (i >= n_trans - 50)
-                        elite_memory.push(t[0], t[1], t[2], t[3], t[4], expert=0.0 if is_danger else 1.0)
-                    elite_threshold = max(500.0, best_distance * 0.7)  # Soglia monotonicamente crescente
+                    # ── Elite Buffer Injection ──
+                    # Se la distanza supera la soglia (best_distance * 0.7), l'episodio viene clonato
+                    # nell'Elite Buffer per Self-Imitation. Gli ultimi 50 step di un crash sono flaggati
+                    # expert=0.0 per evitare Causal Confusion (imitare azioni pre-schianto).
+                    # NB: moltiplicatore abbassato da 0.9 a 0.7. Con 0.9 un singolo colpo fortunato
+                    # precoce (es. 2793m all'ep2) bloccava la soglia troppo in alto: l'Elite Buffer
+                    # si riempiva ~3 volte su 144 episodi e il Self-Imitation rinforzava solo poche
+                    # traiettorie irriproducibili (instabilità). Con 0.7 si riempie più spesso pur
+                    # richiedendo episodi "buoni", restando monotonicamente non decrescente.
+                    if max_dist >= elite_threshold:
+                        n_trans = len(episode_transitions)
+                        for i, t in enumerate(episode_transitions):
+                            is_danger = (termination_reason == "CRASH") and (i >= n_trans - 50)
+                            elite_memory.push(t[0], t[1], t[2], t[3], t[4], expert=0.0 if is_danger else 1.0)
+                        elite_threshold = max(500.0, best_distance * 0.7)  # Soglia monotonicamente crescente
                 break
 
         # Tempo ufficiale TORCS: sui giri completati usa lastLapTime, sugli altri
@@ -1208,9 +1215,9 @@ def train():
 
             refine_status = ""
             if getattr(agent, 'refine_mode', False):
-                riferimento_rollback = f"{refine_plateau_level:.0f}m" if refine_plateau_level > 0.0 else "none"
+                riferimento_plateau = f"{refine_plateau_level:.0f}m" if refine_plateau_level > 0.0 else "none"
                 refine_status = (f" | Refine: ON (BC={agent.refine_bc_weight:.1f}, "
-                                 f"Critic=OFF, rollback_ref={riferimento_rollback})")
+                                 f"Critic=OFF, plateau_ref={riferimento_plateau})")
             else:
                 refine_status = " | Refine: OFF"
 
@@ -1245,6 +1252,9 @@ def train():
                     refine_collapse_count = 0
                     refine_best_mean = 0.0
                     refine_plateau_level = 0.0
+                    refine_attempts = 0
+                    refine_attempt_plateau_ref = 0.0
+                    refine_attempt_limit_logged = False
                     refine_evals_count = 0
                     refine_good_eval_count = 0
                     recent_eval_window.clear()
@@ -1293,29 +1303,54 @@ def train():
                         refine_evals_no_improve = 0
                     else:
                         refine_evals_no_improve += 1          # tipica ferma → conta verso il plateau
-                    if (refine_evals_no_improve >= REFINE_PLATEAU_EVALS and (episode + 1) >= REFINE_MIN_EP
-                            and refine_attempts < REFINE_MAX_ATTEMPTS):
-                        agent.refine_mode = True
-                        agent.refine_bc_weight = REFINE_BC_WEIGHT
-                        # Riferimento rollback = MEDIANA recente (modo 'buono' del bimodale), non il singolo max stocastico
-                        refine_plateau_level = float(np.median(list(recent_eval_window)))
-                        refine_collapse_count = 0
-                        refine_evals_count = 0
-                        refine_good_eval_count = 0
-                        refine_breakout_logged = False
-                        _rlog(f"  AUTO-REFINEMENT ATTIVA (tentativo {refine_attempts+1}/{REFINE_MAX_ATTEMPTS}): "
-                              f"media recente in plateau a {cur_mean:.0f}m, aggiornamento Critic disattivato, "
-                              f"loss Critic solo diagnostica, peso Behavioral Cloning→{REFINE_BC_WEIGHT}, "
-                              f"riferimento rollback (mediana)={refine_plateau_level:.0f}m "
-                              f"(max recente={max(recent_eval_window):.0f}m)")
+                    if refine_evals_no_improve >= REFINE_PLATEAU_EVALS and (episode + 1) >= REFINE_MIN_EP:
+                        # Riferimento plateau = MEDIANA recente (modo 'buono' del bimodale), non il singolo max stocastico.
+                        candidate_plateau_level = float(np.median(list(recent_eval_window)))
+                        reset_msg = None
+                        if refine_attempt_plateau_ref <= 0.0:
+                            refine_attempt_plateau_ref = candidate_plateau_level
+                        elif candidate_plateau_level > refine_attempt_plateau_ref * REFINE_NEW_PLATEAU_FRAC:
+                            old_plateau_ref = refine_attempt_plateau_ref
+                            refine_attempts = 0
+                            refine_attempt_plateau_ref = candidate_plateau_level
+                            refine_attempt_limit_logged = False
+                            reset_msg = (f"  Nuovo plateau rilevato: riferimento {candidate_plateau_level:.0f}m "
+                                         f"> precedente {old_plateau_ref:.0f}m "
+                                         f"(+{(candidate_plateau_level / old_plateau_ref - 1.0) * 100:.0f}%). "
+                                         "Contatore refinement azzerato per il nuovo regime.")
+
+                        if refine_attempts < REFINE_MAX_ATTEMPTS:
+                            agent.refine_mode = True
+                            agent.refine_bc_weight = REFINE_BC_WEIGHT
+                            refine_plateau_level = candidate_plateau_level
+                            refine_collapse_count = 0
+                            refine_evals_count = 0
+                            refine_good_eval_count = 0
+                            refine_breakout_logged = False
+                            refine_attempt_limit_logged = False
+                            if reset_msg is not None:
+                                _rlog(reset_msg)
+                            _rlog(f"  AUTO-REFINEMENT ATTIVA (tentativo {refine_attempts+1}/{REFINE_MAX_ATTEMPTS} "
+                                  f"sul plateau {refine_attempt_plateau_ref:.0f}m): "
+                                  f"media recente in plateau a {cur_mean:.0f}m, aggiornamento Critic disattivato, "
+                                  f"loss Critic solo diagnostica, peso Behavioral Cloning→{REFINE_BC_WEIGHT}, "
+                                  f"riferimento plateau (mediana)={refine_plateau_level:.0f}m "
+                                  f"(max recente={max(recent_eval_window):.0f}m)")
+                        elif not refine_attempt_limit_logged:
+                            refine_attempt_limit_logged = True
+                            _rlog(f"  AUTO-REFINEMENT non riattivata: limite {REFINE_MAX_ATTEMPTS}/{REFINE_MAX_ATTEMPTS} "
+                                  f"raggiunto per il plateau {refine_attempt_plateau_ref:.0f}m. "
+                                  "Training normale finché non emerge un plateau più alto.")
             elif agent.refine_mode and refine_plateau_level <= 0.0:
-                # --refine: refinement già attiva, ma il riferimento rollback si fissa dopo i primi eval
+                # --refine: refinement già attiva, ma il riferimento plateau si fissa dopo i primi eval
                 # (MEDIANA recente per robustezza), così la rete di sicurezza non usa un valore casuale/fortunato.
                 if len(recent_eval_window) >= 4:
                     refine_plateau_level = float(np.median(list(recent_eval_window)))
+                    if refine_attempt_plateau_ref <= 0.0:
+                        refine_attempt_plateau_ref = refine_plateau_level
                     refine_evals_count = 0
                     refine_good_eval_count = 0
-                    _rlog(f"  refinement: riferimento rollback = {refine_plateau_level:.0f}m "
+                    _rlog(f"  refinement: riferimento plateau = {refine_plateau_level:.0f}m "
                           f"(MEDIANA degli ultimi {len(recent_eval_window)} eval, max={max(recent_eval_window):.0f}m)")
             elif agent.refine_mode:
                 # In REFINEMENT.
@@ -1347,6 +1382,9 @@ def train():
                     refine_collapse_count = 0
                     refine_best_mean = 0.0
                     refine_plateau_level = 0.0
+                    refine_attempts = 0
+                    refine_attempt_plateau_ref = 0.0
+                    refine_attempt_limit_logged = False
                     refine_evals_count = 0
                     refine_good_eval_count = 0
                     recent_eval_window.clear()
@@ -1356,7 +1394,7 @@ def train():
                               "Peso Behavioral Cloning→1.0, aggiornamento Critic riattivato.")
                     else:
                         _rlog(f"  REFINEMENT CONSOLIDATA: {good_eval_count} eval buone consecutive "
-                              f"sopra il riferimento rollback (ultima {eval_dist:.0f}m, riferimento {ref_lvl:.0f}m). "
+                              f"sopra il riferimento plateau (ultima {eval_dist:.0f}m, riferimento {ref_lvl:.0f}m). "
                               "Peso Behavioral Cloning→1.0, aggiornamento Critic riattivato.")
                     if actor_freeze_episodes > 0:
                         _rlog(f"  Rientro in modalità allineamento Critic: "
@@ -1371,6 +1409,8 @@ def train():
                     refine_collapse_count = 0
                 if refine_collapse_count >= 3:
                     ref_lvl = refine_plateau_level
+                    if refine_attempt_plateau_ref <= 0.0:
+                        refine_attempt_plateau_ref = ref_lvl
                     if os.path.exists(det_best_dist_pth):
                         agent.actor.load_state_dict(torch.load(det_best_dist_pth, map_location=agent.device))
                         agent.actor_target.load_state_dict(agent.actor.state_dict())
@@ -1384,9 +1424,14 @@ def train():
                     refine_best_mean = 0.0          # ricomincia a misurare il plateau da capo
                     refine_plateau_level = 0.0
                     _rlog(f"  REFINEMENT collassata (<{int(REFINE_COLLAPSE_FRAC*100)}% di {ref_lvl:.0f}m) "
-                          f"→ ROLLBACK al miglior deterministico (td3_det_best_dist), peso Behavioral Cloning→1.0, aggiornamento Critic riattivato. Tentativi: {refine_attempts}/{REFINE_MAX_ATTEMPTS}")
+                          f"→ ROLLBACK al miglior deterministico (td3_det_best_dist), peso Behavioral Cloning→1.0, "
+                          f"aggiornamento Critic riattivato. Tentativi sul plateau {refine_attempt_plateau_ref:.0f}m: "
+                          f"{refine_attempts}/{REFINE_MAX_ATTEMPTS}")
                 # Timeout del refinement: 40 episodi (8 valutazioni) senza nuovi record.
                 elif refine_evals_count >= 8:
+                    ref_lvl = refine_plateau_level
+                    if refine_attempt_plateau_ref <= 0.0:
+                        refine_attempt_plateau_ref = ref_lvl
                     agent.refine_mode = False
                     agent.refine_bc_weight = 1.0
                     refine_attempts += 1
@@ -1397,7 +1442,9 @@ def train():
                     refine_best_mean = 0.0
                     refine_plateau_level = 0.0
                     _rlog(f"  TIMEOUT REFINEMENT (40 episodi in refinement senza superare il record) "
-                          f"→ Uscita automatica, peso Behavioral Cloning→1.0, aggiornamento Critic riattivato. Tentativi: {refine_attempts}/{REFINE_MAX_ATTEMPTS}")
+                          f"→ Uscita automatica, peso Behavioral Cloning→1.0, aggiornamento Critic riattivato. "
+                          f"Tentativi sul plateau {refine_attempt_plateau_ref:.0f}m: "
+                          f"{refine_attempts}/{REFINE_MAX_ATTEMPTS}")
 
         if stop_requested:
             _control_log(f"[{datetime.now().strftime('%H:%M:%S')}] STOP richiesto durante/ dopo eval: "

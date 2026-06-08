@@ -142,7 +142,18 @@ class Client():
         if d: self.debug= d
         self.S= ServerState()
         self.R= DriverAction()
+        self.missed_packets = 0
         self.setup_connection()
+
+    def _note_missed_packet(self):
+        """Gestisce timeout UDP ripetuti senza bloccare il training all'infinito."""
+        self.missed_packets += 1
+        print('.', end=' ', flush=True)
+        if self.missed_packets >= 5:
+            print("\nServer TORCS non risponde: chiusura socket UDP per uscita controllata.")
+            self.shutdown()
+            return True
+        return False
 
     def setup_connection(self):
         # == Set Up UDP Socket ==
@@ -231,7 +242,7 @@ class Client():
             except (BlockingIOError, socket.error):
                 break
         
-        self.so.setblocking(True)
+        self.so.settimeout(1.0)
 
         if last_packet is not None:
             sockdata = last_packet.decode('utf-8')
@@ -241,7 +252,8 @@ class Client():
                 data, addr = self.so.recvfrom(data_size)
                 sockdata = data.decode('utf-8')
             except socket.error as emsg:
-                print('.', end=' ')
+                if self._note_missed_packet():
+                    return
 
         while True:
             if '***identified***' in sockdata:
@@ -251,7 +263,8 @@ class Client():
                     data, addr = self.so.recvfrom(data_size)
                     sockdata = data.decode('utf-8')
                 except socket.error:
-                    pass
+                    if self._note_missed_packet():
+                        return
                 continue
             elif '***shutdown***' in sockdata:
                 print((("Server has stopped the race on %d. "+
@@ -271,9 +284,11 @@ class Client():
                     data, addr = self.so.recvfrom(data_size)
                     sockdata = data.decode('utf-8')
                 except socket.error:
-                    pass
+                    if self._note_missed_packet():
+                        return
                 continue       # Try again.
             else:
+                self.missed_packets = 0
                 self.S.parse_server_str(sockdata)
                 if self.debug:
                     sys.stderr.write("\x1b[2J\x1b[H") # Clear for steady output.
