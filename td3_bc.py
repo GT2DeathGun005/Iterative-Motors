@@ -1214,8 +1214,19 @@ def train():
                     with open(log_file, 'a', encoding='utf-8') as f: f.write(msg + "\n")
 
             # ── AUTO-REFINEMENT: macchina a stati (plateau → refine; collasso → rollback) ──
-            recent_eval_window.append(eval_dist)
-            if auto_refine_enabled and not agent.refine_mode and not getattr(agent, 'actor_frozen', False):
+            # Le valutazioni fatte con Actor congelato servono solo a monitorare la policy corrente:
+            # non devono alimentare il rilevamento plateau, altrimenti il trigger può partire subito
+            # dopo lo scongelamento usando episodi raccolti mentre l'Actor non poteva migliorare.
+            actor_is_frozen = getattr(agent, 'actor_frozen', False)
+            if actor_is_frozen and not agent.refine_mode:
+                refine_evals_no_improve = 0
+                refine_best_mean = 0.0
+                recent_eval_window.clear()
+                _rlog("  🧊 Auto-refinement sospesa: Actor congelato; eval ignorato per il plateau.")
+            else:
+                recent_eval_window.append(eval_dist)
+
+            if auto_refine_enabled and not agent.refine_mode and not actor_is_frozen:
                 # Rilevamento PLATEAU su STATISTICA (non sul singolo best, robusto ai colpi di
                 # fortuna): la MEDIA della finestra recente smette di salire. Serve la finestra piena.
                 if len(recent_eval_window) >= REFINE_WINDOW:
