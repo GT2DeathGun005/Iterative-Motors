@@ -979,6 +979,8 @@ def train():
         # Rilevamento robusto del completamento giro: confrontiamo lastLapTime
         # con il valore iniziale invece di assumere che il relaunch lo azzeri.
         prev_last_lap = float(np.array(ob.get('lastLapTime', 0.0)).flat[0])
+        torcs_lap_time = float(np.array(ob.get('curLapTime', 0.0)).flat[0])
+        completed_lap_time = None
 
         while True:
             # NB: niente actor.eval()/train() qui — sarebbe un no-op fuorviante (nessun dropout;
@@ -1012,11 +1014,13 @@ def train():
 
             current_dist = float(np.array(next_ob.get('distRaced', 0.0)).flat[0])
             last_lap_time = float(np.array(next_ob.get('lastLapTime', 0.0)).flat[0])
+            torcs_lap_time = float(np.array(next_ob.get('curLapTime', 0.0)).flat[0])
             max_dist = max(max_dist, current_dist)
 
             done = False
             if last_lap_time > 0.0 and abs(last_lap_time - prev_last_lap) > 0.01 and step > 500:
                 done, termination_reason = True, "SUCCESS"
+                completed_lap_time = last_lap_time
                 reward += 50.0
                 if last_lap_time < best_lap_time:
                     best_lap_time = last_lap_time
@@ -1072,7 +1076,10 @@ def train():
                     elite_threshold = max(500.0, best_distance * 0.7)  # Soglia monotonicamente crescente
                 break
 
-        lap_time = step * 0.02
+        # Tempo ufficiale TORCS: sui giri completati usa lastLapTime, sugli altri
+        # episodi usa curLapTime. Non derivarlo da step*0.02: il passo del server
+        # non è una garanzia affidabile del tempo gara.
+        lap_time = completed_lap_time if completed_lap_time is not None else torcs_lap_time
         time_str = datetime.now().strftime("%H:%M:%S")
         avg_critic_loss = np.mean(critic_losses) if len(critic_losses) > 0 else 0.0
         avg_actor_loss = np.mean(actor_losses) if len(actor_losses) > 0 else 0.0
@@ -1085,7 +1092,7 @@ def train():
             actor_status = "ON"
         log_msg = (f"[{time_str}] Ep {episode+1:03d} | [{termination_reason}] | "
                    f"Reward: {episode_reward:7.1f} | Steps: {step:4d} | "
-                   f"Time: {lap_time:5.1f}s | Dist: {int(max_dist):5d}m | "
+                   f"LapTime: {lap_time:5.1f}s | Dist: {int(max_dist):5d}m | "
                    f"CriticL: {avg_critic_loss:.3f} ({critic_status}) | "
                    f"ActorL: {avg_actor_loss:.3f} ({actor_status})")
         if new_record: log_msg += f" | Record"

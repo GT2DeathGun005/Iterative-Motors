@@ -203,6 +203,8 @@ SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_det_best_dis
 
 Durante il training RL, il log stampa metriche fondamentali per diagnosticare la salute dell'addestramento. Ecco i valori corretti da aspettarsi:
 
+Il campo `LapTime` arriva dalla telemetria TORCS: `lastLapTime` quando l'episodio chiude un giro valido (`[SUCCESS]`), `curLapTime` negli altri casi. Non è derivato da `Steps * 0.02`, perché il passo del server non è una garanzia affidabile del tempo gara.
+
 ### 1. Loss del Critic
 * **Cos'è:** Misura l'errore (MSE) del Critic nel prevedere le reward future.
 * **Valori Sani:** Grazie al *Reward Scaling* implementato, i valori ottimali oscillano **tra `0.01` e `5.0`** (con occasionali picchi isolati a `10-20` quando la macchina scopre porzioni di pista inedite).
