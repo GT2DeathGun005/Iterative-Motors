@@ -11,6 +11,10 @@
 #    ./train_rl.sh --clean              # Riparte da zero (cancella checkpoint TD3)
 #    ./train_rl.sh --rollback           # Rollback alla migliore policy DETERMINISTICA (det_best_lap →
 #                                       #   det_best_dist → det_best_dist_run) e congela l'Actor per 30 ep (recupero)
+#    ./train_rl.sh --rollback --actor-freeze-episodes 100
+#                                       # Rollback con congelamento Actor piu' lungo: utile se il Critic
+#                                       #   deve recuperare dopo checkpoint corrotto o dati expert nuovi
+#    ./train_rl.sh --no-auto-refine     # Training normale, ma senza attivazione automatica della refinement
 #    ./train_rl.sh --refine             # Avvia in refinement: aggiornamento del Critic disattivato,
 #                                       #   loss Critic solo diagnostica e peso Behavioral Cloning
 #                                       #   ridotto; usare in resume quando il training è già in

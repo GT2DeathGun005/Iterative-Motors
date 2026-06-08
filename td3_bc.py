@@ -717,7 +717,7 @@ class TD3BCAgent:
                 try:
                     with open(log_file, 'r', encoding='utf-8') as f:
                         for line in f:
-                            match = re.search(r'\b(?:Episode|Episodio)\s+(\d+)', line)
+                            match = re.search(r'\b(?:Episode|Episodio|Ep)\s+(\d+)', line)
                             if match:
                                 ep_num = int(match.group(1))
                                 last_ep = max(last_ep, ep_num)
@@ -762,10 +762,20 @@ def train():
     parser.add_argument('--episodes', type=int, default=1000)
     parser.add_argument('--max_steps', type=int, default=5000)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--rollback', action='store_true', help="Forza il rollback dell'Actor alla migliore policy deterministica e lo congela per 30 episodi")
+    parser.add_argument('--rollback', action='store_true', help="Forza il rollback dell'Actor alla migliore policy deterministica e lo congela temporaneamente")
+    parser.add_argument('--actor-freeze-episodes', '--actor_freeze_episodes', dest='actor_freeze_episodes',
+                        type=int, default=30,
+                        help="Numero di episodi di congelamento Actor dopo --rollback (default: 30; aumenta per dare piu' tempo al Critic)")
+    parser.add_argument('--no-auto-refine', '--no_auto_refine', dest='no_auto_refine',
+                        action='store_true',
+                        help="Disattiva solo la refinement automatica da plateau; --refine manuale resta disponibile")
     parser.add_argument('--refine', action='store_true', help="Avvia subito la refinement: aggiornamento del Critic disattivato, loss Critic solo diagnostica, peso Behavioral Cloning ridotto")
     parser.add_argument('--pretrain_critic', action='store_true', help="Esegue il pre-training offline del Critic per 50k passi in caso di emergenza (da usare con --rollback)")
     args = parser.parse_args()
+    if args.actor_freeze_episodes < 0:
+        parser.error("--actor-freeze-episodes deve essere >= 0")
+    actor_freeze_episodes = args.actor_freeze_episodes
+    auto_refine_enabled = not args.no_auto_refine
 
     set_seed(args.seed)
 
@@ -792,10 +802,11 @@ def train():
     agent.actor_frozen = False
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  AUTO-REFINEMENT (Beeson & Montana 2022): dopo un PLATEAU stabile, congela il
-    #  Critic e riduce il vincolo BC per spingere la policy deterministica oltre il muro.
-    #  Conservativo (refine troppo presto → collasso, Ablation 1) + rete di sicurezza:
-    #  se l'eval crolla, rollback automatico al td3_det_best_dist (mai perso su disco).
+    #  AUTO-REFINEMENT (Beeson & Montana 2022): di default, dopo un PLATEAU stabile
+    #  disattiva l'aggiornamento del Critic e riduce il vincolo BC per spingere la
+    #  policy deterministica oltre il muro. Si puo' spegnere con --no-auto-refine
+    #  quando il Critic ha bisogno di recuperare stabilita' dopo rollback/corruzioni.
+    #  --refine resta sempre manuale e immediato.
     # ─────────────────────────────────────────────────────────────────────────
     REFINE_BC_WEIGHT = 0.3         # vincolo BC ridotto durante la refinement
     REFINE_MAX_ATTEMPTS = 3        # oltre, resta in training normale (no loop)
@@ -815,6 +826,10 @@ def train():
         recent_eval_window.append(ev)
     if len(recent_eval_window) > 0:
         print(f"📊 Caricati {len(recent_eval_window)} eval precedenti dal log. Storico: {list(recent_eval_window)}")
+    if auto_refine_enabled:
+        print("🔧 Auto-refinement automatica: attiva di default.")
+    else:
+        print("🧯 Auto-refinement automatica: disattivata da --no-auto-refine. --refine manuale resta disponibile.")
 
     refine_best_mean = 0.0         # miglior MEDIA-finestra vista (segnale di plateau)
     if len(recent_eval_window) >= REFINE_WINDOW:
@@ -883,9 +898,13 @@ def train():
                 import torch.optim as optim
                 agent.actor_optimizer = optim.Adam(
                     [p for p in agent.actor.parameters() if p.requires_grad], lr=3e-4)
-                # Attiviamo il congelamento temporaneo dell'Actor post-rollback
-                agent.actor_frozen = True
-                print("🧊 Actor congelato temporaneamente per stabilizzazione post-rollback.")
+                # Attiviamo il congelamento temporaneo dell'Actor post-rollback, durata configurabile.
+                if actor_freeze_episodes > 0:
+                    agent.actor_frozen = True
+                    print(f"🧊 Actor congelato per {actor_freeze_episodes} episodi: stabilizzazione post-rollback.")
+                else:
+                    agent.actor_frozen = False
+                    print("⚠️ Congelamento Actor post-rollback disattivato (--actor-freeze-episodes 0).")
 
                 # Eseguiamo il pre-training del Critic sui dati offline del buffer (procedura di sicurezza una-tantum, solo con flag dedicato)
                 if getattr(args, 'pretrain_critic', False) and (len(memory) > batch_size or len(expert_memory) > batch_size):
@@ -912,6 +931,15 @@ def train():
                     f"(aggiornamento Critic disattivato, loss Critic solo diagnostica, "
                     f"peso Behavioral Cloning={REFINE_BC_WEIGHT}, riferimento rollback={initial_ref}, "
                     f"episodio iniziale {start_episode})\n")
+    if getattr(args, 'rollback', False):
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"♻️ AVVIO con --rollback: Actor congelato per {actor_freeze_episodes} episodi "
+                    f"(0 = nessun congelamento), auto-refinement automatica="
+                    f"{'attiva' if auto_refine_enabled else 'disattivata'}.\n")
+    elif not auto_refine_enabled:
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write("🧯 AVVIO con --no-auto-refine: refinement automatica disattivata; "
+                    "--refine manuale resta disponibile.\n")
 
     batch_size = 256
     elite_threshold = 500.0
@@ -920,9 +948,10 @@ def train():
 
     for episode in range(start_episode, args.episodes):
         # Gestione dello scongelamento dell'Actor dopo la fase di stabilizzazione post-rollback
-        if agent.actor_frozen and episode >= start_episode + 30:
+        if agent.actor_frozen and episode >= start_episode + actor_freeze_episodes:
             agent.actor_frozen = False
-            print("🔥 Actor scongelato: riavvio aggiornamenti Actor con gradienti del Critic stabilizzati.")
+            print(f"🔥 Actor scongelato dopo {actor_freeze_episodes} episodi: "
+                  f"riavvio aggiornamenti Actor con gradienti del Critic stabilizzati.")
 
         ob = env.reset(relaunch=True)
         episode_transitions = []
@@ -1045,19 +1074,19 @@ def train():
         time_str = datetime.now().strftime("%H:%M:%S")
         avg_critic_loss = np.mean(critic_losses) if len(critic_losses) > 0 else 0.0
         avg_actor_loss = np.mean(actor_losses) if len(actor_losses) > 0 else 0.0
-        critic_update_status = "disattivato (refinement: loss solo diagnostica)" if getattr(agent, 'refine_mode', False) else "attivo"
+        critic_status = "OFF" if getattr(agent, 'refine_mode', False) else "ON"
         if global_step < 15000:
-            actor_update_status = "disattivato (riscaldamento iniziale del Critic)"
+            actor_status = "WARM"
         elif getattr(agent, 'actor_frozen', False):
-            actor_update_status = "disattivato (Actor congelato)"
+            actor_status = "FREEZE"
         else:
-            actor_update_status = "attivo (aggiornamento TD3 ritardato)"
-        log_msg = (f"[{time_str}] Episodio {episode+1:03d} | [{termination_reason}] | "
-                   f"Ricompensa: {episode_reward:7.1f} | Passi: {step:4d} | "
-                   f"Tempo: {lap_time:5.1f}s | Distanza: {int(max_dist):5d}m | "
-                   f"Loss del Critic: {avg_critic_loss:.3f} | Aggiornamento Critic: {critic_update_status} | "
-                   f"Loss dell'Actor: {avg_actor_loss:.3f} | Aggiornamento Actor: {actor_update_status}")
-        if new_record: log_msg += f" | 🏆 NUOVO RECORD"
+            actor_status = "ON"
+        log_msg = (f"[{time_str}] Ep {episode+1:03d} | [{termination_reason}] | "
+                   f"Reward: {episode_reward:7.1f} | Steps: {step:4d} | "
+                   f"Time: {lap_time:5.1f}s | Dist: {int(max_dist):5d}m | "
+                   f"CriticL: {avg_critic_loss:.3f} ({critic_status}) | "
+                   f"ActorL: {avg_actor_loss:.3f} ({actor_status})")
+        if new_record: log_msg += f" | 🏆 Record"
         print(f"🏁 {log_msg}")
 
         with open(log_file, 'a', encoding='utf-8') as f: f.write(log_msg + "\n")
@@ -1121,14 +1150,13 @@ def train():
 
             refine_status = ""
             if getattr(agent, 'refine_mode', False):
-                riferimento_rollback = f"{refine_plateau_level:.0f}m" if refine_plateau_level > 0.0 else "da impostare"
-                refine_status = (f" | Refinement: attiva (peso Behavioral Cloning={agent.refine_bc_weight:.1f}, "
-                                 f"aggiornamento Critic disattivato, loss Critic solo diagnostica, "
-                                 f"riferimento rollback={riferimento_rollback})")
+                riferimento_rollback = f"{refine_plateau_level:.0f}m" if refine_plateau_level > 0.0 else "none"
+                refine_status = (f" | Refine: ON (BC={agent.refine_bc_weight:.1f}, "
+                                 f"Critic=OFF, rollback_ref={riferimento_rollback})")
             else:
-                refine_status = " | Refinement: non attiva"
+                refine_status = " | Refine: OFF"
             
-            eval_msg = f"[{time_str}] 🔍 [EVAL] Risultato: Distanza {int(eval_dist)}m | Ricompensa: {eval_reward:.1f}{refine_status}"
+            eval_msg = f"[{time_str}] 🔍 [EVAL] Result: Dist {int(eval_dist)}m | Reward: {eval_reward:.1f}{refine_status}"
             print(f"  {eval_msg}")
             with open(log_file, 'a', encoding='utf-8') as f: f.write(eval_msg + "\n")
             
@@ -1153,8 +1181,8 @@ def train():
                 if getattr(agent, 'refine_mode', False):
                     agent.refine_mode = False
                     agent.refine_bc_weight = 1.0
-                    agent.actor_frozen = True
-                    start_episode = episode  # Congela l'Actor per i prossimi 30 episodi a partire da ora
+                    agent.actor_frozen = actor_freeze_episodes > 0
+                    start_episode = episode  # Congela l'Actor per la finestra configurata a partire da ora
                     refine_evals_no_improve = 0
                     refine_collapse_count = 0
                     refine_best_mean = 0.0
@@ -1162,7 +1190,11 @@ def train():
                     refine_evals_count = 0
                     recent_eval_window.clear()
                     _rlog("  🎉 REFINEMENT CONCLUSA CON SUCCESSO! Nuovo record deterministico rilevato.")
-                    _rlog("  🔄 Rientro in modalità allineamento Critic: Actor congelato per 30 episodi.")
+                    if actor_freeze_episodes > 0:
+                        _rlog(f"  🔄 Rientro in modalità allineamento Critic: "
+                              f"Actor congelato per {actor_freeze_episodes} episodi.")
+                    else:
+                        _rlog("  🔄 Rientro in training normale: congelamento Actor disattivato.")
 
             # ── Miglior tempo su giro valido in eval deterministica (candidato submission) ──
             # A differenza di td3_det_best_dist (basato sulla DISTANZA), questo cattura il GIRO VALIDO più
@@ -1181,7 +1213,7 @@ def train():
 
             # ── AUTO-REFINEMENT: macchina a stati (plateau → refine; collasso → rollback) ──
             recent_eval_window.append(eval_dist)
-            if not agent.refine_mode and not getattr(agent, 'actor_frozen', False):
+            if auto_refine_enabled and not agent.refine_mode and not getattr(agent, 'actor_frozen', False):
                 # Rilevamento PLATEAU su STATISTICA (non sul singolo best, robusto ai colpi di
                 # fortuna): la MEDIA della finestra recente smette di salire. Serve la finestra piena.
                 if len(recent_eval_window) >= REFINE_WINDOW:

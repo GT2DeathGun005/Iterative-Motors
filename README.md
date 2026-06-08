@@ -144,6 +144,12 @@ TD3_EPISODES=500 ./train_rl.sh
 # Ripartenza di recupero: carica la migliore policy deterministica e congela l'Actor per 30 episodi
 ./train_rl.sh --rollback
 
+# Recupero conservativo: piu' tempo al Critic e nessuna refinement automatica
+./train_rl.sh --rollback --actor-freeze-episodes 100 --no-auto-refine
+
+# Training normale senza trigger automatico di refinement
+./train_rl.sh --no-auto-refine
+
 # Refinement immediata: aggiornamento del Critic disattivato, loss Critic solo diagnostica, peso Behavioral Cloning ridotto
 ./train_rl.sh --refine
 
@@ -212,7 +218,7 @@ Durante il training RL, il log stampa metriche fondamentali per diagnosticare la
 * **Peso Behavioral Cloning costante = 1.0:** $\lambda$ resta **fisso a `2.5`** (normalizzazione di Fujimoto & Gu, 2021) e il peso della penalità imitativa è **costante** — niente decay. La loss è esattamente quella del TD3+BC originale ($-\lambda Q + (\pi-a)^2$). Un decay del vincolo nella fase fragile causava "troppo RL troppo presto" → collasso (Beeson & Montana 2022, Ablation 1). L'ancora umana è inoltre **garantita in ogni batch** dal buffer expert separato (quota 25%).
 
 ### 4. Refinement (`--refine`)
-La refinement è una fase separata per plateau stabili: il peso Behavioral Cloning scende a `0.3` e l'aggiornamento del Critic viene disattivato. Parte automaticamente dopo plateau statistico, oppure subito con `./train_rl.sh --refine`; il log usa `riferimento rollback=...` per indicare la soglia della rete di sicurezza, non un target da inseguire.
+La refinement è una fase separata per plateau stabili: il peso Behavioral Cloning scende a `0.3` e l'aggiornamento del Critic viene disattivato. Il trigger automatico è attivo di default dopo plateau statistico, ma può essere disattivato con `./train_rl.sh --no-auto-refine` quando il Critic deve recuperare stabilità dopo rollback, checkpoint corrotto o nuovi dati expert. `./train_rl.sh --refine` resta il comando manuale per avviarla subito; il log usa `riferimento rollback=...` per indicare la soglia della rete di sicurezza, non un target da inseguire.
 
 ---
 
