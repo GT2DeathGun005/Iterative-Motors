@@ -143,7 +143,8 @@ def load_dataset(path: str) -> Dataset:
         return ds, len(ds)
 class PolicyNetwork(nn.Module):
     """Rete Actor per Behavioral Cloning con architettura Multi-Head:
-    stato (29D) → testa continua (steer, accel, brake) & testa discreta (gear).
+    input stacked 87D (3 frame da stato base 29D) → testa continua
+    (steer, accel, brake) & testa discreta (gear).
 
     Il backbone estrae feature condivise. Le due teste separate evitano
     le oscillazioni e i ritardi tipici della regressione sul cambio marcia.
