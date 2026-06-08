@@ -94,7 +94,7 @@ Il BC minimizza l'errore **medio** ed è **cieco alla posizione** (lo stato è 2
 
 La soluzione è separare le sorgenti dati per i due stadi:
 - **BC** carica **solo i giri interi** (`lap_[0-9]*.h5`) → distribuzione bilanciata dell'intera pista, nessuno sbilanciamento da segmenti.
-- **RL expert buffer** carica **tutto** (`lap_*.h5`, giri + segmenti `lap_seg_*.h5`) → i segmenti mirati rinforzano le curve difficili, ma solo come **25% di anchor** dentro un buffer diversificato, e l'RL ha la *value function* (Critic) per usarli senza imitare ciecamente.
+- **RL expert buffer** carica **tutto** (`lap_*.h5`, giri + segmenti `lap_seg_*.h5`) → i segmenti mirati rinforzano le curve difficili dentro un buffer diversificato. La quota **25% Expert** è applicata dopo, nel sampling di ogni minibatch TD3+BC, e l'RL ha la *value function* (Critic) per usare quei dati senza imitarli ciecamente.
 
 La distinzione è automatica via convenzione di naming (il glob `lap_[0-9]*.h5` esclude i `lap_seg_*.h5`): raccogliere nuovi segmenti mirati con `data_collection.py --segment_only` li indirizza da solo al solo RL, senza rischio di avvelenare il BC.
 
@@ -196,7 +196,7 @@ La marcia **non** è più predetta dalla rete (la `gear_head`, congelata durante
 
 - **Anti-hunting by design**: il problema classico degli auto-shifter è che in **staccata** il downshift fa *salire* gli rpm → uno shifter rpm-based crede di dover risalire di marcia → oscilla. Qui il **downshift guarda la VELOCITÀ** (monotòna decrescente in frenata), non gli rpm → il picco di rpm è irrilevante. L'**upshift** scatta solo **se sul gas** (`accel > 0.4`) e con rpm alti: durante la frenata (gas≈0) è bloccato anche se gli rpm superano la soglia.
 - **Isteresi + cooldown**: soglie di upshift > soglie di downshift, più un lockout di alcuni step dopo ogni cambio → zero jitter al confine.
-- **Soglie derivate e validate sui 75 giri umani**: accordo **±1 marcia 99.0%** con la guida umana, **9.7 cambi/1000 step** (umano reale 7.8), **0% rischio fuorigiri** (mai marce troppo basse ad alta velocità). Conferma empirica del design: gli upshift umani avvengono con `accel~1.00` a rpm~19400, i downshift con `brake~1.00`.
+- **Soglie derivate e validate sui 75 giri umani**: accordo **±1 marcia 99.0%** con la guida umana, **9.7 cambi/1000 step** (umano reale 7.8), **0% rischio fuorigiri** (mai marce troppo basse ad alta velocità). Conferma empirica del design: gli upshift umani avvengono con `accel~1.00` a rpm~19400, i downshift con `brake~1.00`. Validazione live separata sulla policy RL: circa **10.5 cambi/1000 step**, senza oscillazioni rapide.
 
 ## 18. Auto-Refinement (Relaxed Policy Constraint a Plateau, Beeson & Montana 2022)
 Quando la policy deterministica si **stabilizza in un plateau** sotto il giro completo (tipico: il muro di una curva difficile), il vincolo BC che la àncora ai dati umani diventa un freno. Il *Relaxed Policy Constraint* (Paper 2) lo allenta in una **fase separata** per spingere oltre. Qui è automatizzato con una macchina a stati nel loop di training (`td3_bc.py`):

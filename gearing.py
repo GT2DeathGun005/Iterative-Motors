@@ -18,6 +18,7 @@ Soglie DERIVATE e VALIDATE sui 75 giri umani (train_set/laps):
   - accordo ±1 marcia con la guida umana: 99.3%
   - cambi marcia: 9.7 ogni 1000 step (umano reale 7.8; policy rotta 322)
   - upshift umano: accel~1.00, rpm~19400 | downshift umano: brake~1.00 (conferma il design)
+Validazione live separata sulla policy RL: ~10.5 cambi ogni 1000 step, senza oscillazioni rapide.
 """
 
 # Soglie di velocità (km/h) per salire di marcia: g1→2, g2→3, g3→4, g4→5, g5→6.

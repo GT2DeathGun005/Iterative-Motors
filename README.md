@@ -18,7 +18,7 @@ Questa fase RL sfrutta il **Warm-Start** dal BC e segue il **TD3+BC minimalista*
 3. **Determinismo della Policy**: la policy di inferenza è deterministica (output `tanh(mean)` senza rumore, `LayerNorm` indipendente dal batch, nessun dropout). L'**ambiente** TORCS, comunicando via UDP real-time con relaunch ad ogni episodio, è *near-deterministico* (stessa griglia di partenza, ma soggetto a jitter di timing): la riproducibilità è alta ma **non bit-esatta**.
 
 ### Stato locale verificato (2026-06-08)
-- Miglior checkpoint deterministico per distanza: `td3_det_best_dist.pth` (~3289m, preservato anche dopo `--clean`).
+- Miglior checkpoint deterministico per distanza: `td3_det_best_dist.pth` (~3290m, preservato anche dopo `--clean`).
 - Giro valido deterministico: non ancora presente (`td3_det_best_lap.pth` verrà creato al primo giro valido in eval).
 - Giro completo esplorativo: già osservato (`td3_expl_best_lap.pth`, solo riferimento non deterministico).
 
@@ -257,7 +257,7 @@ Actor (Warm-Start da BC)                    Critic (Twin Q-Network, da zero)
 
 **Training dell'Actor:** come nel TD3+BC originale, il TD3 allena **tutto l'Actor** (backbone + `continuous_head`) con LR=`3e-4`. La `gear_head` resta congelata ed è ormai **inutilizzata** (la marcia è calcolata dalla logica deterministica `gearing.py`, non più dalla rete); la `log_std_head` è legacy (retro-compatibilità). L'ancora Behavioral Cloning costante (`bc_weight=1.0` nel codice) previene il *Latent Shift* del backbone.
 
-> **Marcia deterministica (`gearing.py`)**: la marcia non è predetta dalla rete ma da una funzione velocità-primaria anti-hunting (downshift sulla velocità, upshift solo sul gas+rpm), validata sui giri umani (±1 marcia 99%, ~9.7 cambi/1000 step vs 322 della testa appresa). Identica in training/eval/test. Vedi ARCHITECTURE §17.
+> **Marcia deterministica (`gearing.py`)**: la marcia non è predetta dalla rete ma da una funzione velocità-primaria anti-hunting (downshift sulla velocità, upshift solo sul gas+rpm). Validazione offline sui giri umani: ±1 marcia 99%, ~9.7 cambi/1000 step vs 322 della testa appresa; validazione live sulla policy RL: ~10.5 cambi/1000 step, senza oscillazioni rapide. Identica in training/eval/test. Vedi ARCHITECTURE §17.
 
 **Critic Warm-Up (15.000 step):** I primi 15.000 step aggiornano solo il Critic. Questo protegge i pesi BC dai gradienti randomici di un Critic non ancora calibrato.
 
@@ -338,7 +338,7 @@ Le voci più vecchie sono cronologia tecnica: possono citare SAC o nomi checkpoi
 
 **Problema 2 — Falso stallo in test:** `test_agent.py` rilevava uno stallo fasullo a ~550 step. Causa: leggeva la velocità da `next_state[21]*50`, ma `next_state` è ora **normalizzato** (`apply_state_norm`, mean/std) → a velocità sotto-media il valore diventa negativo → `fwd_kmh < 5` fasullo. **Fix:** leggere la velocità dall'obs grezzo `next_obs['speedX']*50`. *(Bug presente solo nel test, non nel training.)*
 
-**Problema 3 — Segmenti concentrati avvelenano il BC:** Aggiungendo 18 segmenti della sola Corkscrew al dataset BC, gli eval di warm-up sono crollati da ~400-818m a ~19-188m (l'agente usciva di pista già a curva 1). **Root cause:** il BC è cieco alla posizione (29D, no `distFromStart`) e minimizza l'errore medio → la sterzata pesante di una curva concentrata "trabocca" su stati simili altrove. **Fix — Split dati BC/RL** (ARCHITECTURE §7, Livello 3): il BC carica solo i **giri interi** (`lap_[0-9]*.h5`, distribuzione bilanciata), l'**RL expert buffer** carica anche i **segmenti** (`lap_seg_*.h5`, come 25% di anchor con value function). Verificato: BC ri-allenato sui soli giri interi → guida di nuovo bene. *(Escluso anche il mismatch marce manuali/algoritmiche come causa: il BC pulito + `compute_gear` guida bene da subito → covariate shift tollerabile.)*
+**Problema 3 — Segmenti concentrati avvelenano il BC:** Aggiungendo 18 segmenti della sola Corkscrew al dataset BC, gli eval di warm-up sono crollati da ~400-818m a ~19-188m (l'agente usciva di pista già a curva 1). **Root cause:** il BC è cieco alla posizione (29D, no `distFromStart`) e minimizza l'errore medio → la sterzata pesante di una curva concentrata "trabocca" su stati simili altrove. **Fix — Split dati BC/RL** (ARCHITECTURE §7, Livello 3): il BC carica solo i **giri interi** (`lap_[0-9]*.h5`, distribuzione bilanciata), l'**RL expert buffer** carica anche i **segmenti** (`lap_seg_*.h5`). La quota **25% Expert** è applicata durante il sampling del batch TD3+BC, non come quota separata di caricamento dei segmenti. Verificato: BC ri-allenato sui soli giri interi → guida di nuovo bene. *(Escluso anche il mismatch marce manuali/algoritmiche come causa: il BC pulito + `compute_gear` guida bene da subito → covariate shift tollerabile.)*
 
 ### [2026-06-04] Risoluzione OOD BC Bug e Relaxed Policy Constraint
 
@@ -350,6 +350,8 @@ Le voci più vecchie sono cronologia tecnica: possono citare SAC o nomi checkpoi
 1. **Masking Rigoroso**: La BC Penalty è calcolata esclusivamente sui campioni empirici registrati nell'Elite Buffer (dove `expert_mask=1.0`). È azzerata durante le fasi esplorative online, liberando l'Actor.
 2. **Rimozione bc_policy**: Eliminato del tutto il clone congelato dell'Actor (-2.3M parametri in VRAM).
 3. **Relaxed Policy Constraint (Decay Esponenziale)**: Transizione del coefficiente imitativo $\lambda$ da 2.5 a 0.25 su 100k step, ispirato a Beeson & Montana (2022).
+
+**Nota stato attuale:** questa variante con decay è storica ed è stata sostituita dal TD3+BC corrente: `bc_weight=1.0` costante nel training normale, con allentamento solo nella fase separata di refinement (`bc_weight=0.3`, Critic non aggiornato).
 
 ### [2026-06-03] Risoluzione Definitiva del Collasso della Policy (6 Bug Fix)
 
@@ -371,6 +373,8 @@ Le voci più vecchie sono cronologia tecnica: possono citare SAC o nomi checkpoi
 5. **Update Ratio 1:4**: Aggiornamento ogni 4 step per ridurre l'overfitting.
 6. **Bonus Completamento Giro = +50.0**: Segnale esplicito per il Critic.
 7. **Evaluation Periodica Deterministica**: Ogni 25 episodi, checkpoint deterministico riproducibile per il sistema SAC storico.
+
+**Nota stato attuale:** i valori di questa voce descrivono una configurazione superata. Il TD3+BC corrente usa LR `3e-4` per Actor e Critic, `bc_weight=1.0`, aggiornamento Critic 1:1 e Actor ritardato ogni 2 update (`policy_freq=2`).
 
 ### [2026-05-31] Risoluzione del Collasso della Policy (Stall Trap & Q-Value Explosion)
 

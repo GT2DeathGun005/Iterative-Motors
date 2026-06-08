@@ -1273,7 +1273,7 @@ def train():
                 breakout_detected = eval_dist > refine_plateau_level * REFINE_BREAKOUT_FRAC
                 if not refine_breakout_logged and breakout_detected:
                     refine_breakout_logged = True
-                    _rlog(f"  PLATEAU SUPERATO: la refinement funziona! eval {eval_dist:.0f}m "
+                    _rlog(f"  PLATEAU SUPERATO: eval {eval_dist:.0f}m "
                           f"> riferimento {refine_plateau_level:.0f}m (+{(eval_dist/refine_plateau_level-1)*100:.0f}%)")
                 # Se il breakout è già vicino al miglior deterministico assoluto, uscire subito
                 # dalla refinement è più sicuro che lasciare il Critic spento: consolidiamo con
