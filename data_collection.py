@@ -8,9 +8,13 @@ Solo i giri validi vengono salvati in file HDF5 separati.
 Loop infinito: registra → valida → salva (se valido) → riavvia → ripeti.
 Interrompere con Ctrl+C. Il giro corrente incompleto NON viene salvato.
 
-Formato output (se il giro è valido e completato):
-    lap_001.h5, lap_002.h5, ...              (un file per giro valido)
+Formato output:
+    lap_001.h5, lap_002.h5, ...              (un file per giro valido completo)
+    lap_seg_001_z01.h5, ...                  (segmenti mirati, solo con --segment_only)
     session_logs/giri/session_YYYYMMDD.log   (log di sessione testuale)
+
+Ogni HDF5 salva stato 29D, azione [steer, accel, brake, gear] e dist_from_start
+come metadato. dist_from_start serve per segmentazione/analisi, non entra nella rete.
 """
 
 import os
@@ -127,7 +131,7 @@ class DualSenseController:
                     print(f"  [Gear] ⬆ Marcia {self.gear}")
                 self._last_shift_time = now
             elif self.joystick.get_button(self.BTN_CROSS):
-                if self.gear > 1:  # Min gear 1 (niente retromarcia nella raccolta dati)
+                if self.gear > 1:  # Min gear 1: la raccolta dati non usa la marcia indietro
                     self.gear -= 1
                     print(f"  [Gear] ⬇ Marcia {self.gear}")
                 self._last_shift_time = now
@@ -276,8 +280,8 @@ def flatten_state(state_dict: dict) -> np.ndarray:
     Ordine: [angle(1), track(19), trackPos(1), speedX(1), speedY(1), speedZ(1),
              wheelSpinVel(4)/100, rpm(1)/10000]
 
-    NOTA: distFromStart è stata rimossa (non informativa per il path following
-    e causa train-test mismatch per le discontinuità del simulatore).
+    NOTA: distFromStart non fa parte dello stato 29D. Viene salvata solo come
+    metadato per analisi/segmentazione, perché la policy deve guidare dai sensori.
 
     Usa .get() con default per evitare crash su chiavi mancanti.
     """
@@ -485,7 +489,7 @@ def main():
     print("=" * 64)
 
     # ── Inizializza l'ambiente ──
-    env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=False)
+    env = TorcsEnv(early_termination=False)
 
     TARGET_DT = 1.0 / 50.0  # 50 Hz target
     lap_attempt = 0

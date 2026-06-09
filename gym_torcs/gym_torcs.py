@@ -1,4 +1,3 @@
-import gym
 from gym import spaces
 import numpy as np
 import snakeoil3_gym as snakeoil3
@@ -15,8 +14,8 @@ def _kill_torcs():
     """Termina le istanze TORCS.
 
     Di DEFAULT uccide *tutti* i processi torcs della macchina (`pkill -9 -f torcs`):
-    è la base del workaround per il memory-leak di TORCS (vedi ARCHITECTURE §5) ed è
-    corretto per il flusso single-instance di training/test.
+    è il workaround operativo contro il memory leak osservato nei run lunghi di TORCS
+    ed è corretto per il flusso single-instance di training/test.
 
     In scenari MULTI-istanza (run paralleli) o MULTI-vettura (video finale) questo
     ucciderebbe anche gli altri TORCS: imposta `TORCS_KILL_ALL=0` per disabilitare il
@@ -34,23 +33,19 @@ class TorcsEnv:
     initial_reset = True
 
 
-    def __init__(self, vision=False, throttle=False, gear_change=False, early_termination=True):
+    def __init__(self, early_termination=True):
         import shutil
         if shutil.which('xvfb-run') is None:
             raise EnvironmentError("xvfb-run non trovato. Installa il pacchetto 'xvfb' per l'esecuzione headless isolata di TORCS.")
-            
-        self.vision = vision
-        self.throttle = throttle
-        self.gear_change = gear_change
+
         self.early_termination = early_termination
 
         self.initial_run = True
 
         _kill_torcs()
         time.sleep(1.5)
-        
-        # Costruisce il comando torcs base
-        torcs_cmd = 'torcs -nofuel -nodamage -vision' if self.vision else 'torcs -nofuel -nodamage'
+
+        torcs_cmd = 'torcs -nofuel -nodamage'
         
         # Se la variabile SHOW_GUI è settata a 1, avvia normalmente. Altrimenti usa Xvfb.
         if os.environ.get('SHOW_GUI', '0') == '1':
@@ -60,19 +55,28 @@ class TorcsEnv:
             os.system(f"{xvfb_cmd} &")
         
         time.sleep(3.0)  # Attende Xvfb/TORCS e la macro di autostart.
-        if throttle is False:
-            self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,))
-        else:
-            self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,))
-
-        if vision is False:
-            high = np.array([1., np.inf, np.inf, np.inf, 1., np.inf, 1., np.inf])
-            low = np.array([0., -np.inf, -np.inf, -np.inf, 0., -np.inf, 0., -np.inf])
-            self.observation_space = spaces.Box(low=low, high=high)
-        else:
-            high = np.array([1., np.inf, np.inf, np.inf, 1., np.inf, 1., np.inf, 255])
-            low = np.array([0., -np.inf, -np.inf, -np.inf, 0., -np.inf, 0., -np.inf, 0])
-            self.observation_space = spaces.Box(low=low, high=high)
+        self.action_space = spaces.Box(
+            low=np.array([-1.0, 0.0, 0.0, 1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0, 1.0, 6.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+        self.observation_space = spaces.Dict({
+            'focus': spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32),
+            'speedX': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
+            'speedY': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
+            'speedZ': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
+            'opponents': spaces.Box(low=-np.inf, high=np.inf, shape=(36,), dtype=np.float32),
+            'rpm': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
+            'track': spaces.Box(low=-np.inf, high=np.inf, shape=(19,), dtype=np.float32),
+            'wheelSpinVel': spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32),
+            'angle': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
+            'trackPos': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
+            'damage': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
+            'curLapTime': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
+            'lastLapTime': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
+            'distFromStart': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
+            'distRaced': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
+        })
 
     def step(self, u):
         # Converte l'azione dell'agente nel formato richiesto dal server TORCS.
@@ -83,39 +87,12 @@ class TorcsEnv:
         # Apply Action
         action_torcs = client.R.d
 
-        # Steering
-        action_torcs['steer'] = this_action['steer']  # in [-1, 1]
+        action_torcs['steer'] = this_action['steer']
+        action_torcs['accel'] = this_action['accel']
+        action_torcs['brake'] = this_action['brake']
+        action_torcs['gear'] = this_action['gear']
 
-        # Controllo automatico minimale di Snakeoil, usato solo se throttle=False.
-        if self.throttle is False:
-            target_speed = self.default_speed
-            if client.S.d['speedX'] < target_speed - (client.R.d['steer']*50):
-                client.R.d['accel'] += .01
-            else:
-                client.R.d['accel'] -= .01
-
-            if client.R.d['accel'] > 0.2:
-                client.R.d['accel'] = 0.2
-
-            if client.S.d['speedX'] < 10:
-                client.R.d['accel'] += 1/(client.S.d['speedX']+.1)
-
-            # Traction Control System
-            if ((client.S.d['wheelSpinVel'][2]+client.S.d['wheelSpinVel'][3]) -
-               (client.S.d['wheelSpinVel'][0]+client.S.d['wheelSpinVel'][1]) > 5):
-                action_torcs['accel'] -= .2
-        else:
-            action_torcs['accel'] = this_action['accel']
-            action_torcs['brake'] = this_action.get('brake', 0.0)
-
-        # Cambio marcia: in AIcar è gestito dall'agente/gearing.py quando gear_change=True.
-        if self.gear_change is True:
-            action_torcs['gear'] = this_action['gear']
-        else:
-            action_torcs['gear'] = 1
-
-
-        # Osservazione precedente: serve a rilevare nuovo danno/muro nel reward.
+        # Snapshot pre-step: serve a rilevare nuovo danno/muro nel reward.
         obs_pre = copy.deepcopy(client.S.d)
 
         # Step fisico: invia l'azione e legge la nuova telemetria dal server.
@@ -187,7 +164,7 @@ class TorcsEnv:
                     episode_terminate = True
                     client.R.d['meta'] = True
 
-            # Spin (Retromarcia)
+            # Spin: auto rivolta nella direzione opposta al senso di marcia.
             if np.cos(obs['angle']) < 0:
                 reward = -10.0
                 info['crash'] = True
@@ -210,7 +187,7 @@ class TorcsEnv:
             self.client.respond_to_server()
 
             if relaunch is True:
-                # Chiudiamo esplicitamente il socket UDP client precedente per evitare conflitti di porta bindata
+                # Chiudiamo esplicitamente il socket UDP aperto prima del relaunch.
                 if hasattr(self, 'client') and self.client is not None:
                     try:
                         self.client.so.close()
@@ -219,7 +196,7 @@ class TorcsEnv:
                 self.reset_torcs()
                 print("### TORCS is RELAUNCHED ###")
 
-        self.client = snakeoil3.Client(p=3001, vision=self.vision)  # Socket UDP SCR standard.
+        self.client = snakeoil3.Client(p=3001, vision=False)  # Socket UDP SCR standard.
         self.client.MAX_STEPS = np.inf
 
         client = self.client
@@ -244,7 +221,7 @@ class TorcsEnv:
         _kill_torcs()
         time.sleep(1.5)  # Garantisce che il sistema operativo liberi la porta UDP
         
-        torcs_cmd = 'torcs -nofuel -nodamage -vision' if self.vision else 'torcs -nofuel -nodamage'
+        torcs_cmd = 'torcs -nofuel -nodamage'
         
         # Se la variabile SHOW_GUI è settata a 1, avvia normalmente. Altrimenti usa Xvfb.
         if os.environ.get('SHOW_GUI', '0') == '1':
@@ -256,30 +233,17 @@ class TorcsEnv:
         time.sleep(3.0)  # Tempo combinato per avvio e macro
 
     def agent_to_torcs(self, u):
-        torcs_action = {'steer': u[0]}
-
-        if self.throttle is True:
-            torcs_action.update({'accel': u[1]})
-            torcs_action.update({'brake': u[2]})
-
-        if self.gear_change is True:
-            torcs_action.update({'gear': int(u[3])})
-
-        return torcs_action
-
-
-    def obs_vision_to_image_rgb(self, obs_image_vec):
-        image_vec =  obs_image_vec
-        rgb = []
-        temp = []
-        # Converte il vettore immagine 64x64x3 in righe RGB, formato Gym-like.
-        for i in range(0,12286,3):
-            temp.append(image_vec[i])
-            temp.append(image_vec[i+1])
-            temp.append(image_vec[i+2])
-            rgb.append(temp)
-            temp = []
-        return np.array(rgb, dtype=np.uint8)
+        action = np.asarray(u, dtype=np.float32).flatten()
+        if action.shape[0] != 4:
+            raise ValueError(
+                f"TorcsEnv.step richiede azioni [steer, accel, brake, gear], ricevuta shape {action.shape}."
+            )
+        return {
+            'steer': float(action[0]),
+            'accel': float(action[1]),
+            'brake': float(action[2]),
+            'gear': int(round(float(action[3]))),
+        }
 
     def make_observaton(self, raw_obs):
         obs_dict = {
@@ -300,10 +264,5 @@ class TorcsEnv:
             'distFromStart': np.array(raw_obs.get('distFromStart', 0.0), dtype=np.float32),
             'distRaced': np.array(raw_obs.get('distRaced', 0.0), dtype=np.float32),
         }
-
-        if self.vision is True:
-            # Converte la visione grezza in RGB solo se vision=True.
-            image_rgb = self.obs_vision_to_image_rgb(raw_obs['img'])
-            obs_dict['img'] = image_rgb
 
         return obs_dict

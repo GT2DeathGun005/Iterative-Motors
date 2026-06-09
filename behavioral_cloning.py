@@ -1,10 +1,10 @@
 """
 Behavioral Cloning (Imitation Learning) — TORCS Giro Secco
 
-Addestra una PolicyNetwork Multi-Head sulle dimostrazioni umane (HDF5).
+Addestra una PolicyNetwork continua sulle dimostrazioni umane (HDF5).
 
 Features:
-  - Supporto multi-file: accetta sia un singolo .h5 sia una directory di lap_*.h5 (solo giri completi)
+  - Supporto multi-file: accetta sia un singolo .h5 sia una directory di lap_[0-9]*.h5 (solo giri completi)
   - Device CPU/CUDA coerente in tutta la pipeline
   - Validation split (80/20) con Early Stopping per evitare overfitting
   - Cosine LR scheduler per convergenza dolce
@@ -25,7 +25,7 @@ Mapping delle azioni (diretto, senza ri-mappatura):
   [0] steering  [-1, 1]  → Tanh output
   [1] accel     [0, 1]   → Sigmoid output
   [2] brake     [0, 1]   → Sigmoid output
-  [3] gear      {0..6}   → CrossEntropy (7 classi)
+  [3] gear      {0..6}   → registrata nel dataset, non predetta dalla rete
 """
 
 import os
@@ -53,7 +53,7 @@ class TorcsHDF5Dataset(Dataset):
     Esegue sanity check all'inizializzazione:
       - Verifica presenza dei gruppi richiesti
       - Verifica assenza di NaN e Inf
-      - Clamp del gear a [0, 6] (esclude retromarcia)
+      - Clamp della marcia registrata a [0, 6] (metadato azione, non target rete)
     """
 
     def __init__(self, file_path: str):
@@ -83,7 +83,8 @@ class TorcsHDF5Dataset(Dataset):
             if np.any(np.isinf(actions_np)):
                 raise ValueError(f"Inf rilevati in 'actions' di {file_path}")
 
-            # ── Clamp gear a [0, 6] (esclude retromarcia -1) ──
+            # La marcia resta nel vettore azione HDF5 per telemetria/coerenza dataset.
+            # Il BC addestra solo i primi tre canali: steer, accel, brake.
             actions_np[:, 3] = np.clip(actions_np[:, 3], 0.0, 6.0)
 
             self.states = torch.tensor(states_np, dtype=torch.float32)
@@ -108,13 +109,13 @@ class TorcsHDF5Dataset(Dataset):
 
 
 def load_dataset(path: str) -> Dataset:
-    """Carica e aggrega l'intero manifold di giri per migliorare la robustezza."""
+    """Carica e aggrega tutti i giri interi disponibili per migliorare la robustezza."""
     if os.path.isdir(path):
         # SOLO giri interi (lap_<numero>.h5). I segmenti di curva (lap_seg_*.h5) sono ESCLUSI dal
         # BC: una distribuzione concentrata su poche curve sbilancia il BC (che minimizza l'errore
         # medio ed è cieco alla posizione → la sterzata di una curva "trabocca" su stati simili
-        # altrove). I segmenti vengono usati SOLO dall'expert buffer dell'RL (che ha la value
-        # function ed è robusto). Vedi ARCHITECTURE §7.
+        # altrove). I segmenti vengono usati SOLO dall'expert buffer del TD3+BC, dove il Critic
+        # valuta la transizione invece di trasformarla in un target supervisionato globale.
         h5_files = sorted(glob.glob(os.path.join(path, "**/lap_[0-9]*.h5"), recursive=True))
 
         if not h5_files:
@@ -142,15 +143,12 @@ def load_dataset(path: str) -> Dataset:
         ds = TorcsHDF5Dataset(path)
         return ds, len(ds)
 class PolicyNetwork(nn.Module):
-    """Rete Actor per Behavioral Cloning con architettura Multi-Head:
+    """Rete Actor per Behavioral Cloning:
     input stacked 87D (3 frame da stato base 29D) → testa continua
-    (steer, accel, brake) & testa discreta (gear).
+    (steer, accel, brake).
 
-    Il backbone estrae feature condivise. Le due teste separate evitano
-    le oscillazioni e i ritardi tipici della regressione sul cambio marcia.
-
-    NOTA: distFromStart è stata rimossa dal vettore di stato (30D → 29D)
-    perché ha correlazione ~0 con le azioni e causa train-test mismatch.
+    NOTA: distFromStart resta fuori dal vettore di stato. È un metadato utile per
+    analisi/segmentazione, ma non per la policy sensoriale 29D.
     """
 
     def __init__(self, state_dim: int = 87, hidden_size: int = 512):
@@ -176,9 +174,6 @@ class PolicyNetwork(nn.Module):
 
         # Testa continua per: steer (1), accel (1), brake (1)
         self.continuous_head = nn.Linear(hidden_size, 3)
-        
-        # Testa discreta per la marcia (7 classi: 0, 1, 2, 3, 4, 5, 6)
-        self.gear_head = nn.Linear(hidden_size, 7)
 
     def forward(self, state: torch.Tensor):
         features = self.backbone(state)
@@ -190,10 +185,8 @@ class PolicyNetwork(nn.Module):
         accel_brake = torch.sigmoid(cont_out[:, 1:3])   # [0, 1]
         
         continuous = torch.cat([steer, accel_brake], dim=1) # 3D: [steer, accel, brake]
-        
-        gear_logits = self.gear_head(features)          # 7D logits
-        
-        return continuous, gear_logits
+
+        return continuous
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -201,11 +194,10 @@ class PolicyNetwork(nn.Module):
 # ──────────────────────────────────────────────────────────────────────
 
 class BehaviorCloningTrainer:
-    """Addestra la PolicyNetwork con Loss combinata MSE + CrossEntropy.
+    """Addestra la PolicyNetwork con loss continua pesata.
 
     Features:
       - Loss continua pesata per sterzo, acceleratore e freno (5x freno)
-      - Classificazione discreta con CrossEntropy per la marcia (gear)
       - Validation split 80/20 con Early Stopping (patience=30)
       - Cosine Annealing LR scheduler
       - Data augmentation con rumore gaussiano strutturato sugli stati
@@ -257,11 +249,10 @@ class BehaviorCloningTrainer:
 
         print(f"  Dataset split: {train_size} train / {val_size} val")
 
-    def _combined_loss(self, pred_continuous, pred_gear_logits, target_actions):
+    def _combined_loss(self, pred_continuous, target_actions):
         # target_actions ha dimensione: [batch_size, 4]
-        # [0] steer, [1] accel, [2] brake, [3] gear (float)
+        # [0] steer, [1] accel, [2] brake. [3] gear resta nel dataset, ma non è predetta.
 
-        # 1. Loss Continua (Weighted MSE)
         targets_cont = target_actions[:, 0:3]
         sq_error = (pred_continuous - targets_cont) ** 2
 
@@ -280,16 +271,7 @@ class BehaviorCloningTrainer:
         weighted_sq = sq_error * channel_weights.unsqueeze(0)
         weighted_sq[:, 0] = weighted_sq[:, 0] * steer_boost
         weighted_sq[:, 2] = weighted_sq[:, 2] * brake_boost
-        cont_ps = weighted_sq.mean(dim=1)  # loss continua per-campione [B]
-
-        # 2. Loss Discreta (CrossEntropy per il Gear), per-campione
-        # Il target della marcia deve essere di tipo Long per CrossEntropy
-        targets_gear = target_actions[:, 3].long()
-        gear_ps = nn.functional.cross_entropy(pred_gear_logits, targets_gear, reduction='none')  # [B]
-
-        # Combinazione bilanciata: la CrossEntropy ha un peso di 2.0 per allinearsi alla scala del MSE
-        per_sample = cont_ps + 2.0 * gear_ps
-        return per_sample.mean()
+        return weighted_sq.mean()
 
     def train_epoch(self) -> float:
         self.model.train()
@@ -309,9 +291,8 @@ class BehaviorCloningTrainer:
             # rete la correzione proporzionale per rientrare in traiettoria.
 
             # --- Perturbazione Laterale (trackPos) ---
-            # ±0.4 copre il 40% della larghezza della pista, simulando errori
-            # realistici che il BC incontrerebbe a test time (prima era ±0.15,
-            # troppo timido per preparare la rete al Corkscrew).
+            # ±0.4 copre il 40% della larghezza pista: abbastanza ampio per insegnare
+            # recuperi realistici quando la policy esce dalla traiettoria umana pulita.
             delta_pos = torch.randn(batch_size, device=states.device) * 0.20
             delta_pos = torch.clamp(delta_pos, -0.40, 0.40)
 
@@ -374,8 +355,8 @@ class BehaviorCloningTrainer:
             targets[:, 0] = targets[:, 0] - 0.25 * delta_pos - 1.5 * delta_angle
             targets[:, 0] = torch.clamp(targets[:, 0], -1.0, 1.0)
             
-            # 5. Correzione parzializzazione throttle (indice 1)
-            # Quando l'auto è fuori posizione, il throttle deve calare proporzionalmente
+            # 5. Correzione parzializzazione acceleratore (indice 1)
+            # Quando l'auto è fuori posizione, l'acceleratore deve calare proporzionalmente
             combined_perturbation = delta_pos.abs() + delta_angle.abs() * 5.0
             targets[:, 1] = targets[:, 1] * (1.0 - 0.15 * combined_perturbation)
             targets[:, 1] = torch.clamp(targets[:, 1], 0.0, 1.0)
@@ -416,8 +397,8 @@ class BehaviorCloningTrainer:
             states = states.view(batch_size, 87)
 
             self.optimizer.zero_grad()
-            pred_cont, pred_gear = self.model(states)
-            loss = self._combined_loss(pred_cont, pred_gear, targets)
+            pred_cont = self.model(states)
+            loss = self._combined_loss(pred_cont, targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
@@ -441,8 +422,8 @@ class BehaviorCloningTrainer:
                 states = (states - self.state_mean) / (self.state_std + 1e-3)
                 states = states.view(states.size(0), 87)
 
-            pred_cont, pred_gear = self.model(states)
-            loss = self._combined_loss(pred_cont, pred_gear, targets)
+            pred_cont = self.model(states)
+            loss = self._combined_loss(pred_cont, targets)
             total_loss += loss.item()
 
         return total_loss / len(self.val_loader)
@@ -509,7 +490,7 @@ class BehaviorCloningTrainer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Behavioral Cloning per agente TORCS (Giro Secco) - Multi-Head"
+        description="Behavioral Cloning per agente TORCS (Giro Secco)"
     )
     parser.add_argument(
         "--dataset", type=str, default="train_set/laps",
@@ -527,7 +508,7 @@ def main():
     # ── Device ──
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n{'=' * 64}")
-    print(f"  BEHAVIORAL CLONING — TORCS Giro Secco (Multi-Head)")
+    print(f"  BEHAVIORAL CLONING — TORCS Giro Secco")
     print(f"  Device: {device}")
     if device == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
@@ -542,7 +523,7 @@ def main():
     # ── Rileva dimensioni ──
     sample_state, _sample_action = dataset[0]
     state_dim = sample_state.shape[0]
-    print(f"  Dimensioni: state={state_dim}, action_dim=4 (steer, accel, brake, gear)")
+    print(f"  Dimensioni: state={state_dim}, action_dim=4 (steer, accel, brake, gear registrata)")
 
     # ── Assicurati che la directory di output esista ──
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
@@ -605,7 +586,7 @@ def main():
 
     trainer.train(max_epochs=args.epochs, checkpoint_path=args.output, patience=100, log_path=log_path)
 
-    print("\n  Addestramento Behavioral Cloning Multi-Head completato.")
+    print("\n  Addestramento Behavioral Cloning completato.")
     print(f"  Pesi salvati in: {args.output}\n")
 
 if __name__ == "__main__":

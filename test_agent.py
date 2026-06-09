@@ -1,27 +1,27 @@
 """
-Test Agent — Guida Autonoma su TORCS (Compatibile BC + TD3)
+Test Agent — Guida Autonoma su TORCS (BC + TD3+BC)
 
-Carica i pesi del modello (BC o TD3) e fa guidare l'agente in modalità
+Carica i pesi del modello (BC o TD3+BC) e fa guidare l'agente in modalità
 rigorosamente deterministica.
 
-La classe BCActor è compatibile con entrambi i formati:
-  - bc_policy.pth  (senza log_std_head) — caricato con strict=False
-  - td3_policy.pth (con log_std_head)   — caricato con strict=True
+La stessa architettura continua viene usata per entrambi i formati:
+  - BC: steer via tanh, accel/brake via sigmoid
+  - TD3+BC: steer/accel/brake via tanh, poi accel/brake rimappati in [0,1]
 
 Priorità di caricamento automatica:
   1. td3_det_best_lap.pth (miglior GIRO VALIDO deterministico: candidato submission)
   2. td3_det_best_dist.pth   (miglior policy ASSOLUTA per distanza; sopravvive a --clean)
-  3. td3_det_best_dist_run.pth   (miglior checkpoint deterministico TD3)
-  4. td3_expl_best_lap.pth    (record sul giro TD3)
-  5. td3_expl_best_dist.pth   (record di distanza TD3)
-  6. td3_policy.pth      (ultimo step TD3)
-  7. bc_policy.pth       (fallback supervisionato)
+  3. td3_det_best_dist_run.pth   (miglior checkpoint deterministico TD3+BC)
+  4. td3_expl_best_lap.pth    (record sul giro TD3+BC)
+  5. td3_expl_best_dist.pth   (record di distanza TD3+BC)
+  6. td3_policy.pth      (ultimo step TD3+BC)
+  7. bc_policy.pth       (ultima priorità: modello supervisionato)
   --weights path      (override esplicito, se fornito)
 
 Determinismo:
   - Determinismo per costruzione (policy evaluate=True senza rumore, gearing/fisica deterministici)
   - model.eval() per disabilitare dropout/batchnorm stocastiche
-  - actor.sample(state, evaluate=True) bypassa il campionamento gaussiano
+  - actor.sample(state, evaluate=True) usa solo tanh(mean)
 
 Uso:
   python test_agent.py --weights train_set/checkpoints/td3_policy.pth
@@ -56,26 +56,20 @@ torch.backends.cudnn.benchmark = False
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  BCActor — Rete compatibile con BC e TD3
+#  PolicyActor — Rete continua BC/TD3+BC
 # ──────────────────────────────────────────────────────────────────────
 
-class BCActor(nn.Module):
-    """Actor ibrido BC-RL con architettura identica all'Actor TD3.
+class PolicyActor(nn.Module):
+    """Actor continuo condiviso da BC e TD3+BC.
 
-    Include log_std_head per compatibilità con vecchi pesi.
-    In modalità evaluate=True (usata per il test), la log_std_head
-    viene completamente ignorata: si usa solo tanh(mean).
+    forward() restituisce l'output BC: Tanh steer, Sigmoid accel/brake.
 
-    forward() restituisce (continuous, gear_logits) con le attivazioni
-    originali del BC (Tanh steer, Sigmoid accel/brake) per compatibilità
-    all'indietro.
-
-    sample(state, evaluate=True) restituisce (tanh_action, None, gear_idx)
-    per l'inferenza deterministica RL-style.
+    sample(state, evaluate=True) restituisce l'output TD3+BC: Tanh su tutti
+    e tre i canali continui.
     """
 
     def __init__(self, state_dim: int = 87, hidden_size: int = 512):
-        super(BCActor, self).__init__()
+        super(PolicyActor, self).__init__()
 
         self.backbone = nn.Sequential(
             nn.Linear(state_dim, hidden_size),
@@ -98,17 +92,8 @@ class BCActor(nn.Module):
         # Testa continua per: steer (1), accel (1), brake (1)
         self.continuous_head = nn.Linear(hidden_size, 3)
 
-        # Testa discreta per la marcia (7 classi: 0, 1, 2, 3, 4, 5, 6)
-        self.gear_head = nn.Linear(hidden_size, 7)
-
-        # Testa log_std per compatibilità pesi RL (ignorata in evaluate mode)
-        self.log_std_head = nn.Linear(hidden_size, 3)
-
     def forward(self, state: torch.Tensor):
-        """Forward compatibile all'indietro col BC: Tanh steer, Sigmoid accel/brake.
-
-        Usato SOLO quando si caricano pesi BC puri (bc_policy.pth).
-        """
+        """Forward BC: Tanh steer, Sigmoid accel/brake."""
         features = self.backbone(state)
 
         cont_out = self.continuous_head(features)
@@ -119,43 +104,13 @@ class BCActor(nn.Module):
 
         continuous = torch.cat([steer, accel_brake], dim=1)  # 3D: [steer, accel, brake]
 
-        gear_logits = self.gear_head(features)
-
-        return continuous, gear_logits
+        return continuous
 
     def sample(self, state: torch.Tensor, evaluate: bool = False):
-        """Campionamento RL-compatible. Con evaluate=True: determinismo assoluto.
-
-        Restituisce (action, log_prob, gear_idx):
-          - evaluate=True:  action = tanh(mean), log_prob = None
-          - evaluate=False: action = tanh(rsample), log_prob calcolato
-
-        In modalità evaluate, la log_std_head e la distribuzione gaussiana
-        vengono completamente bypassate. L'output è deterministico al bit.
-        """
+        """Forward TD3 deterministico: action = tanh(mean)."""
         features = self.backbone(state)
         mean = self.continuous_head(features)
-        gear_logits = self.gear_head(features)
-        gear_idx = torch.argmax(gear_logits, dim=-1)
-
-        if evaluate:
-            # Determinismo assoluto: solo tanh(mean), nessun campionamento
-            action = torch.tanh(mean)
-            return action, None, gear_idx
-
-        # Campionamento stocastico (non usato a test-time)
-        log_std = self.log_std_head(features)
-        log_std = torch.clamp(log_std, min=-20, max=2)
-        std = log_std.exp()
-        from torch.distributions import Normal
-        normal = Normal(mean, std)
-        x_t = normal.rsample()
-        action = torch.tanh(x_t)
-
-        log_prob = normal.log_prob(x_t)
-        log_prob -= torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(1, keepdim=True)
-        return action, log_prob, gear_idx
+        return torch.tanh(mean)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -215,17 +170,16 @@ def flatten_state(state_dict: dict) -> np.ndarray:
         return apply_state_norm(np.zeros(29, dtype=np.float32))
 
 
-def denormalize_action_bc(cont_action: np.ndarray, gear: int) -> np.ndarray:
+def denormalize_action_bc(cont_action: np.ndarray) -> np.ndarray:
     """Converte l'output BC (Tanh steer, Sigmoid accel/brake) nel formato TORCS."""
     env_action = np.zeros(4, dtype=np.float32)
     env_action[0] = np.clip(cont_action[0], -1.0, 1.0)               # steer
     env_action[1] = np.clip(cont_action[1], 0.0, 1.0)                # accel (già Sigmoid)
     env_action[2] = np.clip(cont_action[2], 0.0, 1.0)                # brake (già Sigmoid)
-    env_action[3] = float(max(0, min(6, gear)))                      # gear
     return env_action
 
 
-def denormalize_action_rl(cont_action: np.ndarray, gear: int) -> np.ndarray:
+def denormalize_action_rl(cont_action: np.ndarray) -> np.ndarray:
     """Converte l'output RL (tutto Tanh [-1, 1]) nel formato TORCS.
 
     Mappatura:
@@ -237,7 +191,6 @@ def denormalize_action_rl(cont_action: np.ndarray, gear: int) -> np.ndarray:
     env_action[0] = np.clip(cont_action[0], -1.0, 1.0)               # steer
     env_action[1] = np.clip((cont_action[1] + 1.0) / 2.0, 0.0, 1.0) # accel
     env_action[2] = np.clip((cont_action[2] + 1.0) / 2.0, 0.0, 1.0) # brake
-    env_action[3] = float(max(0, min(6, gear)))                      # gear
     return env_action
 
 
@@ -252,10 +205,10 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
       1. td3_det_best_lap.pth (miglior GIRO VALIDO deterministico: candidato submission)
       2. td3_det_best_dist.pth (miglior policy ASSOLUTA per distanza; sopravvive a --clean)
       3. td3_det_best_dist_run.pth (miglior checkpoint deterministico del run corrente)
-      4. td3_expl_best_lap.pth  (record sul giro TD3)
-      5. td3_expl_best_dist.pth (record di distanza TD3)
-      6. td3_policy.pth    (ultimo step TD3)
-      7. bc_policy.pth     (fallback supervisionato)
+      4. td3_expl_best_lap.pth  (record sul giro TD3+BC)
+      5. td3_expl_best_dist.pth (record di distanza TD3+BC)
+      6. td3_policy.pth    (ultimo step TD3+BC)
+      7. bc_policy.pth     (ultima priorità: modello supervisionato)
 
     Se --weights è specificato, usa quello direttamente.
 
@@ -291,20 +244,20 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
         print(f"  Auto-detect: trovato td3_det_best_dist.pth (Miglior policy ASSOLUTA per distanza, sopravvive ai --clean!)")
     elif os.path.exists(td3_det_best_dist_run_path):
         load_path = td3_det_best_dist_run_path
-        print(f"  Auto-detect: trovato td3_det_best_dist_run.pth (Miglior checkpoint deterministico TD3!)")
+        print(f"  Auto-detect: trovato td3_det_best_dist_run.pth (Miglior checkpoint deterministico TD3+BC!)")
     elif os.path.exists(td3_expl_best_lap_path):
         load_path = td3_expl_best_lap_path
-        print(f"  Auto-detect: trovato td3_expl_best_lap.pth (Record sul giro TD3!)")
+        print(f"  Auto-detect: trovato td3_expl_best_lap.pth (Record sul giro TD3+BC!)")
     elif os.path.exists(td3_expl_best_dist_path):
         load_path = td3_expl_best_dist_path
-        print(f"  Auto-detect: trovato td3_expl_best_dist.pth (Record di distanza TD3!)")
+        print(f"  Auto-detect: trovato td3_expl_best_dist.pth (Record di distanza TD3+BC!)")
     elif os.path.exists(td3_path):
         load_path = td3_path
-        print(f"  Auto-detect: trovato td3_policy.pth (Ultimo step TD3)")
+        print(f"  Auto-detect: trovato td3_policy.pth (Ultimo step TD3+BC)")
 
     elif os.path.exists(bc_path):
         load_path = bc_path
-        print(f"  Auto-detect: fallback su bc_policy.pth")
+        print(f"  Auto-detect: uso bc_policy.pth come ultima priorità supervisionata")
     else:
         print(f"  Nessun file pesi trovato!")
         sys.exit(1)
@@ -314,17 +267,26 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
         sys.exit(1)
 
     try:
-        state_dict = torch.load(load_path, map_location=device, weights_only=True)
+        loaded = torch.load(load_path, map_location=device, weights_only=True)
     except Exception:
-        state_dict = torch.load(load_path, map_location=device, weights_only=False)
+        loaded = torch.load(load_path, map_location=device, weights_only=False)
 
-    # strict=True solo se il file contiene già log_std_head (evita errori sui BC puliti)
-    has_log_std = any('log_std_head' in k for k in state_dict.keys())
-    model.load_state_dict(state_dict, strict=has_log_std)
+    state_dict = loaded.get('actor', loaded) if isinstance(loaded, dict) else loaded
+    if not hasattr(state_dict, 'items'):
+        print(f"  File pesi non adatto all'Actor corrente: {load_path}")
+        sys.exit(1)
+    model_state = model.state_dict()
+    filtered_state = {
+        key: value for key, value in state_dict.items()
+        if key in model_state and hasattr(value, 'shape') and model_state[key].shape == value.shape
+    }
+    if not filtered_state:
+        print(f"  File pesi non adatto all'Actor corrente: {load_path}")
+        sys.exit(1)
+    model.load_state_dict(filtered_state, strict=False)
     model.eval()
 
     # BC vs RL determina la mappatura delle azioni (RL: tanh→[0,1]; BC: sigmoid).
-    # NON si può dedurre dai pesi (sia BC legacy sia Actor TD3 possono avere log_std_head).
     # Override esplicito con --kind {rl,bc}; in 'auto' si usa l'euristica sul nome file.
     if kind == 'rl':
         is_rl = True
@@ -332,16 +294,15 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
         is_rl = False
     else:
         fname = os.path.basename(load_path).lower()
-        if 'td3' in fname or 'sac' in fname:
+        if 'td3' in fname:
             is_rl = True
         elif 'bc' in fname:
             is_rl = False
         else:
-            print("   Tipo pesi non deducibile dal nome file: assumo "
-                  f"{'RL' if has_log_std else 'BC'}. Usa --kind rl|bc per essere esplicito.")
-            is_rl = has_log_std
+            print("   Tipo pesi non deducibile dal nome file. Usa --kind rl|bc per essere esplicito.")
+            sys.exit(1)
 
-    weight_type = "RL (TD3)" if is_rl else "BC"
+    weight_type = "RL (TD3+BC)" if is_rl else "BC"
     print(f"  Pesi [{weight_type}] caricati da: {load_path}")
 
     return model, is_rl
@@ -352,7 +313,7 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
 # ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Test Agent Autonomo (BC/TD3) — TORCS")
+    parser = argparse.ArgumentParser(description="Test Agent Autonomo (BC/TD3+BC) — TORCS")
     parser.add_argument("--weights", type=str, default=None,
                         help="Path ai pesi del modello (.pth). Se omesso, auto-detect.")
     parser.add_argument("--laps", type=int, default=3,
@@ -366,14 +327,14 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"\n{'=' * 64}")
-    print(f"  TEST AGENTE AUTONOMO (BC/TD3) — TORCS")
+    print(f"  TEST AGENTE AUTONOMO (BC/TD3+BC) — TORCS")
     print(f"  Device: {device}")
     print(f"  Stride Type: static (k=6, 0.24s)")
     print(f"  Modalità: DETERMINISTICA (evaluate=True, Zero Noise)")
     print(f"{'=' * 64}\n")
 
     # ── Carica modello con auto-detect ──
-    model = BCActor().to(device)
+    model = PolicyActor().to(device)
     model, is_rl = load_best_weights(model, args.weights, device, kind=args.kind)
 
     # Seleziona la funzione di denormalizzazione corretta
@@ -383,7 +344,7 @@ def main():
 
     # ── Ambiente ──
     print("  Inizializzazione TORCS...")
-    env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=False)
+    env = TorcsEnv(early_termination=False)
 
     lap_times = []
     total_attempts = 0
@@ -396,7 +357,7 @@ def main():
             obs = env.reset(relaunch=True)
             initial_state = flatten_state(obs)
 
-            # Inizializza buffer storico per State Stacking (esattamente 13 elementi: t-12, t-6, t)
+            # Buffer temporale per State Stacking: 13 frame per leggere t-12, t-6 e t.
             state_buffer = deque(maxlen=13)
             for _ in range(13):
                 state_buffer.append(initial_state)
@@ -433,15 +394,13 @@ def main():
                     state_t = torch.FloatTensor(stacked_state).to(device).unsqueeze(0)
 
                     if is_rl:
-                        # RL: usa sample(evaluate=True) per determinismo assoluto
-                        tanh_action, _, gear_idx = model.sample(state_t, evaluate=True)
+                        # TD3: tanh sui tre controlli continui
+                        tanh_action = model.sample(state_t, evaluate=True)
                         cont_action = tanh_action.cpu().numpy()[0]
-                        _raw_gear = int(gear_idx.item())
                     else:
                         # BC: usa forward() con Tanh steer + Sigmoid accel/brake
-                        pred_cont, gear_logits = model(state_t)
+                        pred_cont = model(state_t)
                         cont_action = pred_cont.cpu().numpy()[0]
-                        _raw_gear = int(gear_logits.argmax(dim=1).item())
 
                 # ── Mutual exclusion accel/brake (come l'esperto umano) ──
                 # Per i pesi BC, cont_action[1:3] sono già [0,1] (Sigmoid)
@@ -450,14 +409,14 @@ def main():
                     cont_action[1] = cont_action[1] * (1.0 - cont_action[2])
 
                 # ── Costruzione azione (la marcia viene sovrascritta sotto) ──
-                env_action = denormalize_fn(cont_action, current_gear)
+                env_action = denormalize_fn(cont_action)
 
                 # Mutual exclusion post-denormalize per RL
                 if is_rl:
                     env_action[1] = env_action[1] * (1.0 - env_action[2])
 
                 # ── Marcia DETERMINISTICA (anti-hunting), identica a training/eval (gearing.py) ──
-                # _raw_gear (gear_head congelata) è ignorato. Usa il gas APPLICATO (env_action[1]).
+                # La rete non predice la marcia: gearing.py usa il gas APPLICATO (env_action[1]).
                 current_gear, _shifted = compute_gear(cur_speed_kmh, float(env_action[1]), cur_rpm, current_gear, steps_since_shift)
                 steps_since_shift = 0 if _shifted else steps_since_shift + 1
                 env_action[3] = current_gear

@@ -3,17 +3,13 @@ TD3+BC Fine-Tuning — Twin Delayed DDPG con Behavioral Cloning
 
 Architettura Ibrida BC-RL per TORCS (Offline-to-Online), allineata al TD3+BC minimalista
 (Fujimoto & Gu, 2021):
-  - L'Actor eredita backbone + gear_head dal BC (warm-start). Il TD3 allena TUTTO l'Actor
-    (backbone + continuous_head); resta congelata solo la gear_head (marcia discreta).
+  - L'Actor eredita backbone + continuous_head dal BC (warm-start). TD3+BC allena TUTTO
+    l'Actor; la marcia è calcolata da gearing.py, non dalla rete.
   - Il Critic (Twin Q-Network) è addestrato da zero.
   - Peso Behavioral Cloning COSTANTE = 1.0 → loss = -λ·Q + (π - a)²  (λ = 2.5 / mean|Q|).
   - Normalizzazione stati mean-0/std-1 (state_norm.npz) applicata prima della rete.
   - Buffer EXPERT separato e permanente (anti-FIFO) + sampling 3-vie 25/15/60.
   - Delayed Policy Update (ogni 2 step), Target Policy Smoothing, update ratio 1:1.
-
-Retro-compatibilità:
-  - La 'log_std_head' è mantenuta nell'Actor solo per caricare vecchi checkpoint SAC in
-    'test_agent.py' senza crash; è isolata (requires_grad=False) e inutilizzata nel TD3.
 
 Reward (da corsa, minimalista):
   - progress = (speedX/50.0) * cos(angle) * 1.5 ; pos_penalty deadzone oltre |trackPos|>1.0
@@ -80,7 +76,7 @@ def _backup_paths(filepath):
     return backup_base + ".bak", backup_base + ".prev"
 
 def _rotate_backup(filepath):
-    """Mantiene due copie precedenti in backups/: .bak (ultima valida) e .prev (penultima valida)."""
+    """Mantiene due copie di recupero in backups/: .bak e .prev."""
     if not os.path.exists(filepath):
         return
     backup_path, previous_path = _backup_paths(filepath)
@@ -97,7 +93,7 @@ def _rotate_backup(filepath):
     _fsync_dir(backup_directory)
 
 def _checkpoint_candidates(filepath):
-    """Ordine di recupero: principale, backup ordinati, poi vecchi backup adiacenti legacy."""
+    """Ordine di recupero: principale e backup coerenti."""
     backup_path, previous_path = _backup_paths(filepath)
     candidates = [filepath, backup_path, previous_path, filepath + ".bak", filepath + ".prev"]
     unique_candidates = []
@@ -347,14 +343,10 @@ def flatten_state(state_dict: dict) -> np.ndarray:
 #  Architettura TD3
 # ──────────────────────────────────────────────────────────────────────
 class Actor(nn.Module):
-    """Policy deterministica TD3 con architettura Multi-Head.
+    """Policy deterministica TD3.
 
     Il backbone (4x512 con LayerNorm) estrae feature dallo stato 87D.
     continuous_head: 3 uscite (steer, accel, brake) in [-1,1] via tanh.
-    gear_head: 7 logits per la selezione discreta della marcia.
-    log_std_head: mantenuta SOLO per compatibilità col caricamento di
-                  vecchi checkpoint SAC in test_agent.py. Completamente
-                  isolata (requires_grad=False).
     """
     def __init__(self, state_dim=87, hidden_size=512):
         super(Actor, self).__init__()
@@ -365,23 +357,14 @@ class Actor(nn.Module):
             nn.Linear(hidden_size, hidden_size), nn.LayerNorm(hidden_size), nn.ReLU(),
         )
         self.continuous_head = nn.Linear(hidden_size, 3)  # steer, accel, brake
-        self.gear_head = nn.Linear(hidden_size, 7)        # 7 marce (0-6)
-
-        # Legacy: retro-compatibilità con test_agent.py per vecchi pesi SAC
-        self.log_std_head = nn.Linear(hidden_size, 3)
-        for param in self.log_std_head.parameters():
-            param.requires_grad = False
 
     def forward(self, state):
         features = self.backbone(state)
         mean = self.continuous_head(features)
-        gear_logits = self.gear_head(features)
-        action = torch.tanh(mean)
-        return action, gear_logits
+        return torch.tanh(mean)
 
     def sample(self, state, evaluate=False):
-        action, gear_logits = self.forward(state)
-        gear_idx = torch.argmax(gear_logits, dim=-1)
+        action = self.forward(state)
 
         if not evaluate:
             # TD3: Rumore Gaussiano esplorativo
@@ -389,7 +372,7 @@ class Actor(nn.Module):
             noise = torch.clamp(noise, -0.2, 0.2)
             action = torch.clamp(action + noise, -1.0, 1.0)
 
-        return action, None, gear_idx
+        return action
 
     def load_bc_weights(self, bc_path):
         if not os.path.exists(bc_path): return
@@ -429,7 +412,7 @@ class Critic(nn.Module):
 class TD3BCAgent:
     def __init__(self, device="cuda"):
         self.device = torch.device(device)
-        self.gamma = 0.99   # valore di riferimento TD3+BC (era 0.999: inflazionava i Q di 10× e l'overestimation)
+        self.gamma = 0.99   # orizzonte TD3+BC: ~2s efficaci a 50Hz, stabile per il Critic.
         self.tau = 0.005
         self.policy_freq = 2 # Delayed Policy Update
 
@@ -437,19 +420,15 @@ class TD3BCAgent:
         self.actor_target = Actor().to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
 
-        # Rimuoviamo la vecchia ancora Behavioral Cloning congelata: il target d'imitazione sarà
-        # solo l'azione empirica (expert_mask=1.0) e non la predizione OOD.
+        # La BC penalty usa solo azioni empiriche marcate expert. Gli stati online non
+        # vengono forzati verso una predizione supervisionata fuori distribuzione.
 
         self.critic = Critic().to(self.device)
         self.critic_target = Critic().to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        # Backbone SCONGELATO (TIER 3b): come in TD3+BC originale si allena tutta la rete
-        # dell'Actor. È sicuro perché l'ancora Behavioral Cloning è forte e costante
-        # (peso = 1.0, variabile bc_weight nel codice, niente decay),
-        # e sblocca capacità di apprendimento prima limitata alla sola testa lineare.
-        # Resta congelata solo la gear_head (marcia discreta, ereditata dal BC, non soggetta a RL).
-        for param in self.actor.gear_head.parameters(): param.requires_grad = False
+        # L'Actor è interamente trainabile: backbone e testa continua. L'ancora BC
+        # costante sui campioni expert impedisce drift mentre il Critic raffina la policy.
 
         # LR di riferimento 3e-4 per Actor e Critic. NON si tunara a tentativi: la
         # normalizzazione λ = α/mean|Q| del TD3+BC normalizza già il learning rate
@@ -461,8 +440,8 @@ class TD3BCAgent:
     def select_action(self, state, evaluate=False):
         state_t = torch.FloatTensor(state).to(self.device).unsqueeze(0)
         with torch.no_grad():
-            cont_action, _, gear_idx = self.actor.sample(state_t, evaluate=evaluate)
-        return cont_action.cpu().numpy()[0], gear_idx.cpu().item()
+            cont_action = self.actor.sample(state_t, evaluate=evaluate)
+        return cont_action.cpu().numpy()[0]
 
     def update(self, online_memory, elite_memory, expert_memory, batch_size, global_step):
         # ── Hybrid Sampling a 3 vie: Expert + Online + Elite ──
@@ -510,7 +489,7 @@ class TD3BCAgent:
             # all'azione target per regolarizzare il Critic e impedirgli
             # di sovrastimare picchi stretti nella Q-function.
             noise = (torch.randn_like(action_b) * 0.2).clamp(-0.5, 0.5)
-            next_action, _ = self.actor_target(next_state_b)
+            next_action = self.actor_target(next_state_b)
             next_action = (next_action + noise).clamp(-1.0, 1.0)
 
             q1_next, q2_next = self.critic_target(next_state_b, next_action)
@@ -539,7 +518,7 @@ class TD3BCAgent:
         # Dopo il warm-up, l'Actor viene aggiornato ogni 2 step (policy_freq=2)
         # per dare al Critic il tempo di stabilizzare le sue stime.
         if global_step >= 15000 and global_step % self.policy_freq == 0 and not getattr(self, 'actor_frozen', False):
-            pi, _ = self.actor(state_b)
+            pi = self.actor(state_b)
             q1_pi, _ = self.critic(state_b, pi)
 
             # Componente RL: l'Actor massimizza il Q-Value stimato dal Critic
@@ -579,15 +558,9 @@ class TD3BCAgent:
             Q_abs_mean = q1_pi.abs().mean().detach().clamp(min=1e-5)
             dynamic_alpha = lambda_val / Q_abs_mean
 
-            # ── Peso Behavioral Cloning COSTANTE = 1.0 (niente decay) ──
-            # Questo riproduce ESATTAMENTE la loss del TD3+BC originale:
-            #   L = -λ·Q + (π - a)²  (qui bc_penalty è la nostra MSE pesata).
-            # Il decay precedente (1.0→0.5) indeboliva la BC nella fase fragile post-warm-up
-            # → "troppo RL troppo presto" → collasso (Beeson & Montana 2022, Ablation 1;
-            # Fujimoto & Gu 2021, ablation su α). L'eventuale rilassamento del vincolo va fatto
-            # in una FASE separata dopo il training stabile, con aggiornamento del Critic
-            # disattivato (vedi AUTO-REFINEMENT nel loop di train): lì il peso Behavioral
-            # Cloning scende a refine_bc_weight.
+            # Nel training normale il vincolo BC resta a 1.0: l'Actor massimizza Q senza
+            # perdere il riferimento umano. In refinement il peso scende temporaneamente
+            # e il Critic resta fisso, così l'allentamento avviene solo su plateau.
             bc_weight = self.refine_bc_weight if getattr(self, 'refine_mode', False) else 1.0
 
             total_actor_loss = dynamic_alpha * actor_loss_td3 + (bc_weight * bc_penalty)
@@ -629,9 +602,9 @@ class TD3BCAgent:
         os.makedirs(buffer_dir, exist_ok=True)
         base_name = os.path.basename(filepath).replace('.pth', '')
 
-        # I buffer vengono salvati prima: il checkpoint .pth è il commit marker finale.
-        # Se il processo viene interrotto a metà, il resume userà il checkpoint completo
-        # precedente invece di uno stato neurale più nuovo con buffer ancora vecchi.
+        # I buffer vengono salvati per primi; il checkpoint .pth è il commit finale.
+        # Se l'interruzione avviene a metà, il resume usa l'ultimo commit completo e
+        # scarta eventuali buffer più nuovi non allineati.
         safe_save_npz(memory, os.path.join(buffer_dir, f"{base_name}_buffer.npz"))
         if elite_memory:
             safe_save_npz(elite_memory, os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz"))
@@ -673,7 +646,7 @@ class TD3BCAgent:
                 except Exception as e:
                     print(f"Impossibile caricare {label} da {candidate}: {e}")
 
-            # Fallback estremo: meglio un buffer valido ma segnalato come più nuovo che nessun replay.
+            # Recupero estremo: meglio un buffer valido ma segnalato come più nuovo che nessun replay.
             for candidate in skipped_newer:
                 try:
                     buffer_obj.load(candidate)
@@ -695,8 +668,8 @@ class TD3BCAgent:
                     missing_keys = [k for k in required_keys if k not in checkpoint]
                     if missing_keys:
                         raise KeyError(f"checkpoint incompleto, chiavi mancanti: {missing_keys}")
-                    self.actor.load_state_dict(checkpoint['actor'])
-                    if 'actor_target' in checkpoint: self.actor_target.load_state_dict(checkpoint['actor_target'])
+                    self.actor.load_state_dict(checkpoint['actor'], strict=False)
+                    if 'actor_target' in checkpoint: self.actor_target.load_state_dict(checkpoint['actor_target'], strict=False)
                     self.critic.load_state_dict(checkpoint['critic'])
                     self.critic_target.load_state_dict(checkpoint['critic_target'])
                     self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
@@ -713,7 +686,7 @@ class TD3BCAgent:
                 else:
                     # È un file di soli pesi dell'actor (come td3_expl_best_dist.pth).
                     print(f"{candidate} contiene solo pesi dell'Actor. Inizializzazione degli altri componenti.")
-                    self.actor.load_state_dict(checkpoint)
+                    self.actor.load_state_dict(checkpoint, strict=False)
                     self.actor_target.load_state_dict(self.actor.state_dict())
                     best_lap_time = float('inf')
                     best_eval_dist = 0.0
@@ -757,10 +730,8 @@ class TD3BCAgent:
         if elite_memory:
             _load_buffer_aligned(elite_memory, elite_buffer_path, "Elite Buffer", loaded_checkpoint_path if loaded_ok else None)
 
-        # NB: nessun fallback hardcoded sui record storici. Valori hardcoded (es. 84.3s/3619m
-        # di una run specifica) corrompevano l'Elite Buffer su un resume weights-only:
-        # best_distance alto → elite_threshold = best_distance*0.9 si alza subito e il buffer
-        # non si riempie più (Self-Imitation spento). Su weights-only i record ripartono puliti.
+        # Su checkpoint weights-only i record ripartono puliti: i record validi devono
+        # arrivare dal checkpoint completo o dai sidecar deterministici, non da costanti.
         return episode, global_step, best_lap_time, best_eval_dist, best_distance
 
 def load_recent_evals_from_log(log_path, max_len=8):
@@ -777,7 +748,7 @@ def load_recent_evals_from_log(log_path, max_len=8):
                         except Exception:
                             pass
         except Exception as e:
-            print(f"Impossibile leggere lo storico eval dal log: {e}")
+            print(f"Impossibile leggere gli eval recenti dal log: {e}")
     return evals[-max_len:]
 
 def train():
@@ -803,7 +774,7 @@ def train():
 
     set_seed(args.seed)
 
-    env = TorcsEnv(vision=False, throttle=True, gear_change=True, early_termination=True)
+    env = TorcsEnv(early_termination=True)
     # Buffer ONLINE (FIFO) per l'esperienza dell'agente. 1M transizioni (~0.7 GB RAM):
     # con ~700 step/episodio copre ~1400 episodi senza evizione precoce.
     memory = ReplayBuffer(1000000)
@@ -853,7 +824,7 @@ def train():
     for ev in initial_evals:
         recent_eval_window.append(ev)
     if len(recent_eval_window) > 0:
-        print(f"Caricati {len(recent_eval_window)} eval precedenti dal log. Storico: {list(recent_eval_window)}")
+        print(f"Caricati {len(recent_eval_window)} eval recenti dal log: {list(recent_eval_window)}")
     if auto_refine_enabled:
         print("Auto-refinement automatica: attiva di default.")
     else:
@@ -877,10 +848,9 @@ def train():
         agent.refine_mode = True
         agent.refine_bc_weight = REFINE_BC_WEIGHT
 
-        # Inizializziamo il livello di riferimento per il rollback di sicurezza
-        # usando lo storico appena letto dal log, o il record caricato o td3_det_best_dist.
-        # Se stiamo facendo un rollback, escludiamo lo storico recente (che è degradato)
-        # e usiamo direttamente il best_eval_dist o il file td3_det_best_dist.
+        # Il riferimento plateau usa gli eval recenti del log quando sono affidabili.
+        # Durante un rollback la finestra recente puo' rappresentare una fase degradata,
+        # quindi si usa il miglior record deterministico disponibile.
         if len(recent_eval_window) >= 4 and not getattr(args, 'rollback', False):
             refine_plateau_level = float(np.median(list(recent_eval_window)))
         else:
@@ -912,8 +882,8 @@ def train():
         # "fortunato"). Gli esplorativi (best_lap/best_dist) sono solo un ripiego estremo.
         # ── PROCEDURA DI EMERGENZA (SAFETY-NET) ──
         # Questa procedura scatta SOLO se viene esplicitamente passato il parametro --rollback.
-        # Serve per recuperare da corruzioni del checkpoint principale (Critic degradato o crash)
-        # riallineando il Critic sui dati offline storici prima di riprendere il training normale.
+        # Serve per recuperare da checkpoint o Critic degradati, riallineando il Critic
+        # sui dati expert/online gia' disponibili prima di riprendere il training normale.
         if args.rollback:
             rollback_candidates = [
                 'train_set/checkpoints/td3_det_best_lap.pth',  # 1) giro VALIDO deterministico più veloce
@@ -1034,7 +1004,7 @@ def train():
         while True:
             # NB: niente actor.eval()/train() qui — sarebbe un no-op fuorviante (nessun dropout;
             # il LayerNorm è indipendente dal batch). select_action usa già torch.no_grad().
-            cont_action, _raw_gear = agent.select_action(stacked_state, evaluate=False)
+            cont_action = agent.select_action(stacked_state, evaluate=False)
 
             # Mappatura Action Space: l'Actor emette azioni in [-1,1] (spazio tanh),
             # ma TORCS si aspetta accel/brake in [0,1]. La conversione (x+1)/2
@@ -1049,7 +1019,7 @@ def train():
             torcs_action[1] = torcs_action[1] * (1.0 - torcs_action[2])
 
             # Marcia DETERMINISTICA (anti-hunting): da velocità/rpm correnti + il gas applicato.
-            # _raw_gear (gear_head congelata) è ignorato. Vedi gearing.py.
+            # La rete non predice la marcia: gearing.py è l'unica sorgente del cambio.
             current_gear, _shifted = compute_gear(cur_speed_kmh, torcs_action[1], cur_rpm, current_gear, steps_since_shift)
             steps_since_shift = 0 if _shifted else steps_since_shift + 1
             torcs_action[3] = current_gear
@@ -1183,7 +1153,7 @@ def train():
             while eval_step < args.max_steps:
                 eval_step += 1
                 with torch.no_grad():
-                    eval_action, _eval_gear = agent.select_action(eval_stacked, evaluate=True)
+                    eval_action = agent.select_action(eval_stacked, evaluate=True)
                 eval_env = np.zeros(4)
                 eval_env[0:3] = eval_action
                 eval_env[1], eval_env[2] = np.clip((eval_env[1]+1)/2, 0, 1), np.clip((eval_env[2]+1)/2, 0, 1)
@@ -1240,7 +1210,7 @@ def train():
                 safe_save(agent.actor.state_dict(), det_best_dist_pth)
                 safe_write_text(det_best_dist_txt, f"{eval_dist:.2f}")
                 msg = (f"  NUOVO MIGLIOR DETERMINISTICO ASSOLUTO: {int(eval_dist)}m "
-                       f"(precedente {int(prev_det_best_dist)}m, preservato anche dopo --clean)")
+                       f"(record salvato {int(prev_det_best_dist)}m, preservato anche dopo --clean)")
                 print(msg)
                 with open(log_file, 'a', encoding='utf-8') as f: f.write(msg + "\n")
                 if getattr(agent, 'refine_mode', False):
@@ -1310,13 +1280,13 @@ def train():
                         if refine_attempt_plateau_ref <= 0.0:
                             refine_attempt_plateau_ref = candidate_plateau_level
                         elif candidate_plateau_level > refine_attempt_plateau_ref * REFINE_NEW_PLATEAU_FRAC:
-                            old_plateau_ref = refine_attempt_plateau_ref
+                            previous_plateau_ref = refine_attempt_plateau_ref
                             refine_attempts = 0
                             refine_attempt_plateau_ref = candidate_plateau_level
                             refine_attempt_limit_logged = False
                             reset_msg = (f"  Nuovo plateau rilevato: riferimento {candidate_plateau_level:.0f}m "
-                                         f"> precedente {old_plateau_ref:.0f}m "
-                                         f"(+{(candidate_plateau_level / old_plateau_ref - 1.0) * 100:.0f}%). "
+                                         f"> riferimento attuale {previous_plateau_ref:.0f}m "
+                                         f"(+{(candidate_plateau_level / previous_plateau_ref - 1.0) * 100:.0f}%). "
                                          "Contatore refinement azzerato per il nuovo regime.")
 
                         if refine_attempts < REFINE_MAX_ATTEMPTS:

@@ -18,7 +18,7 @@
 #    ./train_rl.sh --refine             # Avvia in refinement: aggiornamento del Critic disattivato,
 #                                       #   loss Critic solo diagnostica e peso Behavioral Cloning
 #                                       #   ridotto; usare in resume quando il training è già in
-#                                       #   plateau stabile (vedi ARCHITECTURE §18)
+#                                       #   plateau stabile (vedi ARCHITECTURE, sezione Refinement)
 #
 #  Per interrompere il training in sicurezza:
 #    Ctrl+C  oppure  ./stop_training.sh
@@ -73,7 +73,7 @@ for arg in "$@"; do
 done
 
 if [[ "$CLEAN_REQUESTED" == "1" ]]; then
-    log_warn "Flag --clean rilevato: cancellazione checkpoint TD3 precedenti..."
+    log_warn "Flag --clean rilevato: cancellazione checkpoint TD3 esistenti..."
     rm -f \
         "$TD3_CHECKPOINT" "$TD3_CHECKPOINT.bak" "$TD3_CHECKPOINT.prev" \
         "$BACKUP_DIR/td3_checkpoint.pth.bak" "$BACKUP_DIR/td3_checkpoint.pth.prev" \
@@ -95,7 +95,7 @@ if [[ "$CLEAN_REQUESTED" == "1" ]]; then
         "train_set/checkpoints/td3_det_best_dist_run.pth.bak" \
         "train_set/checkpoints/td3_det_best_dist_run.pth.prev" \
         "$BACKUP_DIR/td3_det_best_dist_run.pth.bak" "$BACKUP_DIR/td3_det_best_dist_run.pth.prev"
-    log_ok "Checkpoint TD3 cancellati. Ripartenza pulita."
+    log_ok "Checkpoint TD3+BC cancellati. Ripartenza pulita."
 fi
 
 # Filtra gli argomenti per python (rimuove --clean)
@@ -119,7 +119,7 @@ mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR" "train_set/checkpoints/buffers" "$BACKUP_D
 if [[ -f "$TD3_CHECKPOINT" ]]; then
     log_phase "Ripresa Training (Resume)"
     TD3_SIZE=$(du -h "$TD3_CHECKPOINT" | cut -f1)
-    log_info "Checkpoint TD3 trovato: ${BOLD}$TD3_CHECKPOINT${NC} ($TD3_SIZE)"
+    log_info "Checkpoint TD3+BC trovato: ${BOLD}$TD3_CHECKPOINT${NC} ($TD3_SIZE)"
     if [[ -f "$TD3_BUFFER" ]]; then
         BUF_SIZE=$(du -h "$TD3_BUFFER" | cut -f1)
         log_info "Replay Buffer trovato: ${BOLD}$TD3_BUFFER${NC} ($BUF_SIZE)"
@@ -133,7 +133,7 @@ elif [[ -f "$BC_WEIGHTS" ]]; then
     log_info "Pesi BC trovati: ${BOLD}$BC_WEIGHTS${NC} ($BC_SIZE)"
     log_info "L'Actor TD3 inizializzerà backbone e continuous_head dal BC."
     log_info "Il Critic partirà da zero (Twin Q-Network)."
-    log_info "Actor trainabile: backbone + continuous_head; gear_head congelata e ignorata da gearing.py."
+    log_info "Actor trainabile: backbone + continuous_head; marcia deterministica via gearing.py."
 else
     log_phase "Cold-Start (Nessun Peso Trovato)"
     log_warn "Nessun peso BC trovato in: $BC_WEIGHTS"
@@ -162,7 +162,7 @@ python -u td3_bc.py \
 
 if [[ $? -eq 0 ]] && [[ -f "$TD3_POLICY" ]]; then
     TD3_SIZE=$(du -h "$TD3_POLICY" | cut -f1)
-    log_ok "TD3 completato con successo!"
+    log_ok "TD3+BC completato con successo!"
     log_info "Pesi policy salvati in: ${BOLD}$TD3_POLICY${NC} ($TD3_SIZE)"
     log_info ""
     log_info "Per testare l'agente esegui:"
@@ -171,9 +171,9 @@ if [[ $? -eq 0 ]] && [[ -f "$TD3_POLICY" ]]; then
     log_info "Oppure lascia che test_agent auto-rilevi i pesi migliori:"
     log_info "${BOLD}python test_agent.py${NC}"
 else
-    log_error "TD3 Training fallito!"
+    log_error "Training TD3+BC fallito!"
     exit 1
 fi
 
 echo ""
-log_ok "${BOLD}Training TD3 completato!${NC}"
+log_ok "${BOLD}Training TD3+BC completato!${NC}"

@@ -1,24 +1,16 @@
 """
-gearing.py — Cambio marcia DETERMINISTICO (velocità-primario, anti-hunting).
+gearing.py - cambio marcia deterministico velocita-primario.
 
-Sostituisce la testa gear appresa (gear_head, congelata durante l'RL e soggetta a
-hunting: fino a 322 cambi ogni 1000 step, con assurdità tipo 1ª a 150 km/h).
+La marcia non e' predetta dalla rete. Training, eval e test usano questa stessa
+funzione, cosi' non esiste mismatch tra la policy salvata e la guida live.
 
-PROBLEMA classico degli auto-shifter algoritmici: il downshift in staccata fa SALIRE
-gli rpm → uno shifter rpm-based crede di dover risalire di marcia → oscilla.
+Principio:
+  - il downshift guarda la velocita', che in frenata cala in modo monotono;
+  - l'upshift richiede gas applicato e rpm alti;
+  - isteresi e cooldown impediscono jitter al confine delle soglie.
 
-SOLUZIONE qui adottata:
-  - Il DOWNSHIFT guarda la VELOCITÀ (monotòna decrescente in frenata), NON gli rpm:
-    il picco di rpm nel downshift diventa irrilevante → niente oscillazione.
-  - L'UPSHIFT scatta solo SE SUL GAS (accel alto) e con rpm alti: durante la staccata
-    (gas≈0) l'upshift è bloccato anche se gli rpm superano la soglia.
-  - Isteresi (UP_SPEED > DN_SPEED) + cooldown post-cambio → zero jitter al confine.
-
-Soglie DERIVATE e VALIDATE sui 75 giri umani (train_set/laps):
-  - accordo ±1 marcia con la guida umana: 99.3%
-  - cambi marcia: 9.7 ogni 1000 step (umano reale 7.8; policy rotta 322)
-  - upshift umano: accel~1.00, rpm~19400 | downshift umano: brake~1.00 (conferma il design)
-Validazione live separata sulla policy RL: ~10.5 cambi ogni 1000 step, senza oscillazioni rapide.
+Le soglie sono derivate dai giri umani in train_set/laps e validate live sulla
+policy RL: circa 10.5 cambi ogni 1000 step, senza oscillazioni rapide.
 """
 
 # Soglie di velocità (km/h) per salire di marcia: g1→2, g2→3, g3→4, g4→5, g5→6.
