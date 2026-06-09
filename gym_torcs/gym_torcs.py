@@ -1,7 +1,6 @@
 from gym import spaces 
 import numpy as np
 import snakeoil3_gym as snakeoil3
-import copy
 import os
 import time
 
@@ -25,6 +24,10 @@ class TorcsEnv:
     # Variabili usate per valutare la terminazione anticipata in caso di stallo della vettura
     terminal_judge_start = 500  # 10 secondi dopo la quale si inizia a valutare se la vettura è in stallo
     termination_limit_progress = 5  # Se la vettura non avanza di almeno 5 unità di distanza in 10 secondi, consideriamo che è in stallo e terminiamo l'episodio.
+    off_track_limit = 1.25  # Oltre questo valore il giro è considerato non valido.
+    off_track_penalty_base = 5.0  # Penalità terminale minima quando si supera off_track_limit.
+    off_track_penalty_extra = 5.0  # Penalità progressiva aggiuntiva, saturata entro +1.0 trackPos.
+    incomplete_lap_step_penalty = 5.0  # Penalità locale per fallimenti terminali non legati al tempo giro.
     
     default_speed = 50 # Velocità di riferimento per normalizzare speedX/Y/Z. Non è una velocità massima, ma un valore tipico di velocità in pista (50 m/s = 180 km/h) usato per scalare le osservazioni in modo che siano in un range più gestibile per l'allenamento degli agenti.
     # cambiando questo valore si scalano tutte le osservazioni di velocità (speedX/Y/Z) e anche il calcolo del reward (progress), quindi va scelto in modo coerente con le velocità tipiche che si vogliono raggiungere in pista. 
@@ -103,8 +106,8 @@ class TorcsEnv:
         action_torcs['brake'] = this_action['brake']
         action_torcs['gear'] = this_action['gear']
 
-        # Snapshot pre-step: serve a rilevare nuovo danno/muro nel reward.
-        obs_pre = copy.deepcopy(client.S.d)
+        # Snapshot pre-step: serve a rilevare se TORCS aggiorna lastLapTime al traguardo.
+        prev_last_lap_time = float(np.array(client.S.d.get('lastLapTime', 0.0)).flat[0])
 
         # Step fisico: invia l'azione e legge la nuova telemetria dal server.
         client.respond_to_server()
@@ -134,7 +137,7 @@ class TorcsEnv:
         # Calcolo della penalità per la posizione sul tracciato:
         # - Nessuna penalità se |trackPos| < 1.0 (vettura entro i bordi della pista)
         # - Penalità crescente (rampa quadratica) >= 1.0 e <= 1.25 (punisce il modello se va troppo fuori)
-        # - Penalità massima se |trackPos| > 1.25 (considerato taglio curva/muro, episodio invalido)
+        # - Oltre 1.25 il giro è invalido e sotto viene aggiunta una penalità terminale graduata.
         tp = abs(float(obs['trackPos']))
         pos_penalty = -2.0 * (max(0.0, tp - 1.0) ** 2)
 
@@ -145,51 +148,59 @@ class TorcsEnv:
         # - E si sottrae una penalità per i cambi di sterzo bruschi (zigzag) 
         # La scelta di mettere la reward in questo file è stata effettuata per convenienza
         # Avremmo potuto metterla in TD3+BC ma così è più semplice accedere alle variabili necessarie per il calcolo della stessa
-        # Quali obs, obs_pre, last_steer, ecc... 
+        # Quali obs, last_steer, ecc... 
         # La reward 
         reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
 
 
-        # info dict comunicherà al Replay Buffer se il done è un vero "crash"
-        info = {'crash': False}
+        last_lap_time = float(np.array(obs.get('lastLapTime', 0.0)).flat[0])
+        lap_completed = (
+            last_lap_time > 0.0
+            and abs(last_lap_time - prev_last_lap_time) > 0.01
+            and self.time_step > self.terminal_judge_start
+        )
+
+        # info comunica al training se il terminale è un fallimento e se il giro è valido.
+        info = {
+            'crash': False,
+            'off_track': False,
+            'lap_completed': lap_completed,
+            'lap_time': last_lap_time if lap_completed else 0.0,
+            'termination_reason': 'SUCCESS' if lap_completed else None,
+        }
 
         # ─── Termination Conditions ──────────────────────────────────
         episode_terminate = False
         
 
-        # Danno / Muro. Penalità e flag crash SEMPRE attivi (coerenza reward/Critic). La
-        # TERMINAZIONE invece solo se early_termination=True (training RL): così la transizione
-        # con mask=0 corrisponde a un episodio realmente chiuso lato TORCS, senza l'incoerenza
-        # segnalata. Durante la RACCOLTA DATI umana (early_termination=False) il danno NON termina,
-        # altrimenti un contatto/cordolo ucciderebbe il giro del pilota.
-        if obs['damage'] - obs_pre['damage'] > 0:
-            reward = -10.0
-            info['crash'] = True
-            if self.early_termination:
-                episode_terminate = True
-                client.R.d['meta'] = True
-
         if self.early_termination:
             # Giro NON valido: oltre |trackPos| > 1.25 (taglio curva / muro). È lo stesso limite
             # usato in raccolta dati (cordoli consentiti fino a 1.25, oltre = invalido).
-            if abs(obs['trackPos']) > 1.25:
-                reward = -10.0
+            if tp > self.off_track_limit:
+                excess = min(tp - self.off_track_limit, 1.0)
+                reward -= self.off_track_penalty_base + (self.off_track_penalty_extra * excess)
                 info['crash'] = True
+                info['off_track'] = True
+                info['lap_completed'] = False
+                info['lap_time'] = 0.0
+                info['termination_reason'] = 'OFF_TRACK'
                 episode_terminate = True
                 client.R.d['meta'] = True
 
             # Stallo
-            if self.terminal_judge_start < self.time_step:
+            if not episode_terminate and not lap_completed and self.terminal_judge_start < self.time_step:
                 if progress < (self.termination_limit_progress / 50.0):
-                    reward = -10.0
+                    reward -= self.incomplete_lap_step_penalty
                     info['crash'] = True
+                    info['termination_reason'] = 'STALL'
                     episode_terminate = True
                     client.R.d['meta'] = True
 
             # Spin: auto rivolta nella direzione opposta al senso di marcia.
-            if np.cos(obs['angle']) < 0:
-                reward = -10.0
+            if not episode_terminate and not lap_completed and np.cos(obs['angle']) < 0:
+                reward -= self.incomplete_lap_step_penalty
                 info['crash'] = True
+                info['termination_reason'] = 'SPIN'
                 episode_terminate = True
                 client.R.d['meta'] = True
 

@@ -32,7 +32,7 @@ Il Behavioral Cloning da solo guida bene solo finché l'auto resta vicino alla d
 3. **Masking rigoroso**: la penalità imitativa si applica solo ai campioni marcati expert. Sugli stati online sporchi l'Actor può seguire il Critic e imparare recuperi.
 4. **Expert buffer separato**: i giri umani non vengono persi dalla FIFO del replay online. Ogni batch mantiene un riferimento umano.
 5. **Cambio deterministico**: la marcia non è predetta dalla rete. `gearing.compute_gear()` usa velocità, gas applicato, rpm e cooldown, eliminando oscillazioni di marcia e mismatch tra training/test.
-6. **Reward minimale**: il reward incentiva il progresso e punisce solo uscita, spin, stallo o danno. L'agente resta libero di scegliere velocità e staccate.
+6. **Reward minimale**: il reward incentiva il progresso e punisce uscita pista, spin, stallo e giro non completato. L'agente resta libero di scegliere velocità e staccate.
 7. **Normalizzazione coerente**: scaling fisico fisso + normalizzazione mean/std condivisa da BC, TD3 e test. La rete vede lo stesso spazio in ogni fase.
 
 ---
@@ -230,14 +230,14 @@ reward = progress * 1.5
        - 0.05 * abs(steer - last_steer)
 ```
 
-Terminazioni con `reward = -10`:
+Terminazioni non valide:
 
-- nuovo danno;
-- `|trackPos| > 1.25`;
+- `|trackPos| > 1.25`: giro invalido, con penalità terminale graduata;
 - stallo dopo il transitorio iniziale;
-- auto girata in senso opposto.
+- auto girata in senso opposto;
+- timeout/fine episodio senza un `lastLapTime` valido.
 
-Il bonus `+50` viene assegnato nel loop TD3 quando TORCS aggiorna `lastLapTime`, cioè quando un giro valido viene completato.
+Il bonus `+50` viene assegnato nel loop TD3 quando TORCS aggiorna `lastLapTime`, cioè quando un giro valido viene completato. Se l'episodio termina senza un giro valido, il loop TD3 applica un malus di giro incompleto.
 
 Questa formulazione ha funzionato perché non dice all'agente come affrontare una curva. Premia solo avanzamento valido e stabilità minima, lasciando al TD3 la libertà di trovare staccate e velocità migliori dei dati medi umani.
 

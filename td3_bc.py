@@ -13,7 +13,7 @@ Architettura Ibrida BC-RL per TORCS (Offline-to-Online), allineata al TD3+BC min
 
 Reward (da corsa, minimalista):
   - progress = (speedX/50.0) * cos(angle) * 1.5 ; pos_penalty deadzone oltre |trackPos|>1.0
-  - Terminali (schianto, stallo, spin, |trackPos|>1.25 = giro non valido): -10.0
+  - Terminali non validi: penalità locale nel wrapper + malus di giro incompleto nel loop TD3
   - Bonus giro VALIDO completato: +50.0
 """
 
@@ -44,6 +44,8 @@ from gearing import compute_gear  # cambio marcia deterministico (anti-hunting)
 _PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 _CHECKPOINT_ROOT = os.path.join(_PROJECT_ROOT, 'train_set', 'checkpoints')
 _CHECKPOINT_BACKUP_ROOT = os.path.join(_CHECKPOINT_ROOT, 'backups')
+LAP_SUCCESS_BONUS = 50.0
+INCOMPLETE_LAP_PENALTY = 25.0
 
 def _fsync_file(path):
     """Forza su disco il contenuto del file appena scritto."""
@@ -508,7 +510,7 @@ class TD3BCAgent:
 
             q1_next, q2_next = self.critic_target(next_state_b, next_action)
             min_q_next = torch.min(q1_next, q2_next)
-            # mask_b=0.0 per crash (Q futuro azzerato), mask_b=1.0 altrimenti
+            # mask_b=0.0 per fallimenti terminali (Q futuro azzerato), mask_b=1.0 altrimenti.
             target_q = reward_b + mask_b * self.gamma * min_q_next
 
         q1, q2 = self.critic(state_b, action_b)
@@ -1050,13 +1052,17 @@ def train():
             torcs_lap_time = float(np.array(next_ob.get('curLapTime', 0.0)).flat[0])
             max_dist = max(max_dist, current_dist)
 
+            lap_completed = bool(info.get('lap_completed', False))
+            if not lap_completed:
+                lap_completed = last_lap_time > 0.0 and abs(last_lap_time - prev_last_lap) > 0.01 and step > 500
+
             done = False
             if stop_requested:
                 done, termination_reason = True, "STOP"
-            elif last_lap_time > 0.0 and abs(last_lap_time - prev_last_lap) > 0.01 and step > 500:
+            elif lap_completed and not info.get('crash', False):
                 done, termination_reason = True, "SUCCESS"
                 completed_lap_time = last_lap_time
-                reward += 50.0
+                reward += LAP_SUCCESS_BONUS
                 if last_lap_time < best_lap_time:
                     best_lap_time = last_lap_time
                     new_record = True
@@ -1071,9 +1077,16 @@ def train():
                 safe_save(agent.actor.state_dict(), 'train_set/checkpoints/td3_expl_best_dist.pth')
 
             next_stacked_state = np.concatenate([state_stack[0], state_stack[6], state_stack[12]])
-            mask = 0.0 if info.get('crash', False) else 1.0
 
             time_limit_reached = (step >= args.max_steps)
+            episode_finishes_now = done or env_done or time_limit_reached
+            incomplete_lap = episode_finishes_now and termination_reason not in ("SUCCESS", "STOP")
+            if incomplete_lap:
+                if termination_reason == "TIMEOUT":
+                    termination_reason = "INCOMPLETE"
+                reward -= INCOMPLETE_LAP_PENALTY
+
+            mask = 0.0 if incomplete_lap else 1.0
             episode_transitions.append((stacked_state, cont_action, reward, next_stacked_state, mask))
 
             stacked_state = next_stacked_state

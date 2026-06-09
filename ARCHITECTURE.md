@@ -34,7 +34,7 @@ TORCS viene avviato senza fuel e senza damage fisico distruttivo:
 torcs -nofuel -nodamage
 ```
 
-Il danno viene comunque letto dalla telemetria e usato come segnale terminale per il reward.
+Il danno resta nella telemetria per compatibilità, ma non viene usato come segnale terminale: con `-nodamage` non è un indicatore affidabile. La validità del giro viene decisa da uscita pista e completamento effettivo del lap time.
 
 ---
 
@@ -248,16 +248,16 @@ reward = progress * 1.5
        - 0.05 * abs(steer - last_steer)
 ```
 
-Terminali con `reward = -10`:
+Terminali non validi:
 
-- danno nuovo;
-- `|trackPos| > 1.25`;
+- `|trackPos| > 1.25`, con penalità terminale graduata;
 - stallo dopo 500 step;
 - auto rivolta all'indietro.
 
 Bonus:
 
 - `+50` quando TORCS aggiorna `lastLapTime`, cioè quando il giro è valido.
+- malus di giro incompleto quando l'episodio termina senza `lastLapTime` valido.
 
 Questa forma ha risolto il problema dell'agente troppo vincolato: non penalizza direttamente la velocità in curva e non prescrive una traiettoria. Premia solo avanzamento valido e lascia al TD3 la ricerca delle staccate.
 
@@ -267,8 +267,8 @@ Questa forma ha risolto il problema dell'agente troppo vincolato: non penalizza 
 
 Nel replay:
 
-- `mask = 0.0` solo per crash/fallimento reale;
-- `mask = 1.0` per time-limit;
+- `mask = 0.0` per fallimenti terminali, incluso timeout senza giro valido;
+- `mask = 1.0` per giri validi completati;
 - dati expert sempre `mask = 1.0`.
 
 Il completamento di un giro umano non è un crash. Azzerare il futuro sui dati expert confonderebbe il Critic, perché la transizione terminale di un giro valido e quella di uno schianto avrebbero la stessa semantica Bellman.
