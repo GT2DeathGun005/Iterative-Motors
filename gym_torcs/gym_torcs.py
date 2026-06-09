@@ -204,6 +204,12 @@ class TorcsEnv:
                 episode_terminate = True
                 client.R.d['meta'] = True
 
+            # Giro valido completato: chiude l'episodio anche lato ambiente. Il bonus resta
+            # nel loop TD3, ma il wrapper deve comunque restituire done=True al traguardo.
+            if not episode_terminate and lap_completed:
+                episode_terminate = True
+                client.R.d['meta'] = True
+
         if client.R.d['meta'] is True:
             self.initial_run = False
             client.respond_to_server()

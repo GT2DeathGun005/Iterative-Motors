@@ -208,8 +208,8 @@ I pesi TD3 usano `tanh` su tutti i canali continui. I pesi BC usano `tanh` sullo
 | `td3_policy.pth` | ultimo Actor TD3 salvato |
 | `td3_checkpoint.pth` | stato completo per resume: reti, ottimizzatori, step, record |
 | `td3_det_best_lap.pth` | miglior giro valido deterministico, candidato submission |
-| `td3_det_best_dist.pth` | miglior distanza deterministica assoluta, preservata dopo `--clean` |
-| `td3_det_best_dist_run.pth` | miglior distanza deterministica del run corrente |
+| `td3_det_best_dist.pth` | miglior progresso deterministico entro il primo giro, preservato dopo `--clean` |
+| `td3_det_best_dist_run.pth` | miglior progresso deterministico entro il primo giro nel run corrente |
 | `td3_expl_best_lap.pth` | giro valido in rollout esplorativo |
 | `td3_expl_best_dist.pth` | miglior distanza in rollout esplorativo |
 | `buffers/td3_checkpoint_buffer.npz` | replay online |

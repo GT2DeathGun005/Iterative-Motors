@@ -46,6 +46,20 @@ _CHECKPOINT_ROOT = os.path.join(_PROJECT_ROOT, 'train_set', 'checkpoints')
 _CHECKPOINT_BACKUP_ROOT = os.path.join(_CHECKPOINT_ROOT, 'backups')
 LAP_SUCCESS_BONUS = 50.0
 INCOMPLETE_LAP_PENALTY = 25.0
+TRACK_LENGTH_M = 3608.0
+EVAL_DISTANCE_SANITY_LIMIT = 3800.0
+
+def _is_plausible_eval_dist(value):
+    return 0.0 <= float(value) <= EVAL_DISTANCE_SANITY_LIMIT
+
+def _track_progress_from_start(start_dist, current_dist):
+    """Progresso lungo il giro a partire dalla posizione iniziale, gestendo il wrap al traguardo."""
+    start = float(start_dist)
+    current = float(current_dist)
+    progress = current - start
+    if progress < 0.0:
+        progress += TRACK_LENGTH_M
+    return max(0.0, min(progress, TRACK_LENGTH_M))
 
 def _fsync_file(path):
     """Forza su disco il contenuto del file appena scritto."""
@@ -694,6 +708,16 @@ class TD3BCAgent:
                     best_lap_time = checkpoint.get('best_lap_time', float('inf'))
                     best_eval_dist = checkpoint.get('best_eval_dist', 0.0)
                     best_distance = checkpoint.get('best_distance', 0.0)
+                    if not _is_plausible_eval_dist(best_eval_dist):
+                        det_best_dist_txt = 'train_set/checkpoints/td3_det_best_dist.txt'
+                        sidecar_best_eval_dist = safe_read_float(det_best_dist_txt, 0.0)
+                        print(
+                            f"best_eval_dist={best_eval_dist:.2f} non plausibile per un eval monogiro; "
+                            f"uso sidecar {sidecar_best_eval_dist:.2f}."
+                        )
+                        best_eval_dist = sidecar_best_eval_dist if _is_plausible_eval_dist(sidecar_best_eval_dist) else 0.0
+                    if not _is_plausible_eval_dist(best_distance):
+                        best_distance = best_eval_dist
                     episode = checkpoint['episode']
                     global_step = checkpoint['global_step']
                     if candidate != filepath:
@@ -760,7 +784,9 @@ def load_recent_evals_from_log(log_path, max_len=8):
                         try:
                             match = re.search(r'\b(?:Dist|Distanza)\s+([0-9]+(?:\.[0-9]+)?)m', line)
                             if match:
-                                evals.append(float(match.group(1)))
+                                eval_dist = float(match.group(1))
+                                if _is_plausible_eval_dist(eval_dist):
+                                    evals.append(eval_dist)
                         except Exception:
                             pass
         except Exception as e:
@@ -1016,6 +1042,7 @@ def train():
         prev_last_lap = float(np.array(ob.get('lastLapTime', 0.0)).flat[0])
         torcs_lap_time = float(np.array(ob.get('curLapTime', 0.0)).flat[0])
         completed_lap_time = None
+        episode_start_dist = float(np.array(ob.get('distFromStart', 0.0)).flat[0])
 
         while True:
             # NB: niente actor.eval()/train() qui — sarebbe un no-op fuorviante (nessun dropout;
@@ -1047,7 +1074,8 @@ def train():
             next_f_state = flatten_state(next_ob)
             state_stack.append(next_f_state)
 
-            current_dist = float(np.array(next_ob.get('distRaced', 0.0)).flat[0])
+            current_track_pos_m = float(np.array(next_ob.get('distFromStart', 0.0)).flat[0])
+            current_dist = _track_progress_from_start(episode_start_dist, current_track_pos_m)
             last_lap_time = float(np.array(next_ob.get('lastLapTime', 0.0)).flat[0])
             torcs_lap_time = float(np.array(next_ob.get('curLapTime', 0.0)).flat[0])
             max_dist = max(max_dist, current_dist)
@@ -1062,6 +1090,7 @@ def train():
             elif lap_completed and not info.get('crash', False):
                 done, termination_reason = True, "SUCCESS"
                 completed_lap_time = last_lap_time
+                max_dist = max(max_dist, TRACK_LENGTH_M)
                 reward += LAP_SUCCESS_BONUS
                 if last_lap_time < best_lap_time:
                     best_lap_time = last_lap_time
@@ -1168,6 +1197,8 @@ def train():
             eval_stack = deque([flatten_state(eval_ob)]*13, maxlen=13)
             eval_stacked = np.concatenate([eval_stack[0], eval_stack[6], eval_stack[12]])
             eval_dist, eval_step, eval_reward = 0.0, 0, 0.0
+            eval_lap_completed = False
+            eval_lap_time = None
             eval_current_gear = 1  # marcia deterministica anche in eval (gearing.py)
             eval_steps_since_shift = 999
             eval_cur_speed_kmh = float(np.array(eval_ob.get('speedX', 0.0)).flat[0]) * 50.0
@@ -1175,6 +1206,7 @@ def train():
             # Cronometraggio del miglior giro VALIDO completato in questa valutazione deterministica.
             eval_prev_last_lap = float(np.array(eval_ob.get('lastLapTime', 0.0)).flat[0])
             eval_best_lap_in_run = float('inf')
+            eval_start_dist = float(np.array(eval_ob.get('distFromStart', 0.0)).flat[0])
 
             agent.actor.eval()
             while eval_step < args.max_steps:
@@ -1197,18 +1229,33 @@ def train():
                 eval_reward += eval_r
                 eval_stack.append(flatten_state(eval_ob))
                 eval_stacked = np.concatenate([eval_stack[0], eval_stack[6], eval_stack[12]])
-                eval_dist = float(np.array(eval_ob.get('distRaced', 0.0)).flat[0])
+                current_eval_track_pos_m = float(np.array(eval_ob.get('distFromStart', 0.0)).flat[0])
+                current_eval_dist = _track_progress_from_start(eval_start_dist, current_eval_track_pos_m)
+                eval_dist = max(eval_dist, current_eval_dist)
 
                 # Rilevamento giro VALIDO deterministico: TORCS aggiorna lastLapTime al traguardo.
-                # L'eval prosegue oltre il traguardo (non termina sul giro), quindi può chiudere più
-                # giri: teniamo il più veloce. Stesso criterio del loop di training (step>500).
+                # L'eval deve fermarsi al primo giro valido. La distanza loggata è il massimo
+                # distFromStart visto prima del reset al traguardo, quindi non premia strada extra.
                 eval_last_lap = float(np.array(eval_ob.get('lastLapTime', 0.0)).flat[0])
-                if eval_last_lap > 0.0 and abs(eval_last_lap - eval_prev_last_lap) > 0.01 and eval_step > 500:
+                eval_lap_completed = bool(eval_info.get('lap_completed', False))
+                if not eval_lap_completed:
+                    eval_lap_completed = eval_last_lap > 0.0 and abs(eval_last_lap - eval_prev_last_lap) > 0.01 and eval_step > 500
+                if eval_lap_completed and not eval_info.get('crash', False):
                     eval_prev_last_lap = eval_last_lap
                     eval_best_lap_in_run = min(eval_best_lap_in_run, eval_last_lap)
+                    eval_lap_time = eval_last_lap
+                    eval_dist = max(eval_dist, TRACK_LENGTH_M)
+                    break
 
                 if eval_info.get('crash', False) or eval_done: break
             agent.actor.train()
+
+            if not _is_plausible_eval_dist(eval_dist):
+                _rlog(
+                    f"  [EVAL] distanza {eval_dist:.1f}m non plausibile per un eval monogiro; "
+                    "scartata da record/refinement."
+                )
+                eval_dist = 0.0
 
             refine_status = ""
             if getattr(agent, 'refine_mode', False):
@@ -1218,7 +1265,8 @@ def train():
             else:
                 refine_status = " | Refine: OFF"
 
-            eval_msg = f"[{time_str}]  [EVAL] Result: Dist {int(eval_dist)}m | Reward: {eval_reward:.1f}{refine_status}"
+            lap_status = f" | Lap: {eval_lap_time:.3f}s" if eval_lap_time is not None else ""
+            eval_msg = f"[{time_str}]  [EVAL] Result: Dist {int(eval_dist)}m{lap_status} | Reward: {eval_reward:.1f}{refine_status}"
             print(f"  {eval_msg}")
             with open(log_file, 'a', encoding='utf-8') as f: f.write(eval_msg + "\n")
 

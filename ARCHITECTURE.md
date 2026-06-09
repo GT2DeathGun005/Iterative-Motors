@@ -282,8 +282,8 @@ Salvataggi principali:
 - `td3_checkpoint.pth`: stato completo;
 - `td3_policy.pth`: ultimo Actor;
 - `td3_det_best_lap.pth`: miglior giro valido deterministico;
-- `td3_det_best_dist.pth`: miglior distanza deterministica assoluta;
-- `td3_det_best_dist_run.pth`: miglior distanza deterministica del run;
+- `td3_det_best_dist.pth`: miglior progresso deterministico entro il primo giro;
+- `td3_det_best_dist_run.pth`: miglior progresso deterministico entro il primo giro nel run;
 - `td3_expl_best_lap.pth`: giro valido in esplorazione;
 - `td3_expl_best_dist.pth`: distanza esplorativa;
 - `buffers/*.npz`: replay ed elite buffer.
