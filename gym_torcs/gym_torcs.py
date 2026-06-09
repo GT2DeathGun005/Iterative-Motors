@@ -1,4 +1,4 @@
-from gym import spaces
+from gym import spaces 
 import numpy as np
 import snakeoil3_gym as snakeoil3
 import copy
@@ -6,8 +6,8 @@ import os
 import time
 
 # Directory di questo file (gym_torcs/) — usata per risolvere i path relativi
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_AUTOSTART_SH = os.path.join(_THIS_DIR, 'autostart.sh')
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__)) # Variabile che contiene il percorso assoluto della directory in cui si trova questo file (gym_torcs/), usata per risolvere i path relativi in modo robusto.
+_AUTOSTART_SH = os.path.join(_THIS_DIR, 'autostart.sh') # Path completo allo script di autostart.sh, che automatizza l'avvio di TORCS e la partenza della simulazione.
 
 
 def _kill_torcs():
@@ -17,36 +17,44 @@ def _kill_torcs():
     è il workaround operativo contro il memory leak osservato nei run lunghi di TORCS
     ed è corretto per il flusso single-instance di training/test.
 
-    In scenari MULTI-istanza (run paralleli) o MULTI-vettura (video finale) questo
-    ucciderebbe anche gli altri TORCS: imposta `TORCS_KILL_ALL=0` per disabilitare il
-    kill globale (in quel caso gestisci tu la terminazione dell'istanza specifica).
     """
     if os.environ.get('TORCS_KILL_ALL', '1') != '0':
         os.system('pkill -9 -f torcs')
 
-
 class TorcsEnv:
-    terminal_judge_start = 500  # 10 secondi per consentire il transitorio di partenza
-    termination_limit_progress = 5  # Soglia tollerante per non punire le incertezze
-    default_speed = 50
+    # Variabili usate per valutare la terminazione anticipata in caso di stallo della vettura
+    terminal_judge_start = 500  # 10 secondi dopo la quale si inizia a valutare se la vettura è in stallo
+    termination_limit_progress = 5  # Se la vettura non avanza di almeno 5 unità di distanza in 10 secondi, consideriamo che è in stallo e terminiamo l'episodio.
+    
+    default_speed = 50 # Velocità di riferimento per normalizzare speedX/Y/Z. Non è una velocità massima, ma un valore tipico di velocità in pista (50 m/s = 180 km/h) usato per scalare le osservazioni in modo che siano in un range più gestibile per l'allenamento degli agenti.
+    # cambiando questo valore si scalano tutte le osservazioni di velocità (speedX/Y/Z) e anche il calcolo del reward (progress), quindi va scelto in modo coerente con le velocità tipiche che si vogliono raggiungere in pista. 
+    # Un valore troppo basso potrebbe portare a osservazioni normalizzate troppo grandi, 
+    # mentre un valore troppo alto potrebbe portare a osservazioni troppo piccole.
+    # 50 m/s è una scelta buona perché rappresenta una velocità elevata ma raggiungibile in molte situazioni di gara.
 
-    initial_reset = True
 
+    initial_reset = True    # Flag per indicare se è il primo reset (avvio) dell'ambiente. 
 
+    # di default l'early termination è attivo, cioè l'episodio termina al primo contatto con muro/avversari o stallo.
     def __init__(self, early_termination=True):
-        import shutil
+        import shutil   # è una libreria utile all'elaborazione dei path nell'OS
+
+        # Verifica che xvfb-run sia installato altrimenti lancia un errore di ambiente. 
         if shutil.which('xvfb-run') is None:
             raise EnvironmentError("xvfb-run non trovato. Installa il pacchetto 'xvfb' per l'esecuzione headless isolata di TORCS.")
 
-        self.early_termination = early_termination
 
+        self.early_termination = early_termination
         self.initial_run = True
 
-        _kill_torcs()
-        time.sleep(1.5)
 
+        _kill_torcs()
+        time.sleep(1.5) #attende che il sistema operativo liberi la porta UDP usata da TORCS, altrimenti il successivo avvio fallisce.
+
+        # Stringa che usiamo per lanciare torcs, in modalità no damage e no fuel
         torcs_cmd = 'torcs -nofuel -nodamage'
         
+
         # Se la variabile SHOW_GUI è settata a 1, avvia normalmente. Altrimenti usa Xvfb.
         if os.environ.get('SHOW_GUI', '0') == '1':
             os.system(f'sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1" &')
@@ -60,6 +68,8 @@ class TorcsEnv:
             high=np.array([1.0, 1.0, 1.0, 6.0], dtype=np.float32),
             dtype=np.float32,
         )
+
+        #Dizionario con tutte le infomrazioni che invia TORCS, ogni infomrazione ha le sue dimensioni (visibili da shape) e range di valori
         self.observation_space = spaces.Dict({
             'focus': spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32),
             'speedX': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
@@ -78,6 +88,7 @@ class TorcsEnv:
             'distRaced': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
         })
 
+    # La funzione step prende in input l'azione dell'agente (u), la converte nel formato richiesto da TORCS, invia l'azione al server TORCS, riceve la nuova telemetria, calcola il reward e determina se l'episodio è terminato.
     def step(self, u):
         # Converte l'azione dell'agente nel formato richiesto dal server TORCS.
         client = self.client
@@ -105,29 +116,39 @@ class TorcsEnv:
         self.observation = self.make_observaton(obs)
 
         # ─── Reward Reshaping condiviso dal TD3+BC ───────────────────────
-        sp_norm = obs['speedX'] / 50.0  # Range ~[0, 6]
+        sp_norm = obs['speedX'] / self.default_speed  # Range ~[0, 6]
         progress = sp_norm * np.cos(obs['angle'])
         
-        # Inizializza last_steer se non esiste
+        # Inizializza last_steer se non esiste cioè setta lo sterzo diritto al primo step
         if not hasattr(self, 'last_steer'):
             self.last_steer = 0.0
-            
+
+        # calcola la variazione di sterzo rispetto allo step precedente,
+        # usata per penalizzare i cambi di direzione bruschi (zigzag) e
+        # incentivare uno stile di guida più fluido. La penalità è proporzionale
+        # alla variazione assoluta dello sterzo, con un coefficiente di 0.05 (usato sotto) che 
+        # bilancia l'importanza di questo termine nel reward complessivo.
         steer_change = this_action['steer'] - self.last_steer
         self.last_steer = this_action['steer']
 
-        # Penalità di posizione con DEADZONE: nessuna penalità entro |trackPos| < 1.0
-        # (libertà piena sulla pista), poi una rampa morbida nella fascia dei cordoli
-        # 1.0→1.25 come margine prima del limite di GIRO VALIDO. Oltre 1.25 = taglio/uscita
-        # → terminale (sotto). Coerente coi limiti usati in raccolta dati (|trackPos| ≤ 1.25).
+        # Calcolo della penalità per la posizione sul tracciato:
+        # - Nessuna penalità se |trackPos| < 1.0 (vettura entro i bordi della pista)
+        # - Penalità crescente (rampa quadratica) >= 1.0 e <= 1.25 (punisce il modello se va troppo fuori)
+        # - Penalità massima se |trackPos| > 1.25 (considerato taglio curva/muro, episodio invalido)
         tp = abs(float(obs['trackPos']))
         pos_penalty = -2.0 * (max(0.0, tp - 1.0) ** 2)
 
-        # Reward da corsa: massimizza il progresso (velocità in avanti) lasciando l'agente
-        # libero su staccate e velocità in curva; lo steer-smoothness è un lieve anti-zigzag.
-        # NB: il bonus +50 per GIRO VALIDO completato è applicato nel loop di training di
-        # td3_bc.py (dove si rileva il cambio di lastLapTime e si salva td3_expl_best_lap.pth),
-        # NON qui — altrimenti si conterebbe due volte.
+
+        # Calcolo della reward complessiva per ogni step:
+        # - La reward principale è il progresso in avanti
+        # - A questo si aggiunge la penalità per la posizione fuori pista (pos_penalty)
+        # - E si sottrae una penalità per i cambi di sterzo bruschi (zigzag) 
+        # La scelta di mettere la reward in questo file è stata effettuata per convenienza
+        # Avremmo potuto metterla in TD3+BC ma così è più semplice accedere alle variabili necessarie per il calcolo della stessa
+        # Quali obs, obs_pre, last_steer, ecc... 
+        # La reward 
         reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
+
 
         # info dict comunicherà al Replay Buffer se il done è un vero "crash"
         info = {'crash': False}
@@ -135,6 +156,7 @@ class TorcsEnv:
         # ─── Termination Conditions ──────────────────────────────────
         episode_terminate = False
         
+
         # Danno / Muro. Penalità e flag crash SEMPRE attivi (coerenza reward/Critic). La
         # TERMINAZIONE invece solo se early_termination=True (training RL): così la transizione
         # con mask=0 corrisponde a un episodio realmente chiuso lato TORCS, senza l'incoerenza
