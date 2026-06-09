@@ -384,6 +384,20 @@ class Actor(nn.Module):
         self.load_state_dict(bc_state, strict=False)
         print(f"Pesi BC caricati con successo da {bc_path} (compensato scaling 0.5 per accel/brake).")
 
+    def load_actor_weights(self, path, device):
+        if not os.path.exists(path): return
+        try:
+            loaded = torch.load(path, map_location=device, weights_only=True)
+        except Exception:
+            loaded = torch.load(path, map_location=device, weights_only=False)
+        state_dict = loaded.get('actor', loaded) if isinstance(loaded, dict) else loaded
+        model_state = self.state_dict()
+        filtered_state = {
+            k: v for k, v in state_dict.items()
+            if k in model_state and hasattr(v, 'shape') and model_state[k].shape == v.shape
+        }
+        self.load_state_dict(filtered_state, strict=False)
+
 class Critic(nn.Module):
     """Twin Q-Network: due reti Q indipendenti per mitigare l'Overestimation Bias.
 
@@ -895,7 +909,7 @@ def train():
             best_path = next((p for p in rollback_candidates if os.path.exists(p)), None)
             if best_path:
                 print(f"[EMERGENZA] Rollback Actor: caricamento della migliore policy deterministica da {best_path}")
-                agent.actor.load_state_dict(torch.load(best_path, map_location=agent.device))
+                agent.actor.load_actor_weights(best_path, agent.device)
                 agent.actor_target.load_state_dict(agent.actor.state_dict())
                 import torch.optim as optim
                 agent.actor_optimizer = optim.Adam(
@@ -1382,7 +1396,7 @@ def train():
                     if refine_attempt_plateau_ref <= 0.0:
                         refine_attempt_plateau_ref = ref_lvl
                     if os.path.exists(det_best_dist_pth):
-                        agent.actor.load_state_dict(torch.load(det_best_dist_pth, map_location=agent.device))
+                        agent.actor.load_actor_weights(det_best_dist_pth, agent.device)
                         agent.actor_target.load_state_dict(agent.actor.state_dict())
                     agent.refine_mode = False
                     agent.refine_bc_weight = 1.0
