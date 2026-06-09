@@ -152,15 +152,22 @@ class TorcsEnv:
         # La reward 
         reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
 
-
+        # Estrae il lap time dell'ultimo giro completato 
         last_lap_time = float(np.array(obs.get('lastLapTime', 0.0)).flat[0])
+
+        # Il giro è completato se laptime è > 0 e il tempo è cambiato dallo step prima e 
+        # siamo oltre i 10 Secondi di valutazione per la terminazione anticipata (terminal_judge_start)
         lap_completed = (
             last_lap_time > 0.0
             and abs(last_lap_time - prev_last_lap_time) > 0.01
             and self.time_step > self.terminal_judge_start
         )
 
-        # info comunica al training se il terminale è un fallimento e se il giro è valido.
+        # Dizionario di info che contiene informazioni diagnostiche sull'episodio,
+        # come se c'è stato un crash, se la vettura è andata fuori pista,
+        # se il giro è stato completato, il tempo del giro, e la ragione della terminazione
+        # (se applicabile). Queste informazioni sono utili per l'analisi e il debug dell'allenamento
+        # degli agenti.
         info = {
             'crash': False,
             'off_track': False,
@@ -169,62 +176,87 @@ class TorcsEnv:
             'termination_reason': 'SUCCESS' if lap_completed else None,
         }
 
-        # ─── Termination Conditions ──────────────────────────────────
+
+        # Variabile che indica se l'episodio deve essere terminato. 
         episode_terminate = False
         
 
+        # Se attiva l'early termination, valutiamo le condizioni di terminazione anticipata
         if self.early_termination:
             # Giro NON valido: oltre |trackPos| > 1.25 (taglio curva / muro). È lo stesso limite
             # usato in raccolta dati (cordoli consentiti fino a 1.25, oltre = invalido).
             if tp > self.off_track_limit:
-                excess = min(tp - self.off_track_limit, 1.0)
-                reward -= self.off_track_penalty_base + (self.off_track_penalty_extra * excess)
+                excess = min(tp - self.off_track_limit, 1.0) #calcola di quanto è fuori pista, è limitato a 1 perché con valore 1 hai la massima penalità di uscita di pista
+                reward -= self.off_track_penalty_base + (self.off_track_penalty_extra * excess) # Aggiornamento della reward contando la penalità
+                 
+                # Aggiorna le flag di info per indicare che c'è stato un crash per uscita di pista
                 info['crash'] = True
                 info['off_track'] = True
                 info['lap_completed'] = False
                 info['lap_time'] = 0.0
                 info['termination_reason'] = 'OFF_TRACK'
                 episode_terminate = True
-                client.R.d['meta'] = True
+                client.R.d['meta'] = True # Flag per segnalare che l'episodio deve terminare
 
-            # Stallo
+
+            # Valuta se la vettura è in stallo: 
+            # - se dopo 10 secondi (terminal_judge_start) non ha completato il giro 
+            # - Se l'episodio non è terminato 
+            # - se il giro non è completato
             if not episode_terminate and not lap_completed and self.terminal_judge_start < self.time_step:
+                # Se il progresso è insufficiente (non ha avanzato di almeno 5 unità di distanza in 10 secondi), consideriamo che è in stallo e terminiamo l'episodio.
                 if progress < (self.termination_limit_progress / 50.0):
-                    reward -= self.incomplete_lap_step_penalty
-                    info['crash'] = True
+                    reward -= self.incomplete_lap_step_penalty  #Aggiona la reward contando la penalità per stallo
+                    
+                    # Aggiorna le flag di info per indicare che c'è stato un crash per stallo 
+                    info['crash'] = True    
                     info['termination_reason'] = 'STALL'
                     episode_terminate = True
                     client.R.d['meta'] = True
 
-            # Spin: auto rivolta nella direzione opposta al senso di marcia.
+            # Valuta se la vettura ha sbinnato:
+            # - se l'episodio non è terminato
+            # - se il giro non è completato
+            # - se il coseno dell'angolo tra la vettura e l'asse della pista è negativo
             if not episode_terminate and not lap_completed and np.cos(obs['angle']) < 0:
-                reward -= self.incomplete_lap_step_penalty
+                reward -= self.incomplete_lap_step_penalty  #Aggiona la reward contando la penalità per sbin (la stessa di quella di stallo)
+                
+                # Aggiorna le flag di info 
                 info['crash'] = True
                 info['termination_reason'] = 'SPIN'
                 episode_terminate = True
                 client.R.d['meta'] = True
 
-            # Giro valido completato: chiude l'episodio anche lato ambiente. Il bonus resta
-            # nel loop TD3, ma il wrapper deve comunque restituire done=True al traguardo.
+            # Valuta se il giro è completato: se il giro è completato ma l'episodio non è ancora terminato, allora termina l'episodio con successo.
+            # La reward bonus di fine giro viene applicata in TD3+BC, qui applichiamo solo la terminazione dell'episodio.
             if not episode_terminate and lap_completed:
+                
+                # Flag update
                 episode_terminate = True
                 client.R.d['meta'] = True
 
+        # Se l'episodio è terminato cambia la flag initial run a False
+        # e rispondi al server inviando il dizionario R con meta=True, che è il segnale per 
+        # TORCS di terminare l'episodio e prepararsi per il reset.
         if client.R.d['meta'] is True:
             self.initial_run = False
             client.respond_to_server()
 
-        self.time_step += 1
+        self.time_step += 1 # Incrementa il contatore dei passi
 
-        return self.get_obs(), reward, client.R.d['meta'] or client.so is None, info
+        return self.get_obs(), reward, client.R.d['meta'] or client.so is None, info # restituisce lo stato, il reward, se l'episodio è terminato e informazioni aggiuntive.
 
+    # La funzione reset riavvia l'episodio. Se la flag initial_reset è True, riavvia TORCS e pulisce le variabili di stato. 
+    # Se la flag initial_reset è False, imposta la flag R.d['meta'] a True per segnalare a TORCS di terminare l'episodio corrente   e prepararsi per il reset.
     def reset(self, relaunch=False):
         self.time_step = 0
 
+        # Se initial_reset è False, imposta la flag R.d['meta'] a True per segnalare a TORCS di terminare l'episodio corrente e prepararsi per il reset.
         if self.initial_reset is not True:
             self.client.R.d['meta'] = True
             self.client.respond_to_server()
 
+            # Se la flag relaunch è True, riavvia TORCS e pulisce le variabili di stato.
             if relaunch is True:
                 # Chiudiamo esplicitamente il socket UDP aperto prima del relaunch.
                 if hasattr(self, 'client') and self.client is not None:
