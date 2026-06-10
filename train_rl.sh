@@ -1,31 +1,18 @@
 #!/usr/bin/env bash
-# ═══════════════════════════════════════════════════════════════════════
-#  train_rl.sh — Avvia il training TD3+BC (Reinforcement Learning)
+# Script train_rl.sh per avviare il training TD3+BC (Reinforcement Learning).
+# L'agente parte dai pesi del Behavioral Cloning (Warm-Start) e li affina tramite TD3+BC.
 #
-#  L'agente parte dai pesi del Behavioral Cloning (Warm-Start) e li
-#  affina tramite TD3+BC per correggere il Covariate Shift.
-#
-#  Uso:
-#    ./train_rl.sh                      # 1000 episodi (default)
-#    TD3_EPISODES=500 ./train_rl.sh     # Override episodi
-#    ./train_rl.sh --clean              # Riparte da zero (cancella checkpoint TD3)
-#    ./train_rl.sh --rollback           # Rollback alla migliore policy DETERMINISTICA (det_best_lap →
-#                                       #   det_best_dist → det_best_dist_run) e congela l'Actor per 30 ep (recupero)
-#    ./train_rl.sh --rollback --actor-freeze-episodes 100
-#                                       # Rollback con congelamento Actor piu' lungo: utile se il Critic
-#                                       #   deve recuperare dopo checkpoint corrotto o dati expert nuovi
-#    ./train_rl.sh --no-auto-refine     # Training normale, ma senza attivazione automatica della refinement
-#    ./train_rl.sh --refine             # Avvia in refinement: aggiornamento del Critic disattivato,
-#                                       #   loss Critic solo diagnostica e peso Behavioral Cloning
-#                                       #   ridotto; usare in resume quando il training è già in
-#                                       #   plateau stabile (vedi ARCHITECTURE, sezione Refinement)
-#
-#  Per interrompere il training in sicurezza:
-#    Ctrl+C  oppure  ./stop_training.sh
-# ═══════════════════════════════════════════════════════════════════════
+# Opzioni d'uso principale:
+#   ./train_rl.sh                      # Avvia il training (1000 episodi di default)
+#   TD3_EPISODES=500 ./train_rl.sh     # Imposta un numero personalizzato di episodi
+#   ./train_rl.sh --clean              # Riparte da zero (elimina i checkpoint TD3 esistenti)
+#   ./train_rl.sh --rollback           # Effettua il rollback alla migliore policy deterministica
+#   ./train_rl.sh --rollback --actor-freeze-episodes 100  # Congela l'Actor più a lungo per far recuperare il Critic
+#   ./train_rl.sh --no-auto-refine     # Disattiva il passaggio automatico alla fase di refinement
+#   ./train_rl.sh --refine             # Avvia direttamente in refinement (Critic congelato)
 set -euo pipefail
 
-# ── Colori ──
+# Colori 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -34,11 +21,11 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# ── Directory del progetto ──
+# Directory del progetto
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# ── Configurazione ──
+# Configurazione
 BC_WEIGHTS="${BC_WEIGHTS:-train_set/checkpoints/bc_policy.pth}"
 TD3_CHECKPOINT="train_set/checkpoints/td3_checkpoint.pth"
 TD3_BUFFER="train_set/checkpoints/buffers/td3_checkpoint_buffer.npz"
@@ -53,7 +40,7 @@ TD3_EPISODES="${TD3_EPISODES:-1000}"
 TD3_SEED="${TD3_SEED:-42}"
 TD3_MAX_STEPS="${TD3_MAX_STEPS:-5000}"
 
-# ── Funzioni utility ──
+# Funzioni utility
 timestamp() { date '+%Y-%m-%d %H:%M:%S'; }
 
 log_info()  { echo -e "${CYAN}[$(timestamp)]${NC} $1"; }
@@ -64,7 +51,7 @@ log_phase() { echo -e "\n${BOLD}${BLUE}═════════════�
               echo -e "${BOLD}${BLUE}  $1${NC}"; \
               echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}\n"; }
 
-# ── Gestione flag --clean ──
+# Gestione flag --clean
 CLEAN_REQUESTED=0
 for arg in "$@"; do
     if [[ "$arg" == "--clean" ]]; then
@@ -106,16 +93,13 @@ for arg in "$@"; do
     fi
 done
 
-# ── Pre-check ──
+# Pre-check
 log_phase "AIcar TD3+BC Training (Reinforcement Learning)"
 
 # Crea directory necessarie
 mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR" "train_set/checkpoints/buffers" "$BACKUP_DIR/buffers"
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Warm-Start Detection
-# ═══════════════════════════════════════════════════════════════════════
-
+# Warm-Start Detection
 if [[ -f "$TD3_CHECKPOINT" ]]; then
     log_phase "Ripresa Training (Resume)"
     TD3_SIZE=$(du -h "$TD3_CHECKPOINT" | cut -f1)
@@ -141,10 +125,7 @@ else
     log_warn "Consiglio: esegui prima './train_bc.sh' per addestrare il BC."
 fi
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Addestramento TD3
-# ═══════════════════════════════════════════════════════════════════════
-
+# Addestramento TD3
 log_info "Episodi: ${BOLD}$TD3_EPISODES${NC} | Seme: $TD3_SEED | Passi massimi/episodio: $TD3_MAX_STEPS"
 log_info "Policy in uscita: $TD3_POLICY"
 log_info "Checkpoint in uscita: $TD3_CHECKPOINT"

@@ -1,16 +1,24 @@
 """
-gearing.py - cambio marcia deterministico velocita-primario.
+Modulo per la gestione deterministica e algoritmica del cambio marcia (1..6) in TORCS per l'agente IA.
 
-La marcia non e' predetta dalla rete. Training, eval e test usano questa stessa
-funzione, cosi' non esiste mismatch tra la policy salvata e la guida live.
+Nota sulla pipeline:
+  - Raccolta Dati (Data Collection): Il pilota umano guida utilizzando il cambio manuale (es. pulsanti
+    del controller o frecce della tastiera). Le marce inserite manualmente vengono registrate direttamente
+    nel dataset HDF5 per l'apprendimento supervisionato iniziale.
+  - Addestramento RL ed Evaluation (TD3+BC / Test): La selezione della marcia viene gestita in modo
+    automatico e deterministico da questo modulo. Questo permette di escludere la marcia dallo spazio delle
+    azioni predette dalla rete neurale (che controlla unicamente steer, accel e brake), semplificando
+    l'addestramento ed evitando mismatch comportamentali.
 
-Principio:
-  - il downshift guarda la velocita', che in frenata cala in modo monotono;
-  - l'upshift richiede gas applicato e rpm alti;
-  - isteresi e cooldown impediscono jitter al confine delle soglie.
+Meccanismi di funzionamento:
+  - Downshift (Scalata): Basato esclusivamente sulla velocità del veicolo, che cala in modo
+    monotono durante le frenate. Evita le oscillazioni dovute ai picchi temporanei di RPM.
+  - Upshift (Salita): Consentito solo in presenza di acceleratore premuto (> 40%), giri motore
+    elevati (> 15500 RPM) e velocità superiore alla soglia specifica della marcia corrente.
+  - Prevenzione Jitter: Isteresi strutturale (soglie di scalata inferiori a quelle di salita)
+    e cooldown temporale di lockout (SHIFT_COOLDOWN) impediscono cambi marcia ripetuti o oscillazioni.
 
-Le soglie sono derivate dai giri umani in train_set/laps e validate live sulla
-policy RL: circa 10.5 cambi ogni 1000 step, senza oscillazioni rapide.
+Le soglie sono calibrate sui dati di telemetria dei piloti esperti e validate sul circuito.
 """
 
 # Soglie di velocità (km/h) per salire di marcia: g1→2, g2→3, g3→4, g4→5, g5→6.
@@ -18,9 +26,9 @@ UP_SPEED = [55.0, 118.0, 200.0, 258.0, 286.0]
 # Soglie di velocità (km/h) per scendere di marcia (isteresi: < UP_SPEED): g2→1, g3→2, g4→3, g5→4, g6→5.
 DN_SPEED = [40.0, 92.0, 165.0, 232.0, 272.0]
 
-UP_RPM_GATE = 15500.0   # non salire di marcia se gli rpm non sono già alti (evita di "tirare corto")
-UP_ACCEL_GATE = 0.4     # non salire se non si è sul gas (chiave anti-hunting in staccata)
-SHIFT_COOLDOWN = 5      # step di lockout dopo un cambio (anti-jitter)
+UP_RPM_GATE = 15500.0   # non salire di marcia se gli rpm non sono già alti
+UP_ACCEL_GATE = 0.4     # non salire se non si è sul gas
+SHIFT_COOLDOWN = 5      # step di lockout dopo un cambio
 
 
 def compute_gear(speed_kmh, accel, rpm, current_gear, steps_since_shift):

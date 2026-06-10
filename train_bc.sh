@@ -1,15 +1,7 @@
 #!/usr/bin/env bash
-# ═══════════════════════════════════════════════════════════════════════
-#  train_bc.sh — Avvia l'addestramento AIcar (Behavioral Cloning)
-#
-#  L'agente imita i dati esperti raccolti durante la Fase 1.
-#
-#  Uso:
-#    ./train_bc.sh                          # Avvia il training BC
-#
-#  Nota: La Fase 1 (Data Collection) richiede guida umana e va eseguita
-#        manualmente con: python data_collection.py
-# ═══════════════════════════════════════════════════════════════════════
+# Script train_bc.sh per avviare l'addestramento dell'agente tramite Behavioral Cloning (BC).
+# L'agente impara ad imitare la guida e le traiettorie esperte raccolte manualmente.
+# Uso: ./train_bc.sh
 set -euo pipefail
 
 # ── Colori ──
@@ -63,9 +55,7 @@ log_info "Demo trovate: ${BOLD}${DEMO_COUNT} giri completi${NC} in $DEMO_DIR"
 # Crea directory necessarie
 mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR"
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Behavioral Cloning Training
-# ═══════════════════════════════════════════════════════════════════════
+# Behavioral Cloning Training
 log_phase "Training: Behavioral Cloning"
 log_info "Dataset: $DEMO_DIR ($DEMO_COUNT giri completi; segmenti esclusi dal BC)"
 log_info "Epochs: $BC_EPOCHS | Batch: $BC_BATCH_SIZE"
@@ -91,9 +81,7 @@ fi
 
 echo ""
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Prossimo passo: fine-tuning TD3+BC
-# ═══════════════════════════════════════════════════════════════════════
+# Prossimo passo: fine-tuning TD3+BC
 log_info ""
 log_info "Per avviare il fine-tuning TD3+BC (warm-start dal BC appena addestrato):"
 log_info "${BOLD}./train_rl.sh${NC}"

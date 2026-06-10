@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# ═══════════════════════════════════════════════════════════════════════
-#  stop_training.sh — Ferma i processi AIcar di training, test e TORCS
-# ═══════════════════════════════════════════════════════════════════════
+# Script stop_training.sh per fermare i processi di training, test e TORCS
 
-echo "Arresto dei processi di addestramento AIcar in corso..."
+echo "Arresto dei processi di addestramento in corso..."
 
 # Ferma gli script di training
 pkill -f "train_bc.sh" || echo "Nessun processo train_bc.sh attivo."
