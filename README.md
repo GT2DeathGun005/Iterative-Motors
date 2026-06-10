@@ -1,308 +1,202 @@
-# AIcar - Hybrid BC-RL Architecture (IBM AI RACING LEAGUE 2026)
+# Iterative Motors
 
-Agente autonomo per TORCS sviluppato per partecipare alla **IBM AI RACING LEAGUE 2026**. Il modello viene addestrato in due fasi: imita giri umani puliti con Behavioral Cloning, poi viene raffinato online con TD3+BC mantenendo un ancoraggio costante ai dati esperti.
+Iterative Motors è un progetto di guida autonoma per TORCS nato con un obiettivo preciso: partecipare alla IBM AI Racing League 2026 e costruire un agente capace di superare i limiti e le prestazioni umane sul giro. L'idea è partire dalla competenza di un pilota reale, trasferirla in una rete neurale tramite Behavioral Cloning e poi spingere oltre quella base con Reinforcement Learning TD3+BC.
 
-La pipeline attuale usa una sola architettura viva:
+In pratica, il modello non prova a guidare "da zero". Prima impara a imitare traiettorie, accelerazioni e staccate umane; poi usa il simulatore per esplorare varianti, correggere errori e cercare una guida più veloce e robusta.
 
-- stato base 29D, stacked in 87D (`t-12`, `t-6`, `t`);
-- Actor continuo con backbone 4x512 + `continuous_head` per `steer`, `accel`, `brake`;
-- cambio marcia deterministico in `gearing.py`;
-- ambiente TORCS con azione unica `[steer, accel, brake, gear]`;
-- reward da corsa minimalista: velocità in avanti, validità pista, anti-zigzag leggero;
-- replay online, expert buffer permanente ed elite buffer per self-imitation.
+Per i dettagli tecnici completi vedi [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Il wrapper espone solo il contratto usato dalla pipeline: la policy controlla gas/freno, `gearing.py` controlla la marcia, TORCS gira senza input visivo della rete.
+## Caratteristiche Principali
 
-### Paper di riferimento
+- Simulatore TORCS controllato tramite protocollo SCR/UDP.
+- Raccolta dati umana con controller PS5 DualSense o tastiera.
+- Dataset HDF5 con giri completi e segmenti mirati sulle curve difficili.
+- Policy neurale MLP 87D -> 3D con frame stacking temporale.
+- Behavioral Cloning con loss pesata per sterzo, freno e acceleratore.
+- Data augmentation per recupero laterale, errore angolare e overspeed in curva.
+- Fine-tuning TD3+BC con Actor warm-start da BC e Twin Critic.
+- Replay buffer ibrido: expert, online ed elite.
+- Cambio marcia deterministico separato dalla rete.
+- Checkpoint atomici con backup `.bak`/`.prev` e resume.
+- Evaluation deterministica e auto-detect del miglior checkpoint.
 
-Le scelte correnti sono ancorate a tre linee di letteratura:
+## Struttura Del Progetto
 
-- **Fujimoto & Gu, 2021 - TD3+BC**: base della loss Actor `-lambda Q + (pi-a)^2`, normalizzazione del termine RL con `lambda / mean(|Q|)` e normalizzazione degli stati.
-- **Bojarski et al., 2016 - End to End Learning for Self-Driving Cars**: ispirazione per l'augmentation di recupero, dove stati perturbati insegnano alla rete a rientrare in traiettoria.
-- **Beeson & Montana, 2022 - Conservative/Relaxed Policy Constraint per offline-to-online RL**: riferimento per la fase separata di refinement, in cui il vincolo imitativo viene allentato solo quando la policy è stabile in plateau.
-
----
-
-## Perché Funziona
-
-Il Behavioral Cloning da solo guida bene solo finché l'auto resta vicino alla distribuzione umana. Appena l'agente sbaglia traiettoria, incontra stati che il dataset non contiene e accumula errore. Il TD3+BC risolve il problema senza distruggere ciò che il BC ha imparato:
-
-1. **Warm-start dal BC**: l'Actor parte già capace di sterzare, accelerare e frenare in modo plausibile.
-2. **Ancora BC costante**: nei batch expert l'Actor paga una penalità se si allontana dall'azione umana. Questo impedisce drift improvvisi.
-3. **Masking rigoroso**: la penalità imitativa si applica solo ai campioni marcati expert. Sugli stati online sporchi l'Actor può seguire il Critic e imparare recuperi.
-4. **Expert buffer separato**: i giri umani non vengono persi dalla FIFO del replay online. Ogni batch mantiene un riferimento umano.
-5. **Cambio deterministico**: la marcia non è predetta dalla rete. `gearing.compute_gear()` usa velocità, gas applicato, rpm e cooldown, eliminando oscillazioni di marcia e mismatch tra training/test.
-6. **Reward minimale**: il reward incentiva il progresso e punisce uscita pista, spin, stallo e giro non completato. L'agente resta libero di scegliere velocità e staccate.
-7. **Normalizzazione coerente**: scaling fisico fisso + normalizzazione mean/std condivisa da BC, TD3 e test. La rete vede lo stesso spazio in ogni fase.
-
----
-
-## Pipeline
-
-```
-data_collection.py  ->  behavioral_cloning.py  ->  td3_bc.py  ->  test_agent.py
-      HDF5                    bc_policy.pth          TD3+BC        eval deterministica
+```text
+.
+|-- data_collection.py        # raccolta dati umani in TORCS
+|-- behavioral_cloning.py     # training supervisionato BC
+|-- td3_bc.py                 # fine-tuning TD3+BC
+|-- test_agent.py             # test deterministico dell'agente
+|-- gearing.py                # cambio marcia algoritmico
+|-- gym_torcs/                # wrapper TORCS e client SCR
+|-- train_bc.sh               # avvio training BC
+|-- train_rl.sh               # avvio/resume training TD3+BC
+|-- stop_training.sh          # stop processi training/TORCS
+|-- train_set/                # dataset, checkpoint e log locali
+`-- telemetry/                # CSV generati dai test
 ```
 
-| Fase | Script | Output principale |
-|---|---|---|
-| Raccolta dati | `data_collection.py` | `train_set/laps/lap_*.h5` |
-| Behavioral Cloning | `behavioral_cloning.py` | `train_set/checkpoints/bc_policy.pth`, `state_norm.npz` |
-| TD3+BC | `td3_bc.py` / `train_rl.sh` | `td3_policy.pth`, `td3_checkpoint.pth`, record `td3_*` |
-| Test | `test_agent.py` | telemetria CSV e tempi giro |
+`train_set/` e `telemetry/` sono ignorate da Git tranne i `.gitkeep`: i dati raccolti, i checkpoint e la telemetria sono artefatti locali.
 
----
+## Prerequisiti
 
-## Repository
+Il progetto è pensato per Linux. Servono:
 
-```
-AIcar/
-├── data_collection.py
-├── behavioral_cloning.py
-├── td3_bc.py
-├── test_agent.py
-├── gearing.py
-├── train_bc.sh
-├── train_rl.sh
-├── stop_training.sh
-├── gym_torcs/
-│   ├── gym_torcs.py
-│   ├── snakeoil3_gym.py
-│   └── autostart.sh
-├── telemetry/
-└── train_set/
-    ├── laps/
-    ├── checkpoints/
-    │   ├── backups/
-    │   └── buffers/
-    └── session_logs/
-```
+- Python 3;
+- TORCS con server SCR disponibile;
+- `xvfb-run` per training/test headless;
+- `xte`, fornito di solito da `xautomation`, per l'autostart dei menu TORCS;
+- librerie Python: `torch`, `numpy`, `h5py`, `pygame`, `gym`.
 
----
-
-## 1. Raccolta Dati
-
-Registra giri umani validi. Il giro viene salvato solo se completato senza superare `|trackPos| > 1.25`.
+Setup indicativo:
 
 ```bash
-python data_collection.py --output_dir train_set --device controller
-python data_collection.py --output_dir train_set --device keyboard
+sudo apt install torcs xvfb xautomation
+python -m venv .venv
+source .venv/bin/activate
+pip install numpy torch h5py pygame gym
 ```
 
-Raccolta mirata per curve difficili:
+Per PyTorch con CUDA conviene usare il comando ufficiale adatto alla propria GPU.
+
+## Uso Rapido
+
+### 1. Raccogliere Dimostrazioni Umane
+
+Con controller:
 
 ```bash
-python data_collection.py --output_dir train_set --device controller --segment_only
-python data_collection.py --output_dir train_set --device controller --segment_only --zones "670:810,940:1070"
+python data_collection.py --device controller
 ```
 
-I file HDF5 contengono:
+Con tastiera:
 
-- `states`: stato base 29D;
-- `actions`: `[steer, accel, brake, gear]`;
-- `dist_from_start`: metadato di posizione per analisi e segmentazione.
+```bash
+python data_collection.py --device keyboard
+```
 
-`dist_from_start` non entra nella rete. Il modello resta 29D perché la posizione assoluta produce mismatch tra train/test e non generalizza alle correzioni locali.
+I giri validi vengono salvati in `train_set/laps/lap_XXX.h5`. Per salvare solo segmenti di curve:
 
----
+```bash
+python data_collection.py --device controller --segment_only
+```
 
-## 2. Behavioral Cloning
+Per indicare zone specifiche:
+
+```bash
+python data_collection.py --device controller --segment_only --zones "670:900,2380:2530"
+```
+
+### 2. Addestrare Il Behavioral Cloning
 
 ```bash
 ./train_bc.sh
 ```
 
-Oppure:
+Output principali:
+
+- `train_set/checkpoints/bc_policy.pth`;
+- `train_set/checkpoints/state_norm.npz`;
+- log in `train_set/session_logs/`.
+
+Comando equivalente manuale:
 
 ```bash
 python behavioral_cloning.py \
-    --dataset train_set/laps \
-    --epochs 300 \
-    --batch_size 256 \
-    --lr 3e-4 \
-    --output train_set/checkpoints/bc_policy.pth
+  --dataset train_set/laps \
+  --epochs 300 \
+  --batch_size 256 \
+  --output train_set/checkpoints/bc_policy.pth
 ```
 
-Il BC carica solo giri interi `lap_[0-9]*.h5`. I segmenti `lap_seg_*.h5` sono esclusi dal BC perché concentrano una sola curva e spostano la media delle azioni su stati sensorialmente simili. Quei segmenti vengono invece usati dal TD3+BC nell'expert buffer, dove il Critic può valutarli senza trasformarli in un target globale cieco alla posizione.
-
-Il training BC usa augmentation di recupero sul 50% del batch:
-
-- perturbazione laterale `trackPos`;
-- perturbazione angolare `angle`;
-- aggiornamento geometrico dei sensori `track`;
-- correzione proporzionale dello sterzo target;
-- riduzione del gas e aumento del freno per stati troppo aggressivi.
-
-Il 50% non perturbato preserva la guida pulita sulla traiettoria ideale.
-
----
-
-## 3. TD3+BC
+### 3. Avviare Il Fine-Tuning TD3+BC
 
 ```bash
 ./train_rl.sh
-TD3_EPISODES=500 ./train_rl.sh
+```
+
+Variabili utili:
+
+```bash
+TD3_EPISODES=500 TD3_MAX_STEPS=5000 TD3_SEED=42 ./train_rl.sh
+```
+
+Flag principali:
+
+```bash
 ./train_rl.sh --clean
 ./train_rl.sh --rollback
-./train_rl.sh --rollback --actor-freeze-episodes 100 --no-auto-refine
+./train_rl.sh --rollback --actor-freeze-episodes 100
 ./train_rl.sh --no-auto-refine
 ./train_rl.sh --refine
 ```
 
-Lancio diretto:
+`--clean` elimina i checkpoint TD3 del run corrente, ma preserva i record deterministici assoluti gestiti dai sidecar dedicati.
+
+Per fermare in modo ordinato:
 
 ```bash
-python td3_bc.py \
-    --bc_weights train_set/checkpoints/bc_policy.pth \
-    --episodes 1000 \
-    --max_steps 5000 \
-    --seed 42
+./stop_training.sh
 ```
 
-Durante il training:
+Oppure usa `Ctrl+C`: `td3_bc.py` intercetta il segnale e prova a salvare un checkpoint completo prima di uscire.
 
-- l'Actor emette azioni TD3 in `[-1, 1]`;
-- `accel` e `brake` vengono mappati in `[0, 1]`;
-- `accel_final = accel * (1 - brake)` evita pressione simultanea dei pedali senza discontinuità rigide;
-- `gearing.compute_gear()` decide la marcia usando velocità, gas applicato, rpm e cooldown;
-- il Critic viene aggiornato a ogni step;
-- l'Actor viene aggiornato ogni 2 update del Critic dopo 15.000 step di warm-up.
+### 4. Testare L'Agente
 
-Sampling del batch:
+Auto-detect del miglior checkpoint:
 
-- 25% expert umano;
-- 15% elite/self-imitation, se disponibile;
-- 60% online.
+```bash
+python test_agent.py
+```
 
-Se online o elite sono scarsi, il batch viene riempito dall'expert buffer.
-
----
-
-## 4. Test Deterministico
+Per guardare TORCS durante il test:
 
 ```bash
 SHOW_GUI=1 python test_agent.py
-SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_det_best_lap.pth --laps 1
-SHOW_GUI=1 python test_agent.py --weights train_set/checkpoints/td3_det_best_dist.pth --laps 1
 ```
 
-Priorità auto-detect:
+Checkpoint esplicito:
 
-1. `td3_det_best_lap.pth`
-2. `td3_det_best_dist.pth`
-3. `td3_det_best_dist_run.pth`
-4. `td3_expl_best_lap.pth`
-5. `td3_expl_best_dist.pth`
-6. `td3_policy.pth`
-7. `bc_policy.pth`
+```bash
+python test_agent.py --weights train_set/checkpoints/td3_det_best_lap.pth --laps 5
+```
 
-I pesi TD3 usano `tanh` su tutti i canali continui. I pesi BC usano `tanh` sullo sterzo e `sigmoid` su gas/freno. `test_agent.py` sceglie la conversione dal nome file (`td3_*` o `bc_*`); per nomi custom usa `--kind rl` o `--kind bc`.
+Se il nome file non contiene `td3` o `bc`, specifica il tipo:
 
----
+```bash
+python test_agent.py --weights mio_actor.pth --kind rl
+python test_agent.py --weights mio_bc.pth --kind bc
+```
 
-## Checkpoint
+I CSV di telemetria vengono scritti in `telemetry/`.
+
+## Checkpoint Importanti
 
 | File | Significato |
-|---|---|
-| `bc_policy.pth` | Actor supervisionato da dati umani |
-| `td3_policy.pth` | ultimo Actor TD3 salvato |
-| `td3_checkpoint.pth` | stato completo per resume: reti, ottimizzatori, step, record |
-| `td3_det_best_lap.pth` | miglior giro valido deterministico, candidato submission |
-| `td3_det_best_dist.pth` | miglior progresso deterministico entro il primo giro, preservato dopo `--clean` |
-| `td3_det_best_dist_run.pth` | miglior progresso deterministico entro il primo giro nel run corrente |
-| `td3_expl_best_lap.pth` | giro valido in rollout esplorativo |
-| `td3_expl_best_dist.pth` | miglior distanza in rollout esplorativo |
-| `buffers/td3_checkpoint_buffer.npz` | replay online |
-| `buffers/td3_checkpoint_elite_buffer.npz` | elite buffer |
+| --- | --- |
+| `bc_policy.pth` | Policy addestrata solo con Behavioral Cloning |
+| `state_norm.npz` | Media e deviazione standard degli stati |
+| `td3_checkpoint.pth` | Checkpoint completo per resume TD3+BC |
+| `td3_policy.pth` | Ultima policy TD3 salvata |
+| `td3_det_best_lap.pth` | Miglior giro valido deterministico, candidato submission |
+| `td3_det_best_dist.pth` | Miglior distanza deterministica assoluta |
+| `td3_expl_best_lap.pth` | Miglior giro trovato durante esplorazione |
+| `td3_expl_best_dist.pth` | Miglior distanza trovata durante esplorazione |
 
-Il salvataggio è atomico: buffer prima, checkpoint completo dopo. I backup `.bak` e `.prev` stanno in `train_set/checkpoints/backups/`. Al resume, se un buffer è più nuovo del checkpoint scelto, viene ignorato in favore del backup allineato.
+Quando `test_agent.py` viene lanciato senza `--weights`, cerca i checkpoint in ordine di priorità e usa il migliore disponibile.
 
----
+## Idea Del Modello
 
-## Reward
+La policy vede tre istanti temporali dello stato sensoriale TORCS, concatenati in un input 87D. Produce sterzo, acceleratore e freno. La marcia non è appresa: `gearing.py` la calcola con soglie robuste di velocità, RPM e cooldown, riducendo lo spazio d'azione e migliorando la stabilità.
 
-Nel wrapper TORCS il reward per step è:
+Il Behavioral Cloning fornisce una guida iniziale umana. TD3+BC conserva quell'ancora esperta ma permette alla policy di ottimizzare la reward racing: avanzare lungo la pista, restare entro i limiti, evitare oscillazioni di sterzo, completare il giro e migliorare tempo/distanza in valutazione deterministica.
 
-```text
-progress = (speedX / 50.0) * cos(angle)
-reward = progress * 1.5
-       - 2.0 * max(0, abs(trackPos) - 1.0)^2
-       - 0.05 * abs(steer - last_steer)
-```
+## Riferimenti
 
-Terminazioni non valide:
-
-- `|trackPos| > 1.25`: giro invalido, con penalità terminale graduata;
-- stallo dopo il transitorio iniziale;
-- auto girata in senso opposto;
-- timeout/fine episodio senza un `lastLapTime` valido.
-
-Il bonus `+50` viene assegnato nel loop TD3 quando TORCS aggiorna `lastLapTime`, cioè quando un giro valido viene completato. Se l'episodio termina senza un giro valido, il loop TD3 applica un malus di giro incompleto.
-
-Questa formulazione ha funzionato perché non dice all'agente come affrontare una curva. Premia solo avanzamento valido e stabilità minima, lasciando al TD3 la libertà di trovare staccate e velocità migliori dei dati medi umani.
-
----
-
-## Stato e Normalizzazione
-
-Stato base 29D:
-
-| Indice | Feature | Scaling fisico |
-|---|---|---|
-| 0 | `angle` | radianti |
-| 1-19 | `track[19]` | `/200` |
-| 20 | `trackPos` | nessuno |
-| 21 | `speedX` | `/50` |
-| 22 | `speedY` | `/50` |
-| 23 | `speedZ` | `/50` |
-| 24-27 | `wheelSpinVel[4]` | `/100` |
-| 28 | `rpm` | `/10000` |
-
-Poi `state_norm.npz` applica mean/std alle 29 feature prima dello stacking nella rete. Non aggiungere normalizzazioni locali: BC, TD3 e test devono vedere lo stesso spazio.
-
----
-
-## Cambio Marcia
-
-`gearing.compute_gear(speed_kmh, accel, rpm, current_gear, steps_since_shift)` è l'unica logica di cambio marcia usata in training, eval e test.
-
-Principi:
-
-- downshift basato sulla velocità, non sugli rpm;
-- upshift consentito solo se il gas applicato è sufficiente e gli rpm sono alti;
-- soglie con isteresi;
-- cooldown dopo ogni cambio.
-
-Questo ha risolto le oscillazioni perché in staccata gli rpm possono salire temporaneamente dopo un downshift, mentre la velocità resta monotona. Guardare la velocità per scalare evita il loop scendi-risali-scendi.
-
----
-
-## Refinement
-
-La refinement è una fase separata, non il training normale. Si attiva manualmente con `--refine` o automaticamente quando le eval deterministiche restano in plateau:
-
-- Critic non aggiornato;
-- loss Critic mostrata solo come diagnostica;
-- peso BC ridotto a `0.3`;
-- uscita in consolidamento se supera stabilmente il plateau;
-- ritorno a `bc_weight=1.0` e Critic riattivato.
-
-Serve quando la policy è stabile ma bloccata sotto una curva difficile: si riduce temporaneamente il vincolo imitativo per sfruttare il valore già appreso dal Critic, poi si consolida di nuovo con l'ancora BC completa.
-
----
-
-## Invarianti del Progetto
-
-- `TorcsEnv.step()` riceve sempre `[steer, accel, brake, gear]`.
-- La rete non predice la marcia.
-- Il BC addestra solo `steer`, `accel`, `brake`.
-- Il BC carica solo giri interi.
-- I segmenti mirati entrano solo nel TD3 expert buffer.
-- `dist_from_start` è metadato, non feature.
-- Il cambio marcia è sempre `gearing.compute_gear()`.
-- La mutual exclusion dei pedali è moltiplicativa.
-- La policy di test è deterministica.
-
----
-
-**IBM AI RACING LEAGUE 2026** - Precision Driving through Hybrid BC-RL.
+- Lillicrap et al., "Continuous Control with Deep Reinforcement Learning", 2015: https://arxiv.org/abs/1509.02971
+- Fujimoto, van Hoof, Meger, "Addressing Function Approximation Error in Actor-Critic Methods", 2018: https://arxiv.org/abs/1802.09477
+- Fujimoto, Gu, "A Minimalist Approach to Offline Reinforcement Learning", 2021: https://arxiv.org/abs/2106.06860
+- Beeson, Montana, "Improving TD3-BC: Relaxed Policy Constraint for Offline Learning and Stable Online Fine-Tuning", 2022: https://arxiv.org/abs/2211.11802
+- Bojarski et al., "End to End Learning for Self-Driving Cars", 2016: https://arxiv.org/abs/1604.07316
+- Loiacono, Cardamone, Lanzi, "Simulated Car Racing Championship: Competition Software Manual", 2013: https://arxiv.org/abs/1304.1672

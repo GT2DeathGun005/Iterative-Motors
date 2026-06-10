@@ -39,7 +39,7 @@ log_phase() { echo -e "\n${BOLD}${BLUE}═════════════�
               echo -e "${BOLD}${BLUE}══════════════════════════════════════════${NC}\n"; }
 
 # ── Pre-check ──
-log_phase "AIcar BC Training Pipeline"
+log_phase "Iterative Motors BC Training Pipeline"
 
 # Controlla che esistano giri completi. Il BC esclude i segmenti lap_seg_*.h5:
 # quei file vengono usati solo dall'expert buffer del TD3+BC.

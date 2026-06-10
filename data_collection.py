@@ -139,7 +139,7 @@ class DualSenseController:
         return np.array([steering, accel, brake, float(self.gear)], dtype=np.float32)
 
     def rumble(self, intensity: float = 0.3, duration_ms: int = 180):
-        """Funzione che restituisce l'intensità e la durata del rumble."""
+        """Attiva un breve feedback aptico, se il controller lo supporta."""
         try:
             self.joystick.rumble(0.0, float(min(0.5, intensity)), int(duration_ms))
         except Exception:

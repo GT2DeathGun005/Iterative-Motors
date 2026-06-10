@@ -23,7 +23,7 @@ def _kill_torcs():
 class TorcsEnv:
     # Variabili usate per valutare la terminazione anticipata in caso di stallo della vettura
     terminal_judge_start = 500  # 10 secondi dopo la quale si inizia a valutare se la vettura è in stallo
-    termination_limit_progress = 5  # Se la vettura non avanza di almeno 5 unità di distanza in 10 secondi, consideriamo che è in stallo e terminiamo l'episodio.
+    termination_limit_progress = 5  # Dopo 10 secondi, se la velocità/progresso in avanti scende sotto circa 5 m/s, consideriamo l'auto in stallo.
     off_track_limit = 1.25  # Oltre questo valore il giro è considerato non valido.
     off_track_penalty_base = 5.0  # Penalità terminale minima quando si supera off_track_limit.
     off_track_penalty_extra = 5.0  # Penalità progressiva aggiuntiva, saturata entro +1.0 trackPos.
@@ -199,12 +199,12 @@ class TorcsEnv:
                 client.R.d['meta'] = True # Flag per segnalare che l'episodio deve terminare
 
 
-            # Valuta se la vettura è in stallo: 
-            # - se dopo 10 secondi (terminal_judge_start) non ha completato il giro 
+            # Valuta se la vettura è in stallo:
+            # - se dopo 10 secondi (terminal_judge_start) non ha completato il giro
             # - Se l'episodio non è terminato 
             # - se il giro non è completato
             if not episode_terminate and not lap_completed and self.terminal_judge_start < self.time_step:
-                # Se il progresso è insufficiente (non ha avanzato di almeno 5 unità di distanza in 10 secondi), consideriamo che è in stallo e terminiamo l'episodio.
+                # Se il progresso istantaneo in avanti è insufficiente, consideriamo l'auto in stallo e terminiamo l'episodio.
                 if progress < (self.termination_limit_progress / 50.0):
                     reward -= self.incomplete_lap_step_penalty  #Aggiona la reward contando la penalità per stallo
                     

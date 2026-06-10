@@ -50,10 +50,12 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, random_split
 from datetime import datetime
 
+BATCH_SIZE = 256
+LR = 3e-4
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ──────────────────────────────────────────────────────────────────────
-#  Dataset HDF5
-# ──────────────────────────────────────────────────────────────────────
+
+# Dataset HDF5
 
 class TorcsHDF5Dataset(Dataset):
     """Estende la classe Dataset di PyTorch per caricare dati da un file HDF5 contenente osservazioni e azioni del pilota.
@@ -285,7 +287,7 @@ class BehaviorCloningTrainer:
                 - Acceleratore: peso base 1.0.
                 - Freno: peso base 5.0 (con un boost dinamico del 25x quando il pilota frena, per costringere la rete ad apprendere le staccate).
 
-      - Validation split 80/20 con Early Stopping (patience=30)
+      - Validation split 80/20 con Early Stopping configurabile
             - Il dataset viene diviso in due parti: 80% per il training e 20% per la validazione
             - L'early stopping impedisce l'overfitting fermando l'allenamento quando la validation loss smette di migliorare (evita di sprecare risorse computazionali)
       
@@ -304,10 +306,7 @@ class BehaviorCloningTrainer:
     BRAKE_ACTIVE_THRESHOLD = 0.05  # soglia sopra la quale consideriamo che l'umano stia frenando
     BRAKE_BOOST_FACTOR = 25.0      # moltiplicatore dell'errore sul freno quando attivo
 
-    # Definizioni iperparametri
-    #BATCH_SIZE = 128 valore standard ma aumentabile se si hanno più risorse
-    #LR = 3e-4 costante di Karpathy 
-    #DEVICE = "cpu" default per tutti i pc, ma vale cuda se si dispone di una GPU
+    # I default globali vengono sovrascritti dagli argomenti CLI passati da train_bc.sh/main().
 
     def __init__(self, model: nn.Module, dataset: Dataset,
                  batch_size: int = BATCH_SIZE, lr: float = LR, device: str = DEVICE,

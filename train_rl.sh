@@ -94,7 +94,7 @@ for arg in "$@"; do
 done
 
 # Pre-check
-log_phase "AIcar TD3+BC Training (Reinforcement Learning)"
+log_phase "Iterative Motors TD3+BC Training (Reinforcement Learning)"
 
 # Crea directory necessarie
 mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR" "train_set/checkpoints/buffers" "$BACKUP_DIR/buffers"

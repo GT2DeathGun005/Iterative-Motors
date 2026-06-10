@@ -6,7 +6,7 @@
 # extentions used in the Simulated Car Racing competitions.
 # http://scr.geccocompetitions.com/
 #
-# AIcar usa questo file come client UDP SCR a basso livello. Tutta la logica di
+# Iterative Motors usa questo file come client UDP SCR a basso livello. Tutta la logica di
 # guida vive in gym_torcs.py, td3_bc.py, test_agent.py e gearing.py; qui restano
 # solo parsing della telemetria, formato dell'azione e gestione socket.
 #

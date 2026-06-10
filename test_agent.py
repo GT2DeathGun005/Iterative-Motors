@@ -8,8 +8,8 @@ senza esplorazione stocastica, permettendo di quantificare metriche quali tempo 
 fuoripista o stalli.
 
 Meccanismi chiave implementati per garantire un test deterministico ed affidabile:
-  1. Stato di Valutazione (model.eval()): Disabilita i comportamenti stocastici dei moduli di PyTorch,
-     come LayerNorm o Dropout, stabilizzando l'output per lo stesso input.
+  1. Stato di Valutazione (model.eval()): mette il modello in modalità inferenza. L'Actor non usa Dropout;
+     LayerNorm è deterministica, ma la modalità eval mantiene il percorso coerente con il testing.
   2. Rimozione del Rumore: L'azione è determinata in modalità pura tanh(mean) escludendo
      qualsiasi rumore di esplorazione gaussiana o Ornstein-Uhlenbeck usato in fase di addestramento.
   3. Cambio Marcia Deterministico: La selezione della marcia è delegata interamente al modulo

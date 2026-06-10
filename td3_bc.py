@@ -122,8 +122,9 @@ def _track_progress_from_start(start_dist, current_dist):
     Gestisce correttamente la logica di wrap-around (ritorno a zero) al passaggio sulla linea del traguardo
     sfruttando la lunghezza totale nota del circuito (TRACK_LENGTH_M = 3608m).
     
-    Non abbiamo usato distraced perché misura i chilometri percorsi, anche se il veicolo sbanda o va lungo, questo rischia di sovrastimare da distranza percorsa
-    portando il modello a fare più chilometri possibili invece che cercare il giro più veloce (situazione che è stata evitata dal termine progress nella reward function)
+    Non usiamo distRaced perché misura la distanza realmente percorsa dal veicolo anche quando sbanda
+    o allunga la traiettoria: per il record di giro interessa invece il progresso lungo il tracciato,
+    misurato tramite distFromStart e corretto per il wrap al traguardo.
     """
     start = float(start_dist)
     current = float(current_dist)
