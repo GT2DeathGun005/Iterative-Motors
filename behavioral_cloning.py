@@ -6,7 +6,7 @@ Addestra una PolicyNetwork su spazi di dimensione continua sulle dimostrazioni u
 Features:
   - Supporto multi-file: accetta sia un singolo .h5 sia una directory di lap_[0-9]*.h5 (solo giri completi)
   - Supporto hardware per CPU e GPU tramite pytorch per un training più veloce su sistemi con GPU 
-  - Split del datasetin train e validation set (80/20) con Early Stopping per evitare overfitting
+  - Split del dataset in train e validation set (80/20) con Early Stopping per evitare overfitting
   - Il Cosine LR scheduler modifica dinamicamente il learning rate durante il training per una migliore convergenza del modello.
     Grazie a questa feature il learning rate varia seguendo l'andamento del coseno, se avessimo usato altri tipi di scheduler
     il modello avrebbe potuto convergere più lentamente o non convergere affatto alla fine del training. In questo modo il learning rate è
@@ -623,7 +623,7 @@ class BehaviorCloningTrainer:
 def main():
     # Definisce la funzione che gestisce gli argomenti da riga di comando e li passa al modello per regolarne il comportamento
     parser = argparse.ArgumentParser(
-        description="Behavioral Cloning l'addestramento dell'agente"
+        description="Behavioral Cloning per l'addestramento dell'agente"
     )
     
     # argomento per modificare la directory dei dati di addestramento 
