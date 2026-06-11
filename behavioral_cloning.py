@@ -169,7 +169,7 @@ def load_dataset(path: str) -> Dataset:
         # Restituisce il dataset concatenato e il numero totale di campioni
         return ConcatDataset(datasets), total_samples
     
-    # Se il path è un file h5 caruca siki quello e restituiscilo
+    # Se il path è un file h5 carica solo quello e restituiscilo
     else: 
         ds = TorcsHDF5Dataset(path)
         return ds, len(ds)
@@ -520,7 +520,7 @@ class BehaviorCloningTrainer:
             states = states.view(batch_size, 87)
 
             self.optimizer.zero_grad() #azzera i gradienti del passo precedente
-            pred_cont = self.model(states) #passa il batch alla rete neurale per essere processsato
+            pred_cont = self.model(states) #passa il batch alla rete neurale per essere processato
             loss = self._combined_loss(pred_cont, targets) #calcola la loss
             loss.backward() #calcola i gradienti
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) #clippa i gradienti per evitare esplosione del gradiente se superano 1.0
