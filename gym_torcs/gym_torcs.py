@@ -72,7 +72,7 @@ class TorcsEnv:
             dtype=np.float32,
         )
 
-        #Dizionario con tutte le infomrazioni che invia TORCS, ogni infomrazione ha le sue dimensioni (visibili da shape) e range di valori
+        #Dizionario con tutte le informazioni che invia TORCS, ogni informazione ha le sue dimensioni (visibili da shape) e range di valori
         self.observation_space = spaces.Dict({
             'focus': spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32),
             'speedX': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
@@ -149,7 +149,7 @@ class TorcsEnv:
         # La scelta di mettere la reward in questo file è stata effettuata per convenienza
         # Avremmo potuto metterla in TD3+BC ma così è più semplice accedere alle variabili necessarie per il calcolo della stessa
         # Quali obs, last_steer, ecc... 
-        # La reward 
+        # Calcola la reward come combinazione lineare delle componenti 
         reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
 
         # Estrae il lap time dell'ultimo giro completato 
@@ -206,7 +206,7 @@ class TorcsEnv:
             if not episode_terminate and not lap_completed and self.terminal_judge_start < self.time_step:
                 # Se il progresso istantaneo in avanti è insufficiente, consideriamo l'auto in stallo e terminiamo l'episodio.
                 if progress < (self.termination_limit_progress / 50.0):
-                    reward -= self.incomplete_lap_step_penalty  #Aggiona la reward contando la penalità per stallo
+                    reward -= self.incomplete_lap_step_penalty  #Aggiorna la reward contando la penalità per stallo
                     
                     # Aggiorna le flag di info per indicare che c'è stato un crash per stallo 
                     info['crash'] = True    
@@ -214,12 +214,12 @@ class TorcsEnv:
                     episode_terminate = True
                     client.R.d['meta'] = True
 
-            # Valuta se la vettura ha sbinnato:
+            # Valuta se la vettura ha fatto uno spin:
             # - se l'episodio non è terminato
             # - se il giro non è completato
             # - se il coseno dell'angolo tra la vettura e l'asse della pista è negativo
             if not episode_terminate and not lap_completed and np.cos(obs['angle']) < 0:
-                reward -= self.incomplete_lap_step_penalty  #Aggiona la reward contando la penalità per sbin (la stessa di quella di stallo)
+                reward -= self.incomplete_lap_step_penalty  #Aggiorna la reward contando la penalità per sbin (la stessa di quella di stallo)
                 
                 # Aggiorna le flag di info 
                 info['crash'] = True
