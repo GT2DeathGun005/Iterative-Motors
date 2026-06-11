@@ -138,7 +138,7 @@ def _fsync_file(path):
     Forza la scrittura fisica (flush) dei dati dal buffer di memoria del sistema operativo sul disco fisso.
     
     Viene usata dopo le operazioni di scrittura dei checkpoint per assicurare che il file sia memorizzato
-    fisicamente e non rimanga in una coda volatile volatile del kernel, evitando file corrotti (da 0 byte)
+    fisicamente e non rimanga in una coda volatile del kernel, evitando file corrotti (da 0 byte)
     in caso di improvviso crash del sistema.
     """
     with open(path, 'rb') as f:
@@ -1294,7 +1294,6 @@ def train():
             f.write("AVVIO con --no-auto-refine: refinement automatica disattivata; "
                     "--refine manuale resta disponibile.\n")
 
-    batch_size = 256
     elite_threshold = 500.0
 
     print("Avvio training TD3+BC...")
