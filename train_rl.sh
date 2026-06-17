@@ -10,6 +10,8 @@
 #   ./train_rl.sh --rollback --actor-freeze-episodes 100  # Congela l'Actor più a lungo per far recuperare il Critic
 #   ./train_rl.sh --no-auto-refine     # Disattiva il passaggio automatico alla fase di refinement
 #   ./train_rl.sh --refine             # Avvia direttamente in refinement (Critic congelato)
+#   ./train_rl.sh --bc_alpha 4.0       # Sposta il bilanciamento verso il RL (default 2.5, paper TD3+BC)
+#   ./train_rl.sh --expert_max_lap_time 70.5  # Restringe l'ancora BC ai soli giri umani sotto soglia (default 71.0; <=0 li carica tutti)
 set -euo pipefail
 
 # Colori 

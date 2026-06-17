@@ -87,6 +87,21 @@ def bargraph(x,mn,mx,w,c='X'):
     pnc= int(posnonpu/upw)*'_'
     return '[%s]' % (nnc+npc+ppc+pnc)
 
+# Hook opzionale impostato dal processo chiamante (es. td3_bc.py): callable senza argomenti
+# che ritorna True quando l'utente ha richiesto lo stop. Permette di abortire l'attesa
+# del server TORCS invece di restare bloccati per sempre su "Waiting for server".
+abort_check = None
+
+class ServerTimeoutError(Exception):
+    """Il server TORCS non ha risposto entro il limite di tentativi di connessione.
+
+    aborted=True indica che l'attesa è stata interrotta da una richiesta di stop
+    dell'utente (via abort_check), non da un timeout del server.
+    """
+    def __init__(self, message, aborted=False):
+        super().__init__(message)
+        self.aborted = aborted
+
 class Client():
     def __init__(self,H=None,p=None,i=None,e=None,t=None,s=None,d=None,vision=False):
         # If you don't like the option defaults,  change them here.
@@ -133,7 +148,12 @@ class Client():
         # == Initialize Connection To Server ==
         self.so.settimeout(1)
 
-        n_fail = 5
+        # Attesa LIMITATA: se TORCS non espone il server SCR entro max_attempts secondi
+        # (es. la macro di autostart ha perso il timing e il gioco è fermo al menu),
+        # si solleva ServerTimeoutError così il wrapper TorcsEnv può rilanciare il
+        # simulatore invece di attendere all'infinito.
+        attempts = 0
+        max_attempts = 30  # ~30 s: ogni tentativo fallito consuma il timeout del socket (1 s)
         while True:
             # This string establishes track sensor angles! You can customize them.
             #a= "-90 -75 -60 -45 -30 -20 -15 -10 -5 0 5 10 15 20 30 45 60 75 90"
@@ -151,9 +171,19 @@ class Client():
                 sockdata,addr= self.so.recvfrom(data_size)
                 sockdata = sockdata.decode('utf-8')
             except socket.error as emsg:
+                attempts += 1
                 print("Waiting for server on %d............" % self.port)
-                # Il client resta in attesa finché TORCS espone il server SCR.
-                # L'avvio/riavvio del simulatore è gestito dal wrapper TorcsEnv.
+                if abort_check is not None and abort_check():
+                    self.so.close()
+                    self.so = None
+                    raise ServerTimeoutError(
+                        "Attesa del server TORCS interrotta da richiesta di stop.", aborted=True)
+                if attempts >= max_attempts:
+                    self.so.close()
+                    self.so = None
+                    raise ServerTimeoutError(
+                        f"Il server TORCS non risponde sulla porta {self.port} "
+                        f"dopo {max_attempts} tentativi.")
 
             identify = '***identified***'
             if identify in sockdata:

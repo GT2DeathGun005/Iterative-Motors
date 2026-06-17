@@ -58,7 +58,7 @@ Quando viene istanziato `TorcsEnv`, il wrapper:
 - lancia in parallelo `autostart.sh`, che con `xte` invia la sequenza di tasti dei menu (Race → Practice → New Race → Start) con pause da 200 ms;
 - attende altri 3 secondi per avvio e macro, poi espone `reset()`, `step()`, `get_obs()` ed `end()`.
 
-Durante la data collection `data_collection.py` forza `SHOW_GUI=1`, perché il pilota deve vedere la pista. Durante training e test il sistema gira headless: nel TD3+BC non serve renderizzare per un umano, e si evita di sprecare risorse grafiche. `reset(relaunch=True)` chiude esplicitamente il socket UDP e ripete l'intera procedura di kill/avvio: ripartire da un processo pulito riduce la probabilità che stato sporco, socket bloccati o memory leak del simulatore falsino il training.
+Durante la data collection `data_collection.py` forza `SHOW_GUI=1`, perché il pilota deve vedere la pista. Durante training e test il sistema gira headless: nel TD3+BC non serve renderizzare per un umano, e si evita di sprecare risorse grafiche. `reset(relaunch=True)` chiude esplicitamente il socket UDP e ripete l'intera procedura di kill/avvio: ripartire da un processo pulito riduce la probabilità che stato sporco, socket bloccati o memory leak del simulatore falsino il training. Il reset soft (`relaunch=False`) riavvia invece la gara in-place via flag `meta` ed è quasi istantaneo; se il socket del client risulta morto (server TORCS non risponde), `reset()` promuove automaticamente il reset soft a relaunch completo, perché altrimenti la riconnessione resterebbe in attesa per sempre di un server inesistente.
 
 ### Normalizzazione delle osservazioni
 
@@ -342,7 +342,7 @@ Per un dominio racing la stabilità di TD3 non è un lusso: gli episodi durano c
 
 TD3+BC (Fujimoto & Gu, 2021) aggiunge alla loss dell'Actor un termine di imitazione (MSE rispetto all'azione dell'esperto) bilanciato dal coefficiente adattivo `lambda`. Il razionale per questo progetto: il solo RL da zero sarebbe costoso e instabile in un simulatore racing — l'agente passerebbe migliaia di episodi a sbattere prima di completare un giro — mentre la BC fornisce un comportamento iniziale umano che il TD3 raffina. I dettagli della loss ibrida sono nella sezione sull'aggiornamento, più sotto.
 
-Costanti di modulo: `LAP_SUCCESS_BONUS = 50.0`, `INCOMPLETE_LAP_PENALTY = 25.0`, `TRACK_LENGTH_M = 3608.0`, `EVAL_DISTANCE_SANITY_LIMIT = 3800.0`.
+Costanti di modulo: `LAP_SUCCESS_BONUS = 50.0`, `INCOMPLETE_LAP_PENALTY = 25.0`, `TRACK_LENGTH_M = 3608.0`, `EVAL_DISTANCE_SANITY_LIMIT = 3800.0`, `LAP_TIME_BONUS_REF_S = 80.0`, `LAP_TIME_BONUS_PER_S = 10.0`, `EVAL_SCORE_T_REF_S = 90.0`, `EVAL_SCORE_SANITY_LIMIT = 6500.0`, `EXPL_NOISE_START = 0.10`, `EXPL_NOISE_END = 0.04`, `EXPL_NOISE_ANNEAL_EPISODES = 1500`.
 
 All'avvio `set_seed()` (default 42, configurabile con `--seed`) fissa i generatori casuali di Python, NumPy e PyTorch (CPU e CUDA), imposta cuDNN in modalità deterministica (`deterministic=True`, `benchmark=False`) e definisce `PYTHONHASHSEED`: a parità di seed e dataset gli esperimenti sono riproducibili.
 
@@ -382,6 +382,8 @@ I due Critic gemelli sono invece essenziali: nelle azioni continue una sovrastim
 
 Caricamento expert (`load_expert_data`): legge gli HDF5 (qui entrano anche i segmenti, glob `lap_*.h5`), normalizza gli stati 29D, applica lo stacking `(t-12, t-6, t)`, converte acceleratore e freno dal range sigmoid `[0,1]` al range tanh `[-1,1]` per coerenza con la testa dell'Actor, e ricalcola a posteriori la reward di ogni transizione con la stessa formula di `gym_torcs.py`. Ogni campione è inserito con `expert=1.0` e `mask=1.0`. Il caricamento avviene sia al fresh-start sia al resume, così l'ancora BC è sempre garantita.
 
+Filtro sui giri lenti (`--expert_max_lap_time`, default 71.0 s): vengono caricati solo i file il cui attributo `lap_time` non supera la soglia — vale anche per i segmenti, che ereditano il tempo del giro padre. Il razionale: la BC penalty tira la policy verso la *media* delle azioni campionate, quindi caricare tutti i giri (best umano 69.5 s, media 72.1 s) ancora l'agente al giro medio del pilota; per superarne il best, l'ancora deve puntare solo ai suoi giri migliori. Con `<= 0` il filtro è disattivato.
+
 Ogni batch da 256 transizioni punta a 25% expert, 15% elite, 60% online; se online o elite non hanno abbastanza dati, la quota mancante viene compensata con campioni expert (il resto del batch è sempre `batch − online − elite` dall'expert). Questo rende il training possibile fin dal primo step — di fatto il Critic si pre-allena sui dati umani, come la fase offline del TD3+BC — e mantiene sempre una quota di dimostrazione umana nella loss.
 
 Le percentuali 25/15/60 sono empiriche ma hanno una logica precisa: l'expert mantiene l'ancora umana, l'online insegna a gestire gli stati realmente visitati dall'agente, l'elite preserva le scoperte autonome promettenti. Troppo expert e l'Actor resta incollato al pilota; troppo online e il Critic insegue rumore esplorativo; senza elite, le buone traiettorie verrebbero diluite nella FIFO.
@@ -394,17 +396,17 @@ Done masking: `mask = 0.0` per fallimenti terminali o episodi incompleti (il val
 
 Alla reward online di `gym_torcs.py` (descritta sopra), `td3_bc.py` aggiunge:
 
-- `+50` (`LAP_SUCCESS_BONUS`) quando il giro è completato validamente;
+- `+50` (`LAP_SUCCESS_BONUS`) quando il giro è completato validamente, più un bonus proporzionale al tempo: `+10 × max(0, 80 − lap_time)` (`LAP_TIME_BONUS_PER_S`, `LAP_TIME_BONUS_REF_S`). La sola reward di progresso produce un ritorno per giro quasi costante (la distanza è fissa, l'incentivo alla velocità passa solo dallo sconto γ): senza questo termine un giro da 70 s e uno da 85 s sarebbero premiati quasi allo stesso modo;
 - `-25` (`INCOMPLETE_LAP_PENALTY`) se l'episodio termina in modo incompleto (crash, stallo, spin, timeout);
 - record di distanza basati su `distFromStart` tramite `_track_progress_from_start()`, che gestisce il wrap al traguardo usando `TRACK_LENGTH_M = 3608.0` e misura il progresso a partire dal punto di spawn dell'episodio. Non si usa `distRaced` perché misura la distanza realmente percorsa anche quando l'auto sbanda o allunga la traiettoria: per il record interessa il progresso lungo il tracciato.
 
 Prima di aggiornare il Critic, le reward campionate vengono moltiplicate per `reward_scale = 0.02`. La scala della reward determina la magnitudo dei Q-value: se i Q crescono troppo, la parte RL della loss dell'Actor domina la BC penalty o produce gradienti instabili. Il fattore 0.02 mantiene le stime in un range sano.
 
-Una guardia di plausibilità (`_is_plausible_eval_dist`, limite 3800 m) filtra distanze di valutazione fisicamente impossibili per un eval monogiro, evitando che anomalie nei log inquinino record e refinement.
+Una guardia di plausibilità (`_is_plausible_eval_dist`, limite 3800 m) filtra distanze di valutazione fisicamente impossibili per un eval monogiro, evitando che anomalie nei log inquinino record e refinement. Per gli score (che superano legittimamente la lunghezza pista, vedi sotto) il limite è `EVAL_SCORE_SANITY_LIMIT = 6500` (`_is_plausible_eval_score`).
 
 ### Aggiornamento TD3+BC (`TD3BCAgent.update`)
 
-Iperparametri: `gamma = 0.99`, `tau = 0.005`, `policy_freq = 2`, Adam `3e-4` per entrambe le reti, batch 256, frequenza update 1:1 (un update per ogni step di simulazione, appena l'expert buffer supera la batch size).
+Iperparametri: `gamma = 0.99`, `tau = 0.005`, `policy_freq = 2`, Adam `3e-4` per entrambe le reti, batch 256, frequenza update 1:1 (un update per ogni step di simulazione, appena l'expert buffer supera la batch size). Il coefficiente `alpha` del TD3+BC è configurabile con `--bc_alpha` (default 2.5 come nel paper; valori 3.5–5.0 spostano il bilanciamento verso il RL, utile per superare l'esperto). Il rumore esplorativo è annealato linearmente per episodio da `EXPL_NOISE_START = 0.10` a `EXPL_NOISE_END = 0.04` in `EXPL_NOISE_ANNEAL_EPISODES = 1500` episodi (clip a ±2σ): a fine training servono micro-variazioni di traiettoria, non sbandate da 0.1 di sterzo a velocità di gara.
 
 Per il Critic, ad ogni update:
 
@@ -438,22 +440,26 @@ Entrambe le reti usano gradient clipping a norma 1.0. Dopo ogni update dell'Acto
 target = tau * online + (1 - tau) * target        (tau = 0.005)
 ```
 
-Le reti target rendono lento il bersaglio del Critic: senza, il valore da inseguire cambierebbe con gli stessi pesi in aggiornamento, creando un inseguimento instabile. `tau = 0.005` è abbastanza reattivo da seguire il training e abbastanza lento da filtrare le oscillazioni.
+Le reti target rendono lento il bersaglio del Critic: senza, il valore da inseguire cambierebbe con gli stessi pesi in aggiornamento, creando un inseguimento instabile. `tau = 0.005` è abbastanza reattivo da seguire il training e abbastanza lento da filtrare le oscillazioni. Il soft update (Polyak) viene eseguito ogni `policy_freq` step **a prescindere** da warm-up e congelamento dell'Actor, come nel TD3 originale: in passato era annidato nel ramo dell'aggiornamento Actor, e questo lasciava i target del Critic congelati per decine di migliaia di step durante warm-up e post-rollback, facendo divergere stime correnti e target di Bellman.
 
 ### Ciclo episodico
 
-Ogni episodio: reset con `relaunch=True`, inizializzazione del frame stack (13 copie dello stato iniziale), marcia in prima con `steps_since_shift = 999` (primo cambio consentito subito). Ad ogni step: selezione azione con rumore, conversione pedali e mutua esclusione, calcolo marcia con `compute_gear`, step ambiente, update dell'agente. Le transizioni vengono accumulate e inserite nel buffer online solo a fine episodio (così il `mask` finale è noto); un episodio interrotto da STOP viene scartato.
+Ogni episodio: reset soft di default (meta-restart in-place, quasi istantaneo), con relaunch completo di TORCS solo ogni `RELAUNCH_EVERY_EPISODES = 5` episodi (offset 2 per non sovrapporsi alle eval, che fanno già relaunch propri): il kill+riavvio costa ~6 s reali per episodio, e il relaunch periodico basta a contenere memory leak e stato sporco del simulatore. Seguono inizializzazione del frame stack (13 copie dello stato iniziale) e marcia in prima con `steps_since_shift = 999` (primo cambio consentito subito). Ad ogni step: selezione azione con rumore, conversione pedali e mutua esclusione, calcolo marcia con `compute_gear`, step ambiente, update dell'agente. Le transizioni vengono accumulate e inserite nel buffer online solo a fine episodio (così il `mask` finale è noto).
 
 Record esplorativi salvati al volo durante l'episodio: `td3_expl_best_lap.pth` al miglior tempo su giro completato, `td3_expl_best_dist.pth` alla miglior distanza (sopra 500 m). A fine episodio vengono salvati il checkpoint completo (`td3_checkpoint.pth` + buffer) e l'ultimo Actor (`td3_policy.pth`), e viene scritta una riga di log con reward, step, distanza, loss medie e stato di Critic (`ON`/`OFF`) e Actor (`ON`/`WARM`/`FREEZE`).
 
-SIGINT (Ctrl+C) e SIGTERM non uccidono il processo: impostano `stop_requested`, il loop completa l'episodio, salva un checkpoint completo coerente e poi esce.
+SIGINT (Ctrl+C) e SIGTERM non uccidono il processo: impostano `stop_requested`, l'episodio corrente prosegue fino al suo esito naturale (giro completato, crash o limite di passi) e i suoi dati entrano normalmente nel buffer; poi il loop salva un checkpoint completo coerente ed esce. TORCS viene lanciato con `setsid` in una sessione separata, quindi il Ctrl+C dato nel terminale non raggiunge il simulatore e l'episodio può davvero terminare in modo pulito (la pulizia dei processi resta affidata a `pkill` per nome).
 
 ### Valutazione deterministica periodica
 
-Ogni 5 episodi, superato il warm-up di 15000 step, l'agente viene valutato con `evaluate=True` (zero rumore, `actor.eval()`), marcia algoritmica e stop anticipato al primo giro valido completato. La distanza è misurata con la stessa logica wrap-aware e filtrata per plausibilità (≤ 3800 m). I record deterministici aggiornano tre checkpoint distinti:
+Ogni 5 episodi, superato il warm-up di 15000 step, l'agente viene valutato con `evaluate=True` (zero rumore, `actor.eval()`), marcia algoritmica e stop anticipato al primo giro valido completato. La valutazione è un run singolo: policy deterministica e simulatore deterministico producono risultati riproducibili al metro (verificato empiricamente, anche sui crash anomali), quindi ripetere il run non aggiunge informazione. La distanza è misurata con la stessa logica wrap-aware e filtrata per plausibilità (≤ 3800 m).
 
-- `td3_det_best_dist_run.pth`: miglior distanza del run corrente;
-- `td3_det_best_dist.pth` + sidecar testuale `td3_det_best_dist.txt`: miglior distanza assoluta (con tolleranza `BEST_DIST_EPS = 1.0` m contro le oscillazioni). Il sidecar rende il record persistente anche dopo `--clean` e recuperabile se il checkpoint binario si corrompe;
+Ogni eval produce uno **score** (`_eval_score`): per giri incompleti coincide con la distanza percorsa; per giri completati vale `TRACK_LENGTH_M × (90 / lap_time)`, con floor a `TRACK_LENGTH_M` (un giro completato, anche lento, batte sempre un giro incompleto). Lo score risolve la saturazione della metrica: quando l'agente completa il giro stabilmente, la distanza si ferma a 3608 m e smette di dare segnale a record e refinement, mentre lo score continua a crescere al migliorare del tempo (a ~70 s di giro, 1 secondo vale ~66 m di score). Lo score viene loggato nel campo `Score` delle righe `[EVAL]` ed è la grandezza salvata nei sidecar di record.
+
+I record deterministici aggiornano tre checkpoint distinti:
+
+- `td3_det_best_dist_run.pth`: miglior score del run corrente;
+- `td3_det_best_dist.pth` + sidecar testuale `td3_det_best_dist.txt`: miglior score assoluto (con tolleranza `BEST_DIST_EPS = 1.0` contro le oscillazioni; in regime tempo equivale a ~0.015 s). Il sidecar rende il record persistente anche dopo `--clean` e recuperabile se il checkpoint binario si corrompe;
 - `td3_det_best_lap.pth` + sidecar `td3_det_best_lap.txt`: miglior giro valido deterministico, il candidato per la submission.
 
 La valutazione deterministica è separata dal training perché il rumore esplorativo è utile per imparare ma non rappresenta la policy da portare in gara.
@@ -475,16 +481,21 @@ Il progetto include una macchina a stati per uscire dai plateau, ispirata a Bees
 | `REFINE_COLLAPSE_FRAC` | 0.6 | Soglia di crollo (60% del riferimento) |
 | `REFINE_MAX_ATTEMPTS` | 3 | Tentativi massimi per plateau |
 | `REFINE_NEW_PLATEAU_FRAC` | 1.10 | Plateau più alto del +10% → reset del contatore tentativi |
+| `REFINE_LAP_IMPROVE_FRAC` | 1.004 | Come `IMPROVE_FRAC` ma in regime tempo (+0.4% ≈ 0.3 s di giro) |
+| `REFINE_LAP_BREAKOUT_FRAC` | 1.01 | Come `BREAKOUT_FRAC` ma in regime tempo (+1% ≈ 0.7 s di giro) |
+| `REFINE_LAP_NEW_PLATEAU_FRAC` | 1.01 | Come `NEW_PLATEAU_FRAC` ma in regime tempo |
 
-Rilevamento del plateau: il segnale è la media della finestra delle ultime 8 valutazioni, non il singolo best (robusto ai colpi di fortuna). Se la media non supera la migliore media storica di almeno il 2% per 4 valutazioni consecutive, e si è oltre l'episodio 200 con Actor non congelato, il refinement si attiva. Il riferimento del plateau è la mediana della finestra — il "modo buono" di una distribuzione bimodale — non il massimo stocastico.
+Tutta la macchina a stati lavora sullo **score** dell'eval (vedi sopra), con soglie a doppio regime (`_refine_frac`): quando il riferimento è sotto `TRACK_LENGTH_M` lo score è una distanza e valgono le percentuali larghe; quando lo supera, lo score è in equivalente-tempo, dove 1% ≈ 0.7 s di giro, e le percentuali del regime distanza sarebbero irraggiungibili (+10% chiederebbe 7 secondi di miglioramento). Senza questa distinzione il refinement, una volta raggiunto il completamento stabile del giro, scattava su una metrica satura e bruciava i tentativi in timeout senza poter mai fare breakout — esattamente il comportamento osservato nei log attorno all'episodio 1500.
+
+Rilevamento del plateau: il segnale è la media della finestra delle ultime 8 valutazioni, non il singolo best (robusto ai colpi di fortuna). Se la media non supera la migliore media storica della frazione minima di regime per 4 valutazioni consecutive, e si è oltre l'episodio 200 con Actor non congelato, il refinement si attiva. Il riferimento del plateau è la mediana della finestra — il "modo buono" di una distribuzione bimodale — non il massimo stocastico.
 
 Durante il refinement: l'aggiornamento del Critic è disattivato (la loss resta solo diagnostica), il peso BC scende a 0.3 e l'Actor cerca di sfruttare meglio una value function fissa. Le uscite possibili:
 
-- consolidamento: 3 breakout consecutivi sopra `plateau × 1.10`, oppure un breakout entro 5 m dal record deterministico assoluto, oppure direttamente un nuovo record assoluto. Il peso BC torna a 1.0, il Critic si riattiva e l'Actor viene temporaneamente congelato (default 30 episodi) per riallineare il Critic alla nuova policy;
-- rollback: distanza sotto il 60% del riferimento per 3 valutazioni consecutive → l'Actor viene ripristinato da `td3_det_best_dist.pth`, il tentativo viene contato e il rilevamento del plateau riparte da zero;
+- consolidamento: 3 breakout consecutivi sopra `plateau × frazione di regime` (+10% distanza, +1% tempo), oppure un breakout entro 5 unità di score dal record deterministico assoluto, oppure direttamente un nuovo record assoluto. Il peso BC torna a 1.0, il Critic si riattiva e l'Actor viene temporaneamente congelato (default 30 episodi) per riallineare il Critic alla nuova policy;
+- rollback: score sotto il 60% del riferimento per 3 valutazioni consecutive (un crash in eval produce uno score-distanza basso, quindi il rilevamento del collasso funziona identico nei due regimi) → l'Actor viene ripristinato da `td3_det_best_dist.pth`, il tentativo viene contato e il rilevamento del plateau riparte da zero;
 - timeout: 8 valutazioni in refinement (≈40 episodi) senza superare il record → uscita automatica con tentativo contato.
 
-Esauriti i 3 tentativi su uno stesso plateau, l'auto-refinement resta disarmata finché non emerge un plateau più alto di almeno il 10% (che azzera il contatore). Al resume, la finestra delle valutazioni viene ripopolata leggendo le righe `[EVAL]` dal log di training (`load_recent_evals_from_log`), così lo stato del plateau sopravvive ai riavvii.
+Esauriti i 3 tentativi su uno stesso plateau, l'auto-refinement resta disarmata finché non emerge un plateau più alto della frazione di regime (+10% distanza, +1% tempo), che azzera il contatore. Al resume, la finestra delle valutazioni viene ripopolata leggendo le righe `[EVAL]` dal log di training (`load_recent_evals_from_log`, che preferisce il campo `Score` e ricade su `Dist` per le righe storiche), così lo stato del plateau sopravvive ai riavvii.
 
 Controlli manuali da CLI: `--refine` arma il refinement da subito (riferimento = mediana recente o record storico); `--no-auto-refine` disattiva solo l'attivazione automatica; `--rollback` forza il ripristino dell'Actor dalla migliore policy disponibile, scendendo in ordine di priorità (`det_best_lap` → `det_best_dist` → `det_best_dist_run` → `expl_best_lap` → `expl_best_dist`), reinizializza l'optimizer dell'Actor e lo congela per `--actor-freeze-episodes` episodi (default 30); `--pretrain_critic`, da usare con `--rollback` in emergenza, ri-allena il Critic offline per 50000 passi sui buffer prima di riprendere.
 

@@ -19,7 +19,7 @@ Meccanismi chiave implementati per garantire un test deterministico ed affidabil
 
 Gerarchia di auto-rilevamento dei pesi (in assenza di argomento esplicito --weights):
   1. td3_det_best_lap.pth      -> Miglior giro valido deterministico registrato (candidato per la submission).
-  2. td3_det_best_dist.pth     -> Policy RL deterministica con maggior distanza percorsa cumulativa.
+  2. td3_det_best_dist.pth     -> Policy RL deterministica con miglior score di eval (distanza o equivalente-tempo).
   3. td3_det_best_dist_run.pth -> Miglior checkpoint deterministico della sessione di training corrente.
   4. td3_expl_best_lap.pth     -> Miglior tempo sul giro ottenuto durante le fasi esplorative di RL.
   5. td3_expl_best_dist.pth    -> Massimo record di distanza ottenuto durante le fasi esplorative di RL.

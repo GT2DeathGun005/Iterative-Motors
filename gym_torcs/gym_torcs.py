@@ -19,6 +19,10 @@ def _kill_torcs():
     """
     if os.environ.get('TORCS_KILL_ALL', '1') != '0':
         os.system('pkill -9 -f torcs')
+        # Il pkill qui sopra uccide anche il wrapper xvfb-run (la sua command line
+        # contiene "torcs") prima che possa fare cleanup, lasciando orfano il server
+        # Xvfb: senza questa riga ogni relaunch accumulerebbe un processo Xvfb morto.
+        os.system('pkill -9 -f xvfb-run; pkill -9 Xvfb')
 
 class TorcsEnv:
     # Variabili usate per valutare la terminazione anticipata in caso di stallo della vettura
@@ -59,12 +63,15 @@ class TorcsEnv:
         
 
         # Se la variabile SHOW_GUI è settata a 1, avvia normalmente. Altrimenti usa Xvfb.
+        # setsid stacca TORCS dal terminale: il Ctrl+C dell'utente (SIGINT all'intero foreground
+        # process group) non deve uccidere il simulatore a metà episodio. La pulizia resta
+        # affidata a _kill_torcs (pkill per nome, indipendente dal process group).
         if os.environ.get('SHOW_GUI', '0') == '1':
-            os.system(f'sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1" &')
+            os.system(f'setsid sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1" &')
         else:
             xvfb_cmd = f'xvfb-run -a -s "-screen 0 640x480x24" sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1"'
-            os.system(f"{xvfb_cmd} &")
-        
+            os.system(f"setsid {xvfb_cmd} &")
+
         time.sleep(3.0)  # Attende Xvfb/TORCS e la macro di autostart.
         self.action_space = spaces.Box(
             low=np.array([-1.0, 0.0, 0.0, 1.0], dtype=np.float32),
@@ -253,6 +260,11 @@ class TorcsEnv:
 
         # Se initial_reset è False, imposta la flag R.d['meta'] a True per segnalare a TORCS di terminare l'episodio corrente e prepararsi per il reset.
         if self.initial_reset is not True:
+            # Se il socket del client è morto (server TORCS non risponde o processo terminato),
+            # un reset soft resterebbe bloccato per sempre in setup_connection ad aspettare
+            # un server che non esiste più: si forza il relaunch completo.
+            if getattr(self.client, 'so', None) is None:
+                relaunch = True
             self.client.R.d['meta'] = True
             self.client.respond_to_server()
 
@@ -267,7 +279,21 @@ class TorcsEnv:
                 self.reset_torcs()
                 print("### TORCS is RELAUNCHED ###")
 
-        self.client = snakeoil3.Client(p=3001, vision=False)  # Socket UDP SCR standard.
+        # La connessione può fallire se TORCS resta bloccato al menu (la macro xte di
+        # autostart può perdere il timing all'avvio): in quel caso si forza un relaunch
+        # completo del simulatore e si riprova, invece di attendere un server che non
+        # arriverà mai. Se invece l'attesa è stata abortita da una richiesta di stop
+        # dell'utente, l'eccezione viene propagata subito al chiamante.
+        connect_attempts = 3
+        for attempt in range(1, connect_attempts + 1):
+            try:
+                self.client = snakeoil3.Client(p=3001, vision=False)  # Socket UDP SCR standard.
+                break
+            except snakeoil3.ServerTimeoutError as e:
+                if e.aborted or attempt == connect_attempts:
+                    raise
+                print(f"### Server TORCS non raggiungibile (tentativo {attempt}/{connect_attempts}): relaunch completo ###")
+                self.reset_torcs()
         self.client.MAX_STEPS = np.inf
 
         client = self.client
@@ -295,12 +321,13 @@ class TorcsEnv:
         torcs_cmd = 'torcs -nofuel -nodamage'
         
         # Se la variabile SHOW_GUI è settata a 1, avvia normalmente. Altrimenti usa Xvfb.
+        # setsid: vedi __init__ — TORCS non deve ricevere il Ctrl+C destinato al training.
         if os.environ.get('SHOW_GUI', '0') == '1':
-            os.system(f'sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1" &')
+            os.system(f'setsid sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1" &')
         else:
             xvfb_cmd = f'xvfb-run -a -s "-screen 0 640x480x24" sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1"'
-            os.system(f"{xvfb_cmd} &")
-        
+            os.system(f"setsid {xvfb_cmd} &")
+
         time.sleep(3.0)  # Tempo combinato per avvio e macro
 
     def agent_to_torcs(self, u):
