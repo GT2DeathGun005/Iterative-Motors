@@ -94,7 +94,11 @@ is_running() {  # is_running <task> -> 0 se vivo
     local pf; pf="$(pid_file "$1")"
     [ -f "$pf" ] || return 1
     local pid; pid="$(cat "$pf" 2>/dev/null)"
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$pf"
+    return 1
 }
 
 start_bg() {  # start_bg <task> <comando...>
@@ -234,7 +238,7 @@ menu_prompt_args() {
     local preset_values=()
     local example="--episodes 4000"
     local default_note=""
-    local selection custom token idx value
+    local selection custom_line token idx value
 
     case "$label" in
         collect|collect-controller|collect-keyboard)
@@ -360,28 +364,39 @@ menu_prompt_args() {
         done
         echo
         read -r -p "Preset per ${label}: " selection
-        selection="${selection//,/ }"
-        for token in $selection; do
-            if [[ "$token" =~ ^[0-9]+$ ]] && [ "$token" -ge 1 ] && [ "$token" -le "${#preset_values[@]}" ]; then
-                value="${preset_values[$((token - 1))]}"
-                read -r -a MENU_PRESET_WORDS <<< "$value"
-                menu_add_tokens "${MENU_PRESET_WORDS[@]}"
-            fi
-        done
+        menu_add_preset_selection "$selection"
     fi
 
     echo
     echo "Puoi aggiungere opzioni personalizzate come faresti da CLI."
     echo "Le variabili tipo SHOW_GUI=1 vengono applicate all'ambiente."
     echo -e "${K}Esempio: ${example}${N}"
-    read -r -p "Argomenti extra per ${label} (Enter = default): " -a custom
-    menu_add_tokens "${custom[@]}"
+    read -r -p "Argomenti extra per ${label} (Enter = default): " custom_line
+    if [ "${#preset_labels[@]}" -gt 0 ] && [[ "$custom_line" =~ ^[[:space:]]*[0-9]+([,[:space:]]+[0-9]+)*[[:space:]]*$ ]]; then
+        menu_add_preset_selection "$custom_line"
+    else
+        read -r -a MENU_CUSTOM_WORDS <<< "$custom_line"
+        menu_add_tokens "${MENU_CUSTOM_WORDS[@]}"
+    fi
 
     if [ "${#MENU_ENV[@]}" -gt 0 ] || [ "${#MENU_ARGS[@]}" -gt 0 ]; then
         echo
         [ "${#MENU_ENV[@]}" -gt 0 ] && echo -e "${C}Ambiente:${N} ${MENU_ENV[*]}"
         [ "${#MENU_ARGS[@]}" -gt 0 ] && echo -e "${C}Argomenti:${N} ${MENU_ARGS[*]}"
     fi
+}
+
+menu_add_preset_selection() {
+    local selection="$1"
+    local token value
+    selection="${selection//,/ }"
+    for token in $selection; do
+        if [[ "$token" =~ ^[0-9]+$ ]] && [ "$token" -ge 1 ] && [ "$token" -le "${#preset_values[@]}" ]; then
+            value="${preset_values[$((token - 1))]}"
+            read -r -a MENU_PRESET_WORDS <<< "$value"
+            menu_add_tokens "${MENU_PRESET_WORDS[@]}"
+        fi
+    done
 }
 
 menu_add_tokens() {
