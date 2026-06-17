@@ -73,23 +73,23 @@ torch.backends.cudnn.benchmark = False
 
 def load_best_weights(model, weights_arg, device, kind='auto'):
     """
-    Rileva automaticamente e carica i pesi migliori disponibili per l'Actor, identificandone la natura (BC o RL).
+    Rileva automaticamente e carica i pesi migliori disponibili per l'Actor, identificandone la natura (BC o TD3).
     
     Come funziona:
       - Se l'utente specifica un percorso tramite '--weights', viene caricato direttamente quel file.
       - Se '--weights' è None, esamina la cartella dei checkpoint in ordine di importanza decrescente per trovare il file migliore.
       - Carica lo state_dict ed esegue una filtrazione delle chiavi (filtered_state) per caricare solo i pesi compatibili con
         l'architettura corrente dell'Actor, ignorando eventuali pesi del Critic presenti nel file.
-      - Rileva se il modello è RL (TD3+BC) o BC in base al nome del file (presenza della stringa 'td3' o 'bc'), oppure
+      - Rileva se il modello è TD3+BC o BC in base al nome del file (presenza della stringa 'td3' o 'bc'), oppure
         usando l'argomento esplicito '--kind'. Questo determina la successiva denormalizzazione dell'azione.
         
     Args:
         model: Istanza della classe PolicyActor da caricare.
         weights_arg: Stringa del percorso dei pesi (opzionale).
         device: Dispositivo su cui caricare il modello ('cuda' o 'cpu').
-        kind: Stringa di selezione del formato ('auto', 'rl', o 'bc').
+        kind: Stringa di selezione del formato ('auto', 'td3', 'rl', o 'bc').
     Returns:
-        Una tupla (model, is_rl: bool) indicante il modello caricato e se si trata di una policy RL.
+        Una tupla (model, is_rl: bool) indicante il modello caricato e se si tratta di una policy TD3.
     """
     checkpoint_dir = CHECKPOINT_ROOT
     td3_det_best_lap_path = os.path.join(checkpoint_dir, 'td3_det_best_lap.pth')
@@ -170,8 +170,8 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
     model.load_state_dict(filtered_state, strict=False)
     model.eval()
 
-    # Rilevamento automatico o manuale del tipo di policy (RL vs BC)
-    if kind == 'rl':
+    # Rilevamento automatico o manuale del tipo di policy (TD3 vs BC)
+    if kind in ('td3', 'rl'):
         is_rl = True
     elif kind == 'bc':
         is_rl = False
@@ -182,10 +182,10 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
         elif 'bc' in fname:
             is_rl = False
         else:
-            print("   Tipo pesi non deducibile dal nome file. Usa --kind rl|bc per essere esplicito.")
+            print("   Tipo pesi non deducibile dal nome file. Usa --kind td3|bc per essere esplicito.")
             sys.exit(1)
 
-    weight_type = "RL (TD3+BC)" if is_rl else "BC"
+    weight_type = "TD3+BC" if is_rl else "BC"
     print(f"  Pesi [{weight_type}] caricati da: {load_path}")
 
     return model, is_rl
@@ -203,8 +203,8 @@ def main():
                         help="Numero di giri da completare")
     parser.add_argument("--max_steps", type=int, default=15000,
                         help="Max step per giro (timeout)")
-    parser.add_argument("--kind", choices=["auto", "rl", "bc"], default="auto",
-                        help="Tipo di pesi: 'rl' (tanh→[0,1]) o 'bc' (sigmoid). 'auto' deduce dal nome file.")
+    parser.add_argument("--kind", choices=["auto", "td3", "rl", "bc"], default="auto",
+                        help="Tipo di pesi: 'td3' (tanh→[0,1]) o 'bc' (sigmoid). 'rl' resta alias compatibile.")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -222,7 +222,7 @@ def main():
 
     # Seleziona la funzione di denormalizzazione e la descrizione in base alla policy caricata
     denormalize_fn = denormalize_action_rl if is_rl else denormalize_action_bc
-    inference_mode = "RL (sample evaluate=True)" if is_rl else "BC (forward diretto)"
+    inference_mode = "TD3+BC (sample evaluate=True)" if is_rl else "BC (forward diretto)"
     print(f"  Inference mode: {inference_mode}")
 
     # Inizializzazione del client di connessione al simulatore TORCS

@@ -65,6 +65,9 @@ err()  { echo -e "${R}[run]${N} $*" >&2; }
 
 PYTHON="${PYTHON:-python}"
 MENU_ARGS=()
+MENU_ENV=()
+CMD_ARGS=()
+CMD_ENV=()
 
 # --- gestione task in background -------------------------------------------
 # pid_file <task> -> percorso del pidfile; log_file <task> -> percorso del log
@@ -143,6 +146,19 @@ log_status_line() {
     clean_task_log < "$lf" | grep -E 'Epoch [0-9]+/[0-9]+|Training completato|Addestramento|Pesi salvati|Ep [0-9]+|\[EVAL\]|SUCCESS|CRASH|STOP|NUOVO|Record|Checkpoint|Traceback|Errore|ERROR|Exception' | tail -n 1
 }
 
+split_env_args() {
+    CMD_ENV=("${MENU_ENV[@]}")
+    CMD_ARGS=()
+    local token
+    for token in "$@"; do
+        if [[ "$token" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+            CMD_ENV+=("$token")
+        else
+            CMD_ARGS+=("$token")
+        fi
+    done
+}
+
 # --- cruscotto di stato ----------------------------------------------------
 cmd_status() {
     echo -e "${B}== Iterative Motors — stato pipeline ==${N}"
@@ -190,13 +206,13 @@ cmd_logs() {
 }
 
 # --- comandi della pipeline ------------------------------------------------
-cmd_collect()     { log "Raccolta giri umani (foreground)…"; exec "$PYTHON" -m iterative_motors.data.collection "$@"; }
-cmd_test()        { log "Valutazione deterministica (foreground)…"; exec "$PYTHON" -m iterative_motors.eval.test_agent "$@"; }
-cmd_bc()          { start_bg bc          "$PYTHON" -u -m iterative_motors.bc.train_bc "$@"; }
-cmd_bc_enriched() { start_bg bc-enriched "$PYTHON" -u -m iterative_motors.bc.train_bc --auto_laps "$LAPS_AUTO_DIR" "$@"; }
-cmd_td3()         { start_bg td3         env IM_WRAPPER_LOG_ONLY=1 IM_RECORD_LAPS=1 "$PYTHON" -u -m iterative_motors.rl.train_rl "$@"; }
+cmd_collect()     { split_env_args "$@"; log "Raccolta giri umani (foreground)…"; exec env "${CMD_ENV[@]}" "$PYTHON" -m iterative_motors.data.collection "${CMD_ARGS[@]}"; }
+cmd_test()        { split_env_args "$@"; log "Valutazione deterministica (foreground)…"; exec env "${CMD_ENV[@]}" "$PYTHON" -m iterative_motors.eval.test_agent "${CMD_ARGS[@]}"; }
+cmd_bc()          { split_env_args "$@"; start_bg bc          env "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.bc.train_bc "${CMD_ARGS[@]}"; }
+cmd_bc_enriched() { split_env_args "$@"; start_bg bc-enriched env "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.bc.train_bc --auto_laps "$LAPS_AUTO_DIR" "${CMD_ARGS[@]}"; }
+cmd_td3()         { split_env_args "$@"; start_bg td3         env IM_WRAPPER_LOG_ONLY=1 IM_RECORD_LAPS=1 "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.rl.train_rl "${CMD_ARGS[@]}"; }
 cmd_rl()          { cmd_td3 "$@"; }
-cmd_time_attack() { start_bg time-attack env IM_WRAPPER_LOG_ONLY=1 IM_TIME_ATTACK=1 IM_RECORD_LAPS=1 "$PYTHON" -u -m iterative_motors.rl.train_rl "$@"; }
+cmd_time_attack() { split_env_args "$@"; start_bg time-attack env IM_WRAPPER_LOG_ONLY=1 IM_TIME_ATTACK=1 IM_RECORD_LAPS=1 "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.rl.train_rl "${CMD_ARGS[@]}"; }
 
 usage() {
     awk '
@@ -214,12 +230,170 @@ menu_pause() {
 
 menu_prompt_args() {
     local label="$1"
+    local preset_labels=()
+    local preset_values=()
+    local example="--episodes 4000"
+    local default_note=""
+    local selection custom token idx value
+
+    case "$label" in
+        collect|collect-controller|collect-keyboard)
+            preset_labels=(
+                "Segmenti curva only"
+                "Zone corkscrew 670:900,2380:2530"
+                "Rilancia TORCS ogni 5 giri"
+                "Deadzone sterzo 0.03"
+                "TCS disabilitato"
+                "Soglia TCS slip 4.0"
+                "Output train_set"
+            )
+            preset_values=(
+                "--segment_only"
+                "--zones 670:900,2380:2530"
+                "--relaunch_every 5"
+                "--steering_deadzone 0.03"
+                "--no-tcs"
+                "--tcs_slip 4.0"
+                "--output_dir train_set"
+            )
+            example="--zones 670:900,2380:2530 --segment_only"
+            default_note="Default: output_dir=train_set, device scelto dal menu, deadzone=0.05, relaunch_every=10, TCS attivo, zone auto-rilevate, salva giri completi."
+            ;;
+        bc|bc-enriched)
+            preset_labels=(
+                "Default: 300 epoche"
+                "Override: 500 epoche"
+                "Override: batch 512"
+                "Override: batch 128"
+                "Override: LR 1e-4"
+                "Override: LR 5e-4"
+                "Output: BC standard"
+                "Output: BC arricchita"
+            )
+            preset_values=(
+                "--epochs 300"
+                "--epochs 500"
+                "--batch_size 512"
+                "--batch_size 128"
+                "--lr 1e-4"
+                "--lr 5e-4"
+                "--output train_set/checkpoints/bc_policy.pth"
+                "--output train_set/checkpoints/enriched/bc_policy.pth"
+            )
+            example="--epochs 500 --batch_size 512"
+            default_note="Default: dataset=train_set/laps, epochs=300, batch_size=256, lr=3e-4, output=train_set/checkpoints/bc_policy.pth."
+            ;;
+        td3|time-attack)
+            preset_labels=(
+                "Override: 2500 episodi"
+                "Override: 4000 episodi"
+                "Override: max_steps 15000"
+                "Default: seed 42"
+                "Rollback al best deterministico"
+                "Refinement subito"
+                "Disattiva auto-refine"
+                "Non registrare giri auto"
+                "Override: registra solo giri auto <= 75s"
+                "GUI visibile"
+            )
+            preset_values=(
+                "--episodes 2500"
+                "--episodes 4000"
+                "--max_steps 15000"
+                "--seed 42"
+                "--rollback"
+                "--refine"
+                "--no-auto-refine"
+                "IM_RECORD_LAPS=0"
+                "IM_RECORD_MAX_LAP_TIME=75.0"
+                "SHOW_GUI=1"
+            )
+            example="--episodes 2500 SHOW_GUI=1"
+            if [ "$label" = "time-attack" ]; then
+                default_note="Default time-attack: episodes=1000, max_steps=5000, seed=42, auto-refine attivo, registra giri auto <=80s, noise floor/time-attack attivi, headless salvo SHOW_GUI=1."
+            else
+                default_note="Default TD3: episodes=1000, max_steps=5000, seed=42, auto-refine attivo, no rollback/refine immediato, registra giri auto <=80s, headless salvo SHOW_GUI=1."
+            fi
+            ;;
+        test)
+            preset_labels=(
+                "GUI visibile"
+                "Override: 1 giro"
+                "Default: 3 giri"
+                "Override: 5 giri"
+                "Override: max_steps 20000"
+                "Default: auto-detect checkpoint"
+                "Forza pesi TD3"
+                "Forza pesi BC"
+                "Best lap TD3"
+                "Best dist TD3"
+                "BC arricchita"
+            )
+            preset_values=(
+                "SHOW_GUI=1"
+                "--laps 1"
+                "--laps 3"
+                "--laps 5"
+                "--max_steps 20000"
+                "--kind auto"
+                "--kind td3"
+                "--kind bc"
+                "--weights train_set/checkpoints/td3_det_best_lap.pth --kind td3"
+                "--weights train_set/checkpoints/td3_det_best_dist.pth --kind td3"
+                "--weights train_set/checkpoints/enriched/bc_policy.pth --kind bc"
+            )
+            example="SHOW_GUI=1 --laps 1 --kind td3"
+            default_note="Default test: laps=3, max_steps=15000, kind=auto, weights auto-detect, headless salvo SHOW_GUI=1."
+            ;;
+    esac
+
     echo
     echo -e "${B}${C}${label}${N}"
-    echo "Puoi aggiungere opzioni come faresti da CLI."
-    echo -e "${K}Esempio: --episodes 4000${N}"
+    [ -n "$default_note" ] && echo -e "${Y}${default_note}${N}"
     MENU_ARGS=()
-    read -r -p "Argomenti extra per ${label} (Enter = default): " -a MENU_ARGS
+    MENU_ENV=()
+
+    if [ "${#preset_labels[@]}" -gt 0 ]; then
+        echo "Preset comuni (scrivi numeri separati da spazio o virgola, Enter = nessuno):"
+        for idx in "${!preset_labels[@]}"; do
+            printf "  %2d) %s\n" "$((idx + 1))" "${preset_labels[$idx]}"
+        done
+        echo
+        read -r -p "Preset per ${label}: " selection
+        selection="${selection//,/ }"
+        for token in $selection; do
+            if [[ "$token" =~ ^[0-9]+$ ]] && [ "$token" -ge 1 ] && [ "$token" -le "${#preset_values[@]}" ]; then
+                value="${preset_values[$((token - 1))]}"
+                read -r -a MENU_PRESET_WORDS <<< "$value"
+                menu_add_tokens "${MENU_PRESET_WORDS[@]}"
+            fi
+        done
+    fi
+
+    echo
+    echo "Puoi aggiungere opzioni personalizzate come faresti da CLI."
+    echo "Le variabili tipo SHOW_GUI=1 vengono applicate all'ambiente."
+    echo -e "${K}Esempio: ${example}${N}"
+    read -r -p "Argomenti extra per ${label} (Enter = default): " -a custom
+    menu_add_tokens "${custom[@]}"
+
+    if [ "${#MENU_ENV[@]}" -gt 0 ] || [ "${#MENU_ARGS[@]}" -gt 0 ]; then
+        echo
+        [ "${#MENU_ENV[@]}" -gt 0 ] && echo -e "${C}Ambiente:${N} ${MENU_ENV[*]}"
+        [ "${#MENU_ARGS[@]}" -gt 0 ] && echo -e "${C}Argomenti:${N} ${MENU_ARGS[*]}"
+    fi
+}
+
+menu_add_tokens() {
+    local token
+    for token in "$@"; do
+        [ -z "$token" ] && continue
+        if [[ "$token" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+            MENU_ENV+=("$token")
+        else
+            MENU_ARGS+=("$token")
+        fi
+    done
 }
 
 menu_count_glob() {
@@ -378,10 +552,12 @@ menu_run_action() {
             menu_pause
             ;;
         collect-controller)
-            cmd_collect --device controller
+            menu_prompt_args "collect-controller"
+            cmd_collect --device controller "${MENU_ARGS[@]}"
             ;;
         collect-keyboard)
-            cmd_collect --device keyboard
+            menu_prompt_args "collect-keyboard"
+            cmd_collect --device keyboard "${MENU_ARGS[@]}"
             ;;
         bc)
             menu_prompt_args "bc"

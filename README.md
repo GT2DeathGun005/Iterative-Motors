@@ -66,8 +66,9 @@ pip install numpy torch h5py pygame gym   # per CUDA usare il comando ufficiale 
 ```
 
 Il menu di `run.sh` funziona come un piccolo pit wall: mostra una Formula 1 in ASCII, riepilogo
-di processi/dataset/record e opzioni selezionabili con le frecce. I comandi diretti restano
-disponibili per automazione e script.
+di processi/dataset/record e opzioni selezionabili con le frecce. Quando avvii un comando, propone
+preset comuni e un campo libero per argomenti/env var, per esempio `SHOW_GUI=1 --laps 1`. I comandi
+diretti restano disponibili per automazione e script.
 
 ### 1. Raccogliere dimostrazioni umane
 
