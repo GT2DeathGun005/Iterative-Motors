@@ -220,7 +220,7 @@ class KeyboardController:
 
 
 # Le zone problematiche del tracciato sono le curve, abbiamo estratto questi valori dai file di torcs
-# in particoalre da corkscrew.xml, abbiamo poi allargato leggermente le zone per catturare anche le staccate e le uscite di curva
+# in particolare da corkscrew.xml, abbiamo poi allargato leggermente le zone per catturare anche le staccate e le uscite di curva
 PROBLEM_ZONES = [
     (340, 530), (670, 810), (940, 1070), (1420, 1590), (1870, 1980),
     (2380, 2530), (2570, 2780), (2890, 3020), (3190, 3300),
