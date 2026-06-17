@@ -94,11 +94,33 @@ is_running() {  # is_running <task> -> 0 se vivo
     local pf; pf="$(pid_file "$1")"
     [ -f "$pf" ] || return 1
     local pid; pid="$(cat "$pf" 2>/dev/null)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        return 0
-    fi
-    rm -f "$pf"
-    return 1
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+task_pids() {
+    local task; task="$(canonical_task "$1")"
+    local pid args has_time_attack
+    ps -eo pid=,args= | while read -r pid args; do
+        case "$args" in
+            *"python"*"-m iterative_motors.rl.train_rl"*)
+                has_time_attack=0
+                if [ -r "/proc/$pid/environ" ] && tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qx 'IM_TIME_ATTACK=1'; then
+                    has_time_attack=1
+                fi
+                if { [ "$task" = "time-attack" ] && [ "$has_time_attack" -eq 1 ]; } ||
+                   { [ "$task" = "td3" ] && [ "$has_time_attack" -eq 0 ]; }; then
+                    echo "$pid"
+                fi
+                ;;
+            *"python"*"-m iterative_motors.bc.train_bc"*)
+                if [ "$task" = "bc-enriched" ] && [[ "$args" == *"--auto_laps"* ]]; then
+                    echo "$pid"
+                elif [ "$task" = "bc" ] && [[ "$args" != *"--auto_laps"* ]]; then
+                    echo "$pid"
+                fi
+                ;;
+        esac
+    done
 }
 
 start_bg() {  # start_bg <task> <comando...>
@@ -109,8 +131,18 @@ start_bg() {  # start_bg <task> <comando...>
     fi
     local lf; lf="$(log_file "$task")"
     log "Avvio '${task}' in background → log: ${lf}"
-    # setsid stacca il processo dal terminale: chiudere la shell non lo uccide.
-    setsid bash -c "exec $* >>'$lf' 2>&1" &
+    # setsid stacca il wrapper dal terminale. Il comando gira nello stesso process group:
+    # stop puo' quindi inviare SIGINT al gruppo e lasciare al trainer il salvataggio pulito.
+    setsid bash -c '
+        lf="$1"; shift
+        "$@" > >(
+            sed -E \
+                -e "/Gym has been|Please upgrade|Users of this|migration guide|Waiting for server|Client connected/d" \
+                -e "/^[.][[:space:]]*$/d" \
+                -e "/^### TORCS is RELAUNCHED ###$/d" \
+                -e "s/^[.][[:space:]]+//" >> "$lf"
+        ) 2>&1
+    ' run-wrapper "$lf" "$@" &
     local pid=$!
     echo "$pid" > "$(pid_file "$task")"
     sleep 1
@@ -127,10 +159,25 @@ cmd_stop() {  # stop pulito (SIGINT) di un task o di tutti
     if [ $# -ge 1 ]; then targets="$1"; else targets="td3 time-attack bc bc-enriched"; fi
     for task in $targets; do
         task="$(canonical_task "$task")"
+        local pids=""
         if is_running "$task"; then
             local pid; pid="$(cat "$(pid_file "$task")")"
-            log "SIGINT a '${task}' (PID ${pid}) — uscita pulita con salvataggio del checkpoint..."
-            kill -INT "$pid" 2>/dev/null
+            pids="$pid"
+        else
+            pids="$(task_pids "$task" | tr '\n' ' ')"
+        fi
+
+        if [ -n "$pids" ]; then
+            local pid pgid
+            for pid in $pids; do
+                pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+                log "SIGINT a '${task}' (PID ${pid}${pgid:+, PGID ${pgid}}) — uscita pulita con salvataggio del checkpoint..."
+                if [ -n "$pgid" ]; then
+                    kill -INT "-$pgid" 2>/dev/null || kill -INT "$pid" 2>/dev/null
+                else
+                    kill -INT "$pid" 2>/dev/null
+                fi
+            done
         else
             log "'${task}' non in esecuzione."
         fi
@@ -147,7 +194,7 @@ clean_task_log() {
 
 log_status_line() {
     local lf="$1"
-    clean_task_log < "$lf" | grep -E 'Epoch [0-9]+/[0-9]+|Training completato|Addestramento|Pesi salvati|Ep [0-9]+|\[EVAL\]|SUCCESS|CRASH|STOP|NUOVO|Record|Checkpoint|Traceback|Errore|ERROR|Exception' | tail -n 1
+    clean_task_log < "$lf" | grep -E 'Epoch [0-9]+/[0-9]+|Training completato|Addestramento|Pesi salvati|Ep [0-9]+|\[EVAL\] Result|SUCCESS|CRASH|STOP|NUOVO|Record|Checkpoint|Traceback|Errore|ERROR|Exception' | tail -n 1
 }
 
 split_env_args() {
@@ -702,17 +749,17 @@ cmd_menu() {
     local key=""
     while true; do
         menu_draw "$selected"
-        IFS= read -rsn1 key || break
+        IFS= read -rsn1 key || return 0
         case "$key" in
             q|Q)
-                break
+                return 0
                 ;;
             "")
                 konami_feed OTHER
-                menu_run_action "${MENU_ACTIONS[$selected]}" || break
+                menu_run_action "${MENU_ACTIONS[$selected]}" || return 0
                 ;;
             $'\x1b')
-                IFS= read -rsn2 -t 0.1 key || break
+                IFS= read -rsn2 -t 0.1 key || return 0
                 case "$key" in
                     "[A")
                         konami_feed UP
