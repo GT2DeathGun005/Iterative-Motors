@@ -30,9 +30,20 @@ PI= 3.14159265359
 
 data_size = 2**17
 
-# Directory di questo file (gym_torcs/) — usata per risolvere i path relativi
+# Directory di questo file (env/) — usata per risolvere i path relativi
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _AUTOSTART_SH = os.path.join(_THIS_DIR, 'autostart.sh')
+
+# Angoli dei 19 sensori track: devono coincidere con la BC augmentation.
+# Costruiti dalla costante condivisa (fallback al literale se importato fuori dal package).
+try:
+    from iterative_motors.common.constants import SENSOR_ANGLES_DEG as _ANG
+except Exception:
+    _ANG = (-45.0, -19.0, -12.0, -7.0, -4.0, -2.5, -1.7, -1.0, -0.5, 0.0,
+            0.5, 1.0, 1.7, 2.5, 4.0, 7.0, 12.0, 19.0, 45.0)
+TRACK_SENSOR_STR = " ".join(
+    (str(int(_x)) if float(_x).is_integer() else ("%g" % _x)) for _x in _ANG
+)
 
 # Initialize help messages
 ophelp=  'Options:\n'
@@ -155,10 +166,8 @@ class Client():
         attempts = 0
         max_attempts = 30  # ~30 s: ogni tentativo fallito consuma il timeout del socket (1 s)
         while True:
-            # This string establishes track sensor angles! You can customize them.
-            #a= "-90 -75 -60 -45 -30 -20 -15 -10 -5 0 5 10 15 20 30 45 60 75 90"
-            # xed- Going to try something a bit more aggressive...
-            a= "-45 -19 -12 -7 -4 -2.5 -1.7 -1 -.5 0 .5 1 1.7 2.5 4 7 12 19 45"
+            # Angoli dei 19 sensori track (dalla costante condivisa SENSOR_ANGLES_DEG).
+            a = TRACK_SENSOR_STR
 
             initmsg='%s(init %s)' % (self.sid,a)
 

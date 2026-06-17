@@ -91,37 +91,30 @@ import torch.nn.functional as F
 from collections import deque
 from datetime import datetime
 
-# Import gym_torcs
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'gym_torcs')))
-try:
-    from gym_torcs import TorcsEnv
-    import snakeoil3_gym as snakeoil3
-except ImportError:
-    print("Warning: gym_torcs non trovato.")
+# ── Iterative Motors: package (ambiente, utility, reti condivise) ─────────
+_SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir))
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+from iterative_motors.env.gym_torcs import TorcsEnv
+from iterative_motors.env import snakeoil3_gym as snakeoil3
+from iterative_motors.env.gearing import compute_gear  # cambio marcia algoritmico
+from iterative_motors.common.constants import TRACK_LENGTH_M, LAPS_AUTO_DIR
+from iterative_motors.common.checkpoint import (
+    safe_save, safe_write_text, safe_read_float, safe_save_npz,
+    _fsync_file, _fsync_dir, _backup_paths, _rotate_backup, _checkpoint_candidates,
+)
+from iterative_motors.common.state import apply_state_norm, flatten_state_norm as flatten_state
+from iterative_motors.models.networks import Actor, Critic
+from iterative_motors.data.replay_buffer import ReplayBuffer
+from iterative_motors.data.lap_recorder import LapRecorder
+from iterative_motors.rl.reward import (
+    LAP_SUCCESS_BONUS, INCOMPLETE_LAP_PENALTY, EVAL_DISTANCE_SANITY_LIMIT,
+    LAP_TIME_BONUS_REF_S, LAP_TIME_BONUS_PER_S, EVAL_SCORE_T_REF_S, EVAL_SCORE_SANITY_LIMIT,
+    _is_plausible_eval_dist, _is_plausible_eval_score, _eval_score, _track_progress_from_start,
+    personal_best_bonus, TIME_ATTACK_BC_ALPHA, TIME_ATTACK_NOISE_FLOOR, TIME_ATTACK_ENTRY_S,
+)
+from iterative_motors.rl.agent import TD3BCAgent
 
-from gearing import compute_gear  # cambio marcia algoritmico
-
-_PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
-_CHECKPOINT_ROOT = os.path.join(_PROJECT_ROOT, 'train_set', 'checkpoints')
-_CHECKPOINT_BACKUP_ROOT = os.path.join(_CHECKPOINT_ROOT, 'backups')
-LAP_SUCCESS_BONUS = 50.0
-INCOMPLETE_LAP_PENALTY = 25.0
-TRACK_LENGTH_M = 3608.0
-EVAL_DISTANCE_SANITY_LIMIT = 3800.0
-
-# Bonus terminale proporzionale al tempo sul giro: il solo LAP_SUCCESS_BONUS fisso premia
-# allo stesso modo un giro da 70s e uno da 85s; questo termine aggiunge un incentivo diretto
-# alla riduzione del tempo (10 punti per ogni secondo sotto il riferimento di 80s).
-LAP_TIME_BONUS_REF_S = 80.0
-LAP_TIME_BONUS_PER_S = 10.0
-
-# Score di valutazione unificato: per giri incompleti coincide con la distanza percorsa,
-# per giri completati cresce al diminuire del tempo (score = TRACK_LENGTH_M * T_REF / lap_time).
-# Risolve la saturazione della metrica a 3608m quando l'agente completa il giro: senza score,
-# la macchina a stati del refinement non vede più alcun gradiente di miglioramento.
-# Con T_REF = 90s: giro da 70.0s -> 4639m; 1 secondo di giro vale circa 66m di score.
-EVAL_SCORE_T_REF_S = 90.0
-EVAL_SCORE_SANITY_LIMIT = 6500.0  # corrisponde a un giro < 50s, fisicamente implausibile
 
 # Relaunch completo di TORCS (kill + riavvio + macro di autostart) solo ogni N episodi:
 # costa ~6 secondi reali contro il reset soft (meta-restart in-place) quasi istantaneo.
@@ -139,258 +132,8 @@ EXPL_NOISE_START = 0.10
 EXPL_NOISE_END = 0.04
 EXPL_NOISE_ANNEAL_EPISODES = 1500
 
-def _is_plausible_eval_dist(value):
-    """
-    Verifica se una distanza percorsa misurata durante la fase di evaluation è fisicamente plausibile.
-    
-    Serve a filtrare eventuali anomalie nei log in cui la distanza registrata supera i limiti fisici
-    del singolo giro (EVAL_DISTANCE_SANITY_LIMIT = 3800m), prevenendo statistiche inficiate.
-    """
-    return 0.0 <= float(value) <= EVAL_DISTANCE_SANITY_LIMIT
 
-def _is_plausible_eval_score(value):
-    """
-    Verifica la plausibilità di uno score di valutazione (distanza o equivalente-tempo).
 
-    A differenza di _is_plausible_eval_dist, ammette valori oltre la lunghezza del tracciato:
-    un giro completato in 70s produce uno score di ~4639m. Il limite di 6500m corrisponde
-    a un giro sotto i 50 secondi, fisicamente irraggiungibile.
-    """
-    return 0.0 <= float(value) <= EVAL_SCORE_SANITY_LIMIT
-
-def _eval_score(eval_dist, lap_time=None):
-    """
-    Converte il risultato di una valutazione deterministica in uno score scalare confrontabile.
-
-    Due regimi:
-      - Giro incompleto (lap_time assente): score = distanza percorsa, clampata alla lunghezza pista.
-      - Giro completato: score = TRACK_LENGTH_M * (EVAL_SCORE_T_REF_S / lap_time), con floor a
-        TRACK_LENGTH_M così un giro completato (anche lento) vale sempre più di uno incompleto.
-
-    Lo score sostituisce la distanza pura in tutta la logica di record e refinement: una volta
-    che l'agente completa il giro stabilmente, la distanza satura a 3608m e smette di dare segnale,
-    mentre lo score continua a crescere al migliorare del tempo sul giro.
-    """
-    if lap_time is not None and 30.0 < float(lap_time) < EVAL_SCORE_T_REF_S * 4:
-        return TRACK_LENGTH_M * max(1.0, EVAL_SCORE_T_REF_S / float(lap_time))
-    return max(0.0, min(float(eval_dist), TRACK_LENGTH_M))
-
-def _track_progress_from_start(start_dist, current_dist):
-    """
-    Calcola la distanza percorsa lungo il circuito a partire da un punto iniziale specificato.
-    
-    Gestisce correttamente la logica di wrap-around (ritorno a zero) al passaggio sulla linea del traguardo
-    sfruttando la lunghezza totale nota del circuito (TRACK_LENGTH_M = 3608m).
-    
-    Non usiamo distRaced perché misura la distanza realmente percorsa dal veicolo anche quando sbanda
-    o allunga la traiettoria: per il record di giro interessa invece il progresso lungo il tracciato,
-    misurato tramite distFromStart e corretto per il wrap al traguardo.
-    """
-    start = float(start_dist)
-    current = float(current_dist)
-    progress = current - start
-    if progress < 0.0:
-        progress += TRACK_LENGTH_M
-    return max(0.0, min(progress, TRACK_LENGTH_M))
-
-def _fsync_file(path):
-    """
-    Forza la scrittura fisica (flush) dei dati dal buffer di memoria del sistema operativo sul disco fisso.
-    
-    Viene usata dopo le operazioni di scrittura dei checkpoint per assicurare che il file sia memorizzato
-    fisicamente e non rimanga in una coda volatile del kernel, evitando file corrotti (da 0 byte)
-    in caso di improvviso crash del sistema.
-    """
-    with open(path, 'rb') as f:
-        os.fsync(f.fileno())
-
-def _fsync_dir(path):
-    """
-    Sincronizza i metadati della directory genitrice su disco tramite la chiamata di sistema fsync.
-    
-    Questo passaggio è cruciale per garantire la persistenza dell'operazione atomica di sostituzione (os.replace)
-    ed evitare perdite di puntatori all'interno del file system in caso di spegnimento anomalo del computer.
-    """
-    dir_fd = os.open(path or '.', os.O_DIRECTORY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-
-def _backup_paths(filepath):
-    """
-    Determina i percorsi assoluti da destinare ai file di backup del checkpoint (.bak e .prev).
-    
-    Se il file originale si trova nella cartella principale dei checkpoint, organizza i relativi backup
-    in una sottocartella dedicata ('train_set/checkpoints/backups') per mantenere l'albero dei file pulito.
-    """
-    abs_filepath = os.path.abspath(filepath)
-    backup_base = None
-    try:
-        if os.path.commonpath([abs_filepath, _CHECKPOINT_ROOT]) == _CHECKPOINT_ROOT:
-            relative_path = os.path.relpath(abs_filepath, _CHECKPOINT_ROOT)
-            if relative_path != 'backups' and not relative_path.startswith('backups' + os.sep):
-                backup_base = os.path.join(_CHECKPOINT_BACKUP_ROOT, relative_path)
-    except ValueError:
-        backup_base = None
-
-    if backup_base is None:
-        backup_base = filepath
-
-    return backup_base + ".bak", backup_base + ".prev"
-
-def _rotate_backup(filepath):
-    """
-    Ruota ciclicamente le copie di backup esistenti per conservare la cronologia recente.
-    
-    Sposta il file '.bak' (backup precedente) in '.prev' (penultimo backup) e crea una copia
-    del checkpoint corrente nominandola '.bak'. L'operazione è resa sicura tramite passaggi temporanei
-    e forzature di scrittura fisica (fsync).
-    """
-    if not os.path.exists(filepath):
-        return
-    backup_path, previous_path = _backup_paths(filepath)
-    backup_directory = os.path.dirname(backup_path) or '.'
-    os.makedirs(backup_directory, exist_ok=True)
-
-    if os.path.exists(backup_path):
-        os.replace(backup_path, previous_path)
-
-    temp_backup = backup_path + ".tmp"
-    shutil.copy2(filepath, temp_backup)
-    _fsync_file(temp_backup)
-    os.replace(temp_backup, backup_path)
-    _fsync_dir(backup_directory)
-
-def _checkpoint_candidates(filepath):
-    """
-    Restituisce una lista ordinata di percorsi candidati in cui cercare un checkpoint valido.
-    
-    L'ordine va dal file primario cercato ai vari backup storici (.bak, .prev). Questa ridondanza
-    permette all'agente di riprendere l'esecuzione (resume) caricando lo stato coerente più recente
-    anche se il file principale si è danneggiato o è stato interrotto a metà scrittura.
-    """
-    backup_path, previous_path = _backup_paths(filepath)
-    candidates = [filepath, backup_path, previous_path, filepath + ".bak", filepath + ".prev"]
-    unique_candidates = []
-    seen = set()
-    for candidate in candidates:
-        key = os.path.abspath(candidate)
-        if key not in seen:
-            unique_candidates.append(candidate)
-            seen.add(key)
-    return unique_candidates
-
-def safe_save(obj, filepath, keep_backup=True):
-    """
-    Salva un oggetto PyTorch in modo atomico e sicuro contro le interruzioni di corrente.
-    
-    Come funziona:
-      - Salva l'oggetto su un percorso temporaneo (estensione '.tmp').
-      - Esegue fsync per forzare la persistenza fisica.
-      - Esegue la rotazione dei backup esistenti (.bak e .prev).
-      - Rinomina atomicamente il file temporaneo nel percorso finale usando os.replace.
-      - Sincronizza i metadati della directory genitrice.
-    """
-    directory = os.path.dirname(filepath) or '.'
-    os.makedirs(directory, exist_ok=True)
-    temp_filepath = filepath + ".tmp"
-    torch.save(obj, temp_filepath)
-    _fsync_file(temp_filepath)
-    if keep_backup:
-        _rotate_backup(filepath)
-    os.replace(temp_filepath, filepath)
-    _fsync_dir(directory)
-
-def safe_write_text(filepath, text, keep_backup=True):
-    """
-    Scrive una stringa di testo (es. metadati e sidecar di record) in modo atomico e sicuro.
-    
-    Implementa lo stesso protocollo di scrittura temporanea, sincronizzazione forzata e
-    rotazione dei backup usato per i checkpoint binari di PyTorch.
-    """
-    directory = os.path.dirname(filepath) or '.'
-    os.makedirs(directory, exist_ok=True)
-    temp_filepath = filepath + ".tmp"
-    with open(temp_filepath, 'w', encoding='utf-8') as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    if keep_backup:
-        _rotate_backup(filepath)
-    os.replace(temp_filepath, filepath)
-    _fsync_dir(directory)
-
-def safe_read_float(filepath, default):
-    """
-    Legge un valore a virgola mobile da un file sidecar testuale, gestendo potenziali errori.
-    
-    In caso di problemi di lettura o di assenza del file primario, tenta automaticamente di caricare
-    il valore dai backup storici (.bak, .prev). Restituisce il valore di default in ultima istanza.
-    """
-    for candidate in _checkpoint_candidates(filepath):
-        if not os.path.exists(candidate):
-            continue
-        try:
-            with open(candidate, 'r', encoding='utf-8') as f:
-                return float(f.read().strip())
-        except Exception as e:
-            print(f"Impossibile leggere valore numerico da {candidate}: {e}")
-    return default
-
-def safe_save_npz(buffer_obj, filepath, keep_backup=True):
-    """
-    Salva il ReplayBuffer in formato binario compresso (.npz) garantendo atomicità.
-    
-    Utilizza un file temporaneo con estensione '.tmp.npz' per evitare che la libreria numpy
-    aggiunga desinenze ridondanti e per non sovrascrivere direttamente il file principale
-    prima che sia interamente registrato sul disco fisso.
-    """
-    if len(buffer_obj.buffer) == 0:
-        return
-    os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
-    # np.savez_compressed appende automaticamente '.npz' se non presente.
-    # Per evitarlo, facciamo terminare il file temporaneo con '.tmp.npz'.
-    temp_filepath = filepath.replace(".npz", "") + ".tmp.npz"
-    buffer_obj.save(temp_filepath)
-    if os.path.exists(temp_filepath):
-        _fsync_file(temp_filepath)
-        if keep_backup:
-            _rotate_backup(filepath)
-        os.replace(temp_filepath, filepath)
-        _fsync_dir(os.path.dirname(filepath) or '.')
-
-_STATE_NORM_PATH = 'train_set/checkpoints/state_norm.npz'
-
-def _load_state_norm():
-    """
-    Carica i file delle statistiche di normalizzazione (media e deviazione standard) degli stati.
-    
-    Queste statistiche sono pre-calcolate a partire dal dataset esperto umano per consentire
-    una normalizzazione mean-0/std-1 stabile come raccomandato in TD3+BC (Fujimoto & Gu, 2021).
-    
-    Ritorna:
-        Una tupla (mean, std) di array numpy a 32-bit float, o (None, None) se il file non esiste.
-    """
-    if os.path.exists(_STATE_NORM_PATH):
-        d = np.load(_STATE_NORM_PATH)
-        return d['mean'].astype(np.float32), d['std'].astype(np.float32)
-    return None, None
-
-_STATE_MEAN, _STATE_STD = _load_state_norm()
-
-def apply_state_norm(s):
-    """
-    Normalizza le feature di stato sensoriali grezze (29D) per centrarle a media 0 e deviazione standard 1.
-    
-    Formula:
-        s_norm = (s - mean) / (std + 1e-3)
-    Il termine 1e-3 evita divisioni per zero su sensori statici.
-    Se le statistiche non sono caricate, restituisce il vettore grezzo senza modifiche (no-op).
-    """
-    if _STATE_MEAN is None:
-        return s
-    return ((s - _STATE_MEAN) / (_STATE_STD + 1e-3)).astype(np.float32)
 
 # ──────────────────────────────────────────────────────────────────────
 #  Determinismo
@@ -416,701 +159,8 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
-#  Replay Buffer
-class ReplayBuffer:
-    """
-    Buffer di memorizzazione delle transizioni per l'addestramento Off-Policy (Replay Buffer).
-    
-    Questa classe memorizza le esperienze sotto forma di tuple: (stato, azione, reward, stato_successivo, done).
-    Gestisce anche un flag parallelo ('expert') per marcare i campioni originati dall'operatore umano (expert=1.0)
-    rispetto a quelli collezionati in autonomia dall'agente (expert=0.0). Questo marcatore è fondamentale
-    per isolare i campioni su cui calcolare la penalità BC (Behavioral Cloning Penalty).
-    """
-    def __init__(self, capacity: int):
-        self.buffer = deque(maxlen=capacity)
-        self.expert_masks = deque(maxlen=capacity)
 
-    def push(self, state, action, reward, next_state, done, expert=0.0):
-        """
-        Inserisce una nuova transizione nel buffer. Se la capacità massima è superata,
-        il campione più vecchio viene rimosso (coda circolare FIFO).
-        """
-        self.buffer.append((state, action, reward, next_state, done))
-        self.expert_masks.append(expert)
 
-    def sample(self, batch_size: int):
-        """
-        Estrae casualmente un batch di transizioni dal buffer.
-        
-        Ritorna:
-            Una tupla di array numpy (state, action, reward, next_state, done, expert_mask).
-        """
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-        batch = [self.buffer[i] for i in indices]
-        expert_masks_batch = [self.expert_masks[i] for i in indices]
-        state, action, reward, next_state, done = map(np.stack, zip(*batch))
-        return state, action, reward, next_state, done, np.array(expert_masks_batch, dtype=np.float32)
-
-    def save(self, filepath: str):
-        """
-        Salva l'intero contenuto del buffer su un file compresso numpy (.npz) per consentire
-        il ripristino o il riavvio del training.
-        """
-        if len(self.buffer) == 0: return
-        states, actions, rewards, next_states, dones = zip(*self.buffer)
-        np.savez_compressed(filepath,
-            states=np.array(states, dtype=np.float32),
-            actions=np.array(actions, dtype=np.float32),
-            rewards=np.array(rewards, dtype=np.float32),
-            next_states=np.array(next_states, dtype=np.float32),
-            dones=np.array(dones, dtype=np.float32),
-            expert_masks=np.array(list(self.expert_masks), dtype=np.float32))
-
-    def load_expert_data(self, h5_dir_or_file: str, max_samples: int = None, max_lap_time: float = None):
-        """
-        Carica i dati di guida registrati dall'esperto umano (file .h5) e li inserisce nel buffer.
-
-        Come funziona:
-          - Legge i file HDF5 estratti durante la guida manuale.
-          - Se max_lap_time è specificato, scarta i file il cui attributo 'lap_time' supera la soglia
-            (vale sia per i giri completi sia per i segmenti, che ereditano il tempo del giro padre).
-            Questo alza il livello dell'ancora BC: imitare la media di tutti i giri umani tira la policy
-            verso il giro medio, mentre per superare il pilota serve imitare solo i suoi giri migliori.
-          - Normalizza gli stati fisici 29D grezzi usando la media e deviazione standard pre-calcolate.
-          - Applica lo State Stacking (Fujimoto 2021) concatenando t-12 (index i-12), t-6 (index i-6) e t (index i)
-            per formare gli stati 87D che la rete si aspetta in input.
-          - Mappa l'azione dell'esperto (acceleratore e freno) dall'intervallo [0, 1] (Sigmoid) all'intervallo [-1, 1] (Tanh)
-            per renderle coerenti con le uscite della testa continua dell'Actor.
-          - Calcola a posteriori il reward associato a ciascuna transizione usando la stessa formula di gym_torcs,
-            favorendo il progresso longitudinale e penalizzando le uscite di pista.
-          - Salva i campioni marcando il flag expert = 1.0.
-        """
-        import glob
-        import h5py
-        import os
-
-        if os.path.isdir(h5_dir_or_file):
-            h5_files = sorted(glob.glob(os.path.join(h5_dir_or_file, "**/lap_*.h5"), recursive=True))
-        else:
-            h5_files = [h5_dir_or_file]
-
-        loaded = 0
-        skipped_slow = 0
-        for f in h5_files:
-            # Check per non superare il numero massimo di campioni
-            if max_samples and loaded >= max_samples: break
-            try:
-                with h5py.File(f, 'r') as h5f:
-                    if max_lap_time is not None:
-                        file_lap_time = h5f.attrs.get('lap_time', None)
-                        if file_lap_time is not None and float(file_lap_time) > max_lap_time:
-                            skipped_slow += 1
-                            continue
-                    states_np = h5f['states'][:]
-                    actions_np = h5f['actions'][:]
-
-                states_norm = apply_state_norm(states_np)  # applica la normalizzazione
-                length = len(states_np)
-                k = 6
-
-                # applica lo state stacking concatenando t-12, t-6 e t
-                for i in range(length - 1):
-                    if max_samples and loaded >= max_samples: break
-                    idx_t6 = max(0, i - k)
-                    idx_t12 = max(0, i - 2 * k)
-                    next_i = i + 1
-                    n_idx_t6 = max(0, next_i - k)
-                    n_idx_t12 = max(0, next_i - 2 * k)
-
-                    stacked_state = np.concatenate([states_norm[idx_t12], states_norm[idx_t6], states_norm[i]])
-                    next_stacked_state = np.concatenate([states_norm[n_idx_t12], states_norm[n_idx_t6], states_norm[next_i]])
-
-                    cont_action = actions_np[i, 0:3].copy()
-                    cont_action[1] = (cont_action[1] * 2.0) - 1.0
-                    cont_action[2] = (cont_action[2] * 2.0) - 1.0
-
-                    speedX = states_np[i, 21] * 50.0
-                    angle = states_np[i, 0]
-                    trackPos = states_np[i, 20]
-
-                    progress = (speedX / 50.0) * np.cos(angle)
-                    tp = abs(trackPos)
-                    pos_penalty = -2.0 * (max(0.0, tp - 1.0) ** 2)
-                    steer_change = cont_action[0] - actions_np[i-1, 0] if i > 0 else 0.0
-                    reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
-
-                    mask = 1.0 
-
-                    self.push(stacked_state, cont_action, reward, next_stacked_state, mask, expert=1.0)
-                    loaded += 1
-            except Exception as e:
-                print(f"Errore caricando {f}: {e}")
-
-        filtro_msg = ""
-        if max_lap_time is not None:
-            filtro_msg = f" (filtro lap_time <= {max_lap_time:.1f}s: scartati {skipped_slow} file più lenti)"
-        print(f"  [EXPERT INJECTION] Caricati {loaded} campioni esperti nel Replay Buffer.{filtro_msg}")
-
-    def load(self, filepath: str):
-        """
-        Carica le transizioni compresse salvate in un file .npz nel buffer in memoria.
-        """
-        if not os.path.exists(filepath): return
-        with np.load(filepath) as data:
-            states = data['states']
-            actions = data['actions']
-            rewards = data['rewards']
-            next_states = data['next_states']
-            dones = data['dones']
-            expert_masks_data = data['expert_masks'] if 'expert_masks' in data.files else np.zeros(len(states))
-            states, actions, rewards, next_states, dones, expert_masks_data = [
-                np.asarray(x) for x in (states, actions, rewards, next_states, dones, expert_masks_data)
-            ]
-        lengths = {len(states), len(actions), len(rewards), len(next_states), len(dones), len(expert_masks_data)}
-        if len(lengths) != 1:
-            raise ValueError(f"Replay Buffer non coerente in {filepath}: lunghezze diverse {sorted(lengths)}")
-
-        new_buffer = deque(maxlen=self.buffer.maxlen)
-        new_expert_masks = deque(maxlen=self.expert_masks.maxlen)
-        for i in range(len(states)):
-            new_buffer.append((states[i], actions[i], float(rewards[i]), next_states[i], float(dones[i])))
-            new_expert_masks.append(float(expert_masks_data[i]))
-        self.buffer = new_buffer
-        self.expert_masks = new_expert_masks
-        print(f"  Replay Buffer caricato: {len(self.buffer)} transizioni")
-
-    def __len__(self):
-        return len(self.buffer)
-
-def flatten_state(state_dict: dict) -> np.ndarray:
-    """
-    Esegue l'appiattimento e la normalizzazione delle letture sensoriali grezze di TORCS.
-    
-    Estrae le 29 caratteristiche dello stato (angoli, track, trackPos, speedX/Y/Z, velocità ruote, RPM),
-    le normalizza utilizzando media e deviazione standard pre-calcolate, e restituisce il vettore 29D.
-    """
-    def _s(key, default=0.0):
-        v = state_dict.get(key, default)
-        if isinstance(v, np.ndarray): return float(v.flat[0])
-        return float(v) if v is not None else default
-    def _a(key, size):
-        v = state_dict.get(key, None)
-        if v is None: return np.zeros(size, dtype=np.float32)
-        return np.array(v, dtype=np.float32).flatten()[:size]
-    try:
-        s = np.concatenate([
-            [_s('angle')], _a('track', 19), [_s('trackPos'), _s('speedX'), _s('speedY'), _s('speedZ')],
-            _a('wheelSpinVel', 4) / 100.0, [_s('rpm') / 10000.0]
-        ]).astype(np.float32)
-        return apply_state_norm(s)  
-    except Exception as e:
-        print(f"flatten_state fallita (stato a zero): {e}")
-        return apply_state_norm(np.zeros(29, dtype=np.float32))
-
-# ──────────────────────────────────────────────────────────────────────
-#  Architettura TD3
-# ──────────────────────────────────────────────────────────────────────
-class Actor(nn.Module):
-    """
-    Policy deterministica per la generazione dei comandi di guida (Actor Network).
-    
-    L'input è uno stato concatenato a 87 dimensioni (3 stack temporali di 29 sensori).
-    Usa un backbone a 4 strati lineari fully-connected (512 neuroni ciascuno) con Layer Normalization
-    e attivazioni ReLU per estrarre le caratteristiche di guida.
-    La testa continua produce 3 uscite continue normalizzate nell'intervallo [-1, 1] tramite Tanh:
-      - Uscita 0: Sterzo dell'auto.
-      - Uscita 1: Pressione dell'acceleratore.
-      - Uscita 2: Pressione del freno.
-    """
-    def __init__(self, state_dim=87, hidden_size=512):
-        super(Actor, self).__init__()
-        self.backbone = nn.Sequential(
-            nn.Linear(state_dim, hidden_size), nn.LayerNorm(hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size), nn.LayerNorm(hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size), nn.LayerNorm(hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size), nn.LayerNorm(hidden_size), nn.ReLU(),
-        )
-        self.continuous_head = nn.Linear(hidden_size, 3)  # steer, accel, brake
-
-    def forward(self, state):
-        """
-        Calcola l'azione deterministica grezza (senza rumore) a partire dallo stato 87D.
-        """
-        features = self.backbone(state)
-        mean = self.continuous_head(features)
-        return torch.tanh(mean)
-
-    def sample(self, state, evaluate=False, noise_std=0.1):
-        """
-        Determina l'azione da eseguire sull'ambiente TORCS a partire dallo stato corrente.
-
-        A seconda della modalità di esecuzione, l'azione può essere esplorativa o deterministica:
-          - Training (evaluate = False): Aggiunge un rumore Gaussiano esplorativo con deviazione standard
-            noise_std (clippato in [-2*noise_std, +2*noise_std]) all'azione deterministica. La deviazione
-            standard viene annealata dal training loop (da EXPL_NOISE_START a EXPL_NOISE_END) perché a fine
-            training servono micro-variazioni di traiettoria, non sbandate. L'azione finale viene saturata
-            nell'intervallo [-1.0, 1.0].
-          - Valutazione (evaluate = True): Restituisce l'azione deterministica pura prodotta dalla rete Actor,
-            garantendo una guida stabile, pulita e riproducibile per la fase di submission/test.
-        """
-        action = self.forward(state)
-
-        # Se non siamo in evaluate, aggiunge rumore all'azione
-        if not evaluate:
-            noise = torch.randn_like(action) * noise_std
-            noise = torch.clamp(noise, -2.0 * noise_std, 2.0 * noise_std)
-            action = torch.clamp(action + noise, -1.0, 1.0)
-
-        return action
-
-    def load_bc_weights(self, bc_path):
-        """
-        Inizializza l'agente caricando i pesi pre-addestrati tramite Behavioral Cloning.
-        
-        Compensa lo scaling delle uscite per acceleratore e freno moltiplicandone pesi e bias per 0.5.
-        Questo è necessario perché la policy BC usava la Sigmoid [0, 1] per gas/freno, mentre TD3+BC
-        usa la Tanh [-1, 1], richiedendo una conversione lineare y = 0.5 * x per preservare i valori iniziali.
-        """
-        if not os.path.exists(bc_path): return
-        bc_state = torch.load(bc_path, map_location='cpu', weights_only=True)
-
-        if 'continuous_head.weight' in bc_state:
-            bc_state['continuous_head.weight'][1:3] = bc_state['continuous_head.weight'][1:3] * 0.5
-        
-        if 'continuous_head.bias' in bc_state:
-            bc_state['continuous_head.bias'][1:3] = bc_state['continuous_head.bias'][1:3] * 0.5
-        
-        self.load_state_dict(bc_state, strict=False)
-        print(f"Pesi BC caricati con successo da {bc_path} (compensato scaling 0.5 per accel/brake).")
-
-    def load_actor_weights(self, path, device):
-        """
-        Carica i pesi dell'Actor filtrando solo i parametri adatti alla struttura corrente.
-        """
-        if not os.path.exists(path): return
-        try:
-            loaded = torch.load(path, map_location=device, weights_only=True)
-        except Exception:
-            loaded = torch.load(path, map_location=device, weights_only=False)
-        state_dict = loaded.get('actor', loaded) if isinstance(loaded, dict) else loaded
-        model_state = self.state_dict()
-        filtered_state = {
-            k: v for k, v in state_dict.items()
-            if k in model_state and hasattr(v, 'shape') and model_state[k].shape == v.shape
-        }
-        self.load_state_dict(filtered_state, strict=False)
-
-class Critic(nn.Module):
-    """
-    Twin Critic Network per la stima del valore Q(s, a).
-    
-    Implementa due reti Q indipendenti (Q1 e Q2) che prendono in input la concatenazione
-    dello stato 87D e dell'azione 3D. L'uso di due reti distinte previene l'Overestimation Bias:
-    ad ogni passo di ottimizzazione si sceglie il minimo tra le due stime per calcolare il target TD.
-    """
-    def __init__(self, state_dim=87, action_dim=3, hidden_size=512):
-        super(Critic, self).__init__()
-        self.q1 = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size), nn.ReLU(), nn.Linear(hidden_size, 1)
-        )
-        self.q2 = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size), nn.ReLU(), nn.Linear(hidden_size, 1)
-        )
-
-    def forward(self, state, action):
-        """
-        Ritorna le stime Q1(s,a) e Q2(s,a) come tupla.
-        """
-        xu = torch.cat([state, action], 1)
-        return self.q1(xu), self.q2(xu)
-
-# ──────────────────────────────────────────────────────────────────────
-#  TD3+BC Agent
-# ──────────────────────────────────────────────────────────────────────
-class TD3BCAgent:
-    """
-    Classe principale dell'agente TD3+BC che coordina l'ottimizzazione e il ciclo di addestramento.
-    
-    Questa classe gestisce l'interazione tra i modelli neurali dell'Actor e del Twin Critic, controllando i passaggi chiave:
-      - Selezione delle azioni (con o senza rumore esplorativo Gaussiano).
-      - Ottimizzazione dei Critic tramite la minimizzazione dell'errore di differenza temporale (TD Error), 
-        ovvero la discrepanza tra la stima Q corrente e il target calcolato con l'equazione di Bellman.
-      - Ottimizzazione dell'Actor minimizzando la loss ibrida RL/BC descritta nella documentazione del modulo.
-      - Stabilizzazione del training tramite Polyak Averaging, ovvero l'aggiornamento lento e progressivo delle 
-        reti target interpolando i pesi attivi con un tasso controllato dal coefficiente tau (soft update).
-      - Gestione degli stati speciali di training (congelamento temporaneo dell'Actor post-rollback e modalità di refinement).
-    """
-    def __init__(self, device="cuda"):
-        self.device = torch.device(device)
-        self.gamma = 0.99   # Fattore di sconto temporale per il calcolo del valore Q futuro
-        self.tau = 0.005    # Parametro per l'aggiornamento soft Polyak delle reti target
-        self.policy_freq = 2 # Frequenza di aggiornamento dell'Actor rispetto al Critic (Delayed Policy Update)
-        self.expl_noise = EXPL_NOISE_START  # Dev. standard del rumore esplorativo, annealata dal training loop
-        self.bc_alpha = 2.5  # Coefficiente alpha del TD3+BC: piu' alto = piu' peso alla componente RL rispetto alla BC
-
-        # Inizializzazione Actor (online e target)
-        self.actor = Actor().to(self.device)
-        self.actor_target = Actor().to(self.device)
-        self.actor_target.load_state_dict(self.actor.state_dict())
-
-        # Inizializzazione Critic (online e target)
-        self.critic = Critic().to(self.device)
-        self.critic_target = Critic().to(self.device)
-        self.critic_target.load_state_dict(self.critic.state_dict())
-
-        # Ottimizzatori Adam per l'aggiornamento dei parametri neurali
-        actor_params = [p for p in self.actor.parameters() if p.requires_grad]
-        self.actor_optimizer = optim.Adam(actor_params, lr=3e-4)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
-
-    def select_action(self, state, evaluate=False):
-        """
-        Seleziona l'azione continua 3D per lo stato corrente.
-        
-        Se evaluate = True, la scelta è deterministica. Altrimenti, viene aggiunto
-        rumore esplorativo per facilitare la ricerca off-policy.
-        """
-        state_t = torch.FloatTensor(state).to(self.device).unsqueeze(0)
-        with torch.no_grad():
-            cont_action = self.actor.sample(state_t, evaluate=evaluate, noise_std=self.expl_noise)
-        return cont_action.cpu().numpy()[0]
-
-    def update(self, online_memory, elite_memory, expert_memory, batch_size, global_step):
-        """
-        Esegue un singolo passo di addestramento per il Critic ed (eventualmente) per l'Actor.
-        
-        Come funziona:
-          1. Campiona un batch ibrido a 3 vie: 25% esperti (pilota umano), 15% elite (migliori prestazioni dell'agente)
-             e 60% online (esplorazione corrente). Se online o elite contengono pochi dati, compensa con campioni expert.
-          2. Applica una riscalatura delle ricompense (reward_scale = 0.02) per mantenere i valori Q entro un range stabile.
-          3. Aggiorna il Critic (Twin Critic):
-             - Calcola l'azione target per lo stato successivo aggiungendo rumore clippato (Target Policy Smoothing).
-             - Estrae Q1_target(s', a') e Q2_target(s', a') dalle reti target del Critic.
-             - Prende il minimo tra le due stime (per evitare sovrastime) e calcola il target di Bellman Q_target = r + gamma * min(Q1, Q2).
-             - Esegue la discesa del gradiente minimizzando l'errore quadratico medio (MSE) delle stime correnti Q1 e Q2 rispetto a Q_target.
-          4. Aggiorna l'Actor (Delayed Policy Update):
-             - Se global_step >= 15000 (warm-up concluso) e global_step è un multiplo di policy_freq (ogni 2 passi del critic):
-             - Calcola la componente RL: l'Actor massimizza il valore atteso Q1(s, pi(s)).
-             - Isola i campioni del batch contrassegnati come expert (expert_mask > 0.5).
-             - Calcola la BC Penalty (MSE tra l'azione predetta e quella dell'esperto umano) unicamente su questi campioni
-               per evitare di forzare la policy in stati esplorativi.
-             - Applica una penalità di mutua esclusione per disincentivare la pressione simultanea di acceleratore e freno.
-             - Calcola il coefficiente dinamico lambda del paper: bc_alpha / mean(|Q(s, pi(s))|).
-             - Combina le due loss in: Loss = dynamic_alpha * RL_Loss + BC_Penalty.
-             - Esegue il backward dei gradienti sull'Actor applicando il clipping a 1.0.
-          5. Aggiorna le reti target tramite Polyak Averaging con parametro tau, ogni policy_freq step
-             a prescindere da warm-up e congelamento dell'Actor (come nel TD3 originale).
-        """
-        # Hybrid Sampling a 3 vie: Expert + Online + Elite
-        b_expert = int(batch_size * 0.25)
-        b_elite = min(int(batch_size * 0.15), len(elite_memory.buffer))
-        b_online = min(batch_size - b_expert - b_elite, len(online_memory.buffer))
-        b_expert = batch_size - b_online - b_elite  # il resto dall'expert (sempre disponibile)
-
-        parts = [expert_memory.sample(b_expert)]
-
-        if b_online > 0: parts.append(online_memory.sample(b_online))
-        if b_elite > 0:  parts.append(elite_memory.sample(b_elite))
-
-        state_b      = np.concatenate([p[0] for p in parts], axis=0)
-        action_b     = np.concatenate([p[1] for p in parts], axis=0)
-        reward_b     = np.concatenate([p[2] for p in parts], axis=0)
-        next_state_b = np.concatenate([p[3] for p in parts], axis=0)
-        mask_b       = np.concatenate([p[4] for p in parts], axis=0)
-        expert_mask_b= np.concatenate([p[5] for p in parts], axis=0)
-
-        # Riscalatura della ricompensa per mantenere in un range sano la magnitudo del Critic
-        reward_scale = 0.02
-        reward_b = reward_b * reward_scale
-
-        state_b = torch.FloatTensor(state_b).to(self.device)
-        next_state_b = torch.FloatTensor(next_state_b).to(self.device)
-        action_b = torch.FloatTensor(action_b).to(self.device)
-        reward_b = torch.FloatTensor(reward_b).to(self.device).unsqueeze(1)
-        mask_b = torch.FloatTensor(mask_b).to(self.device).unsqueeze(1)
-        expert_mask_b = torch.FloatTensor(expert_mask_b).to(self.device).unsqueeze(1)
-
-        # Aggiornamento del Critic (Bellman equation con Twin Q-Network)
-        with torch.no_grad():
-            # Target Policy Smoothing (TD3): aggiungiamo rumore clippato per regolarizzare le stime Q
-            noise = (torch.randn_like(action_b) * 0.2).clamp(-0.5, 0.5)
-            next_action = self.actor_target(next_state_b)
-            next_action = (next_action + noise).clamp(-1.0, 1.0)
-
-            q1_next, q2_next = self.critic_target(next_state_b, next_action)
-            min_q_next = torch.min(q1_next, q2_next)
-            target_q = reward_b + mask_b * self.gamma * min_q_next
-
-        q1, q2 = self.critic(state_b, action_b)
-        critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
-
-        # In refinement l'aggiornamento del Critic è disattivato:
-        # l'Actor si raffina verso una value function fissa con vincolo BC ridotto.
-        if not getattr(self, 'refine_mode', False):
-            self.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)  # Impedisce gradient explosion
-            self.critic_optimizer.step()
-
-        actor_loss_val = 0.0
-
-        # Delayed Policy Update (TD3: ogni 2 step del Critic)
-        # Warm-Up di 15000 step per far stabilizzare il Critic prima di aggiornare l'Actor.
-        if global_step >= 15000 and global_step % self.policy_freq == 0 and not getattr(self, 'actor_frozen', False):
-            pi = self.actor(state_b)
-            q1_pi, _ = self.critic(state_b, pi)
-
-            # Componente RL: massimizzazione del Q-Value stimato
-            actor_loss_td3 = -q1_pi.mean()
-
-            # BC Penalty (Masking Rigoroso: Solo su sotto-batch Expert)
-            det_steer = pi[:, 0]
-            det_accel = (pi[:, 1] + 1.0) / 2.0
-            det_brake = (pi[:, 2] + 1.0) / 2.0
-            target_steer = action_b[:, 0]
-            target_accel = (action_b[:, 1] + 1.0) / 2.0
-            target_brake = (action_b[:, 2] + 1.0) / 2.0
-
-            expert_mask_flat = expert_mask_b.squeeze(1)
-            expert_indices = torch.where(expert_mask_flat > 0.5)[0]
-
-            if len(expert_indices) > 0:
-                steer_loss = F.mse_loss(det_steer[expert_indices], target_steer[expert_indices])
-                accel_loss = F.mse_loss(det_accel[expert_indices], target_accel[expert_indices])
-                brake_loss = F.mse_loss(det_brake[expert_indices], target_brake[expert_indices])
-                # Somma i contributi dei tre controlli per la loss BC
-                bc_penalty = (steer_loss * 2.0 + accel_loss + brake_loss * 2.0)
-            else:
-                bc_penalty = torch.tensor(0.0, device=self.device)
-
-            # Penalità per evitare acceleratore e freno premuti contemporaneamente
-            mutual_exclusion_penalty = (det_accel * det_brake).mean()
-            bc_penalty = bc_penalty + (mutual_exclusion_penalty * 0.1)
-
-            # Normalizzazione λ del TD3+BC (Fujimoto & Gu, 2021).
-            # bc_alpha (default 2.5, configurabile con --bc_alpha) regola il rapporto RL/BC:
-            # valori piu' alti spostano il bilanciamento verso il RL, utile per superare l'esperto.
-            Q_abs_mean = q1_pi.abs().mean().detach().clamp(min=1e-5)
-            dynamic_alpha = self.bc_alpha / Q_abs_mean
-
-            # Gestione del refinement (allentamento del vincolo BC su plateau)
-            bc_weight = self.refine_bc_weight if getattr(self, 'refine_mode', False) else 1.0
-
-            total_actor_loss = dynamic_alpha * actor_loss_td3 + (bc_weight * bc_penalty)
-
-            self.actor_optimizer.zero_grad()
-            total_actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)  # Impedisce gradient explosion
-            self.actor_optimizer.step()
-            actor_loss_val = total_actor_loss.item()
-
-        # Soft Update (Polyak Averaging, τ=0.005) — eseguito ogni policy_freq step a prescindere
-        # da warm-up e congelamento dell'Actor, come nel TD3 originale. Tenerlo dentro il ramo
-        # dell'aggiornamento Actor lasciava i target del Critic congelati per decine di migliaia
-        # di step (warm-up e post-rollback), facendo divergere stime correnti e target di Bellman.
-        if global_step % self.policy_freq == 0:
-            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-
-        return critic_loss.item(), actor_loss_val, 0.0
-
-    def save_checkpoint(self, filepath, episode, global_step, memory, elite_memory=None, best_lap_time=float('inf'), best_eval_dist=0.0, best_distance=0.0):
-        """
-        Salva lo stato corrente dell'agente e dei replay buffer su disco in modo atomico.
-        
-        Per garantire l'integrità del checkpoint ed evitare disallineamenti o corruzioni dovuti ad arresti improvvisi:
-          1. Crea la cartella 'buffers/' parallela alla cartella del checkpoint.
-          2. Salva i Replay Buffer (principale ed elite) in formato .npz. I buffer vengono scritti PRIMA dei pesi,
-             poiché rappresentano l'operazione più onerosa in termini di I/O.
-          3. Crea un dizionario contenente i pesi di Actor, Critic, le rispettive reti target, gli ottimizzatori,
-             il numero dell'episodio, il global_step e le metriche di record (best_lap_time, best_eval_dist, best_distance).
-          4. Salva questo dizionario in formato .pth usando safe_save (scrittura temporanea, fsync e backup rotation).
-          
-        Se il processo viene interrotto a metà, l'assenza del file .pth aggiornato indicherà al resume che i nuovi buffer
-        non sono allineati, inducendo il sistema a ignorarli a favore dei backup temporali coerenti.
-        """
-        checkpoint = {
-            'checkpoint_version': 2,
-            'saved_at': datetime.now().isoformat(),
-            'actor': self.actor.state_dict(),
-            'actor_target': self.actor_target.state_dict(),
-            'critic': self.critic.state_dict(),
-            'critic_target': self.critic_target.state_dict(),
-            'actor_optimizer': self.actor_optimizer.state_dict(),
-            'critic_optimizer': self.critic_optimizer.state_dict(),
-            'episode': episode,
-            'global_step': global_step,
-            'best_lap_time': best_lap_time,
-            'best_eval_dist': best_eval_dist,
-            'best_distance': best_distance,
-        }
-        buffer_dir = os.path.join(os.path.dirname(filepath), 'buffers')
-        os.makedirs(buffer_dir, exist_ok=True)
-        base_name = os.path.basename(filepath).replace('.pth', '')
-
-        safe_save_npz(memory, os.path.join(buffer_dir, f"{base_name}_buffer.npz"))
-        if elite_memory:
-            safe_save_npz(elite_memory, os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz"))
-        safe_save(checkpoint, filepath)
-
-    def load_checkpoint(self, filepath, memory, elite_memory=None):
-        """
-        Carica un checkpoint precedentemente salvato, ripristinando lo stato dell'agente e dei replay buffer.
-        
-        Gestione robusta del ripristino (Resume):
-          1. Scansiona i percorsi dei candidati (incluso backups/) per trovare un file .pth leggibile.
-          2. Se il checkpoint contiene la struttura completa di training, ripristina i pesi dei modelli,
-             i target, gli stati degli ottimizzatori e le variabili di avanzamento (episodio, step globali).
-          3. Valida le distanze memorizzate (best_eval_dist e best_distance). Se contengono valori anomali
-             (fuori dal limite fisso monogiro di 3800m), tenta di ripristinarle leggendo i sidecar testuali
-             compilati in parallelo ('td3_det_best_dist.txt').
-          4. Se il checkpoint contiene solo pesi dell'Actor (es. modelli estratti da terze parti per testing),
-             esegue un warm-start dei soli parametri di guida deterministici, azzerando ottimizzatori e buffer.
-          5. Carica i Replay Buffer (principale ed elite) forzando la sincronizzazione temporale:
-             - Non carica buffer con timestamp di modifica successivo a quello del checkpoint .pth (con tolleranza 1ms),
-               poiché indicherebbe che il buffer appartiene ad un salvataggio successivo interrotto prima di scrivere il .pth.
-             - In tal caso, scansiona i backup del buffer per trovarne uno coerente con l'epoca del checkpoint caricato.
-          
-        Ritorna:
-            Una tupla (episode, global_step, best_lap_time, best_eval_dist, best_distance) aggiornata.
-        """
-        buffer_dir = os.path.join(os.path.dirname(filepath), 'buffers')
-        base_name = os.path.basename(filepath).replace('.pth', '')
-        buffer_path = os.path.join(buffer_dir, f"{base_name}_buffer.npz")
-        elite_buffer_path = os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz")
-
-        def _load_buffer_aligned(buffer_obj, path, label, loaded_checkpoint_path=None):
-            """
-            Carica il buffer più recente che non sia temporalmente successivo al checkpoint .pth caricato.
-            Previene il disallineamento dei dati in caso di interruzioni durante il salvataggio.
-            """
-            if buffer_obj is None:
-                return False
-            max_mtime = None
-            if loaded_checkpoint_path and os.path.exists(loaded_checkpoint_path):
-                max_mtime = os.path.getmtime(loaded_checkpoint_path)
-
-            skipped_newer = []
-            for candidate in _checkpoint_candidates(path):
-                if not os.path.exists(candidate):
-                    continue
-                if max_mtime is not None and os.path.getmtime(candidate) > max_mtime + 1e-3:
-                    skipped_newer.append(candidate)
-                    continue
-                try:
-                    buffer_obj.load(candidate)
-                    if candidate != path:
-                        print(f"{label} recuperato dal backup coerente: {candidate}")
-                    if skipped_newer:
-                        print(f"{label}: ignorati file più nuovi del checkpoint caricato: {skipped_newer}")
-                    return True
-                except Exception as e:
-                    print(f"Impossibile caricare {label} da {candidate}: {e}")
-
-            # Recupero di emergenza: se nessun backup allineato è integro, carica il buffer più nuovo disponibile
-            for candidate in skipped_newer:
-                try:
-                    buffer_obj.load(candidate)
-                    print(f"{label}: nessun backup allineato trovato; uso {candidate} (più nuovo del checkpoint).")
-                    return True
-                except Exception as e:
-                    print(f"Impossibile caricare {label} da {candidate}: {e}")
-            return False
-
-        loaded_ok = False
-        loaded_checkpoint_path = None
-        for candidate in _checkpoint_candidates(filepath):
-            if not os.path.exists(candidate):
-                continue
-            try:
-                checkpoint = torch.load(candidate, map_location=self.device, weights_only=False)
-                if isinstance(checkpoint, dict) and 'actor' in checkpoint:
-                    required_keys = ['actor', 'critic', 'critic_target', 'actor_optimizer', 'critic_optimizer', 'episode', 'global_step']
-                    missing_keys = [k for k in required_keys if k not in checkpoint]
-                    if missing_keys:
-                        raise KeyError(f"checkpoint incompleto, chiavi mancanti: {missing_keys}")
-                    self.actor.load_state_dict(checkpoint['actor'], strict=False)
-                    if 'actor_target' in checkpoint: self.actor_target.load_state_dict(checkpoint['actor_target'], strict=False)
-                    self.critic.load_state_dict(checkpoint['critic'])
-                    self.critic_target.load_state_dict(checkpoint['critic_target'])
-                    self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
-                    self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer'])
-
-                    best_lap_time = checkpoint.get('best_lap_time', float('inf'))
-                    best_eval_dist = checkpoint.get('best_eval_dist', 0.0)
-                    best_distance = checkpoint.get('best_distance', 0.0)
-                    # best_eval_dist è uno SCORE (distanza o equivalente-tempo): la soglia di
-                    # plausibilità è quella degli score, non quella della distanza monogiro.
-                    if not _is_plausible_eval_score(best_eval_dist):
-                        det_best_dist_txt = 'train_set/checkpoints/td3_det_best_dist.txt'
-                        sidecar_best_eval_dist = safe_read_float(det_best_dist_txt, 0.0)
-                        print(
-                            f"best_eval_dist={best_eval_dist:.2f} non plausibile come score di eval; "
-                            f"uso sidecar {sidecar_best_eval_dist:.2f}."
-                        )
-                        best_eval_dist = sidecar_best_eval_dist if _is_plausible_eval_score(sidecar_best_eval_dist) else 0.0
-                    if not _is_plausible_eval_dist(best_distance):
-                        # best_distance è una distanza fisica di esplorazione: se corrotta, si riparte
-                        # dallo score clampato alla lunghezza pista (mai oltre i metri reali percorribili).
-                        best_distance = min(best_eval_dist, TRACK_LENGTH_M)
-                    episode = checkpoint['episode']
-                    global_step = checkpoint['global_step']
-                    if candidate != filepath:
-                        print(f"Checkpoint principale non usato: recupero da backup {candidate}")
-                    print(f"Checkpoint caricato: ripresa dall'Episodio {episode}")
-                else:
-                    # È un file di soli pesi dell'actor (come td3_expl_best_dist.pth).
-                    print(f"{candidate} contiene solo pesi dell'Actor. Inizializzazione degli altri componenti.")
-                    self.actor.load_state_dict(checkpoint, strict=False)
-                    self.actor_target.load_state_dict(self.actor.state_dict())
-                    best_lap_time = float('inf')
-                    best_eval_dist = 0.0
-                    best_distance = 0.0
-                    episode = 0
-                    global_step = 0
-                loaded_ok = True
-                loaded_checkpoint_path = candidate
-                break
-            except Exception as e:
-                print(f"Checkpoint non utilizzabile da {candidate}: {e}")
-
-        if not loaded_ok:
-            if not any(os.path.exists(candidate) for candidate in _checkpoint_candidates(filepath)):
-                return 0, 0, float('inf'), 0.0, 0.0
-            print("Nessun checkpoint completo valido trovato tra principale e backup recenti.")
-            print("Tentativo di recupero minimo delle informazioni dal log...")
-            log_file = 'train_set/session_logs/td3_training.log'
-            last_ep = 0
-            if os.path.exists(log_file):
-                try:
-                    with open(log_file, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            match = re.search(r'\b(?:Episode|Episodio|Ep)\s+(\d+)', line)
-                            if match:
-                                ep_num = int(match.group(1))
-                                last_ep = max(last_ep, ep_num)
-                except Exception:
-                    pass
-            print(f"Ripristinato ultimo episodio: {last_ep}. Il training riprenderà dall'episodio {last_ep + 1}.")
-            episode = last_ep + 1
-            global_step = episode * 1500
-            best_lap_time = float('inf')
-
-            best_eval_dist = 0.0
-            det_best_dist_txt = 'train_set/checkpoints/td3_det_best_dist.txt'
-            best_eval_dist = safe_read_float(det_best_dist_txt, 0.0)
-            # Il sidecar contiene uno score: per la distanza fisica di esplorazione va clampato.
-            best_distance = min(best_eval_dist, TRACK_LENGTH_M)
-
-        _load_buffer_aligned(memory, buffer_path, "Replay Buffer", loaded_checkpoint_path if loaded_ok else None)
-        if elite_memory:
-            _load_buffer_aligned(elite_memory, elite_buffer_path, "Elite Buffer", loaded_checkpoint_path if loaded_ok else None)
-
-        return episode, global_step, best_lap_time, best_eval_dist, best_distance
 
 def load_recent_evals_from_log(log_path, max_len=8):
     """
@@ -1424,15 +474,36 @@ def train():
 
     elite_threshold = 500.0
 
+    # ── Fase TIME-ATTACK (opt-in via IM_TIME_ATTACK=1) ────────────────────────
+    # Da attivare DOPO aver raccolto abbastanza giri completi e riaddestrato la BC: riduce
+    # l'ancoraggio alla BC (alpha più alto) e abbassa il floor del rumore esplorativo per
+    # limare i tempi. Il bonus di record personale è invece sempre attivo (vedi blocco SUCCESS).
+    time_attack = (os.environ.get('IM_TIME_ATTACK', '0') == '1')
+    noise_floor = TIME_ATTACK_NOISE_FLOOR if time_attack else EXPL_NOISE_END
+    if time_attack:
+        agent.bc_alpha = TIME_ATTACK_BC_ALPHA
+        print(f"[TIME-ATTACK] Fase attiva: bc_alpha={agent.bc_alpha}, noise_floor={noise_floor}. "
+              f"L'agente ottimizza il tempo sul giro battendo il proprio record.")
+
+    # Lap recorder: raccoglie i giri completi e puliti guidati dall'agente in esplorazione
+    # e li salva in train_set/laps_auto/ per arricchire il dataset della BC (flywheel dati).
+    # Soglia tempo configurabile via IM_RECORD_MAX_LAP_TIME (default 80s); disattivabile con IM_RECORD_LAPS=0.
+    lap_recorder = LapRecorder(
+        LAPS_AUTO_DIR,
+        max_lap_time=float(os.environ.get('IM_RECORD_MAX_LAP_TIME', '80.0')),
+        on_track_limit=1.0,
+        enabled=(os.environ.get('IM_RECORD_LAPS', '1') != '0'),
+    )
+
     print("Avvio training TD3+BC...")
 
     for episode in range(start_episode, args.episodes):
-        # Annealing lineare del rumore esplorativo: da EXPL_NOISE_START a EXPL_NOISE_END
-        # in EXPL_NOISE_ANNEAL_EPISODES episodi. A regime servono micro-variazioni di
-        # traiettoria, non sbandate da 0.1 di sterzo a velocità di gara.
+        # Annealing lineare del rumore esplorativo: da EXPL_NOISE_START al floor (EXPL_NOISE_END,
+        # oppure TIME_ATTACK_NOISE_FLOOR in time-attack) in EXPL_NOISE_ANNEAL_EPISODES episodi.
+        # A regime servono micro-variazioni di traiettoria, non sbandate a velocità di gara.
         agent.expl_noise = max(
-            EXPL_NOISE_END,
-            EXPL_NOISE_START - (EXPL_NOISE_START - EXPL_NOISE_END) * episode / EXPL_NOISE_ANNEAL_EPISODES
+            noise_floor,
+            EXPL_NOISE_START - (EXPL_NOISE_START - noise_floor) * episode / EXPL_NOISE_ANNEAL_EPISODES
         )
 
         # Gestione dello scongelamento dell'Actor dopo la fase di stabilizzazione post-rollback
@@ -1453,6 +524,13 @@ def train():
                 break
             raise
         episode_transitions = []
+
+        # Lap recorder: nuovo giro, e tracciamento dell'osservazione grezza pre-step.
+        lap_recorder.start_episode()
+        cur_ob = ob
+        # Etichetta di fase (curriculum): time-attack se attiva, altrimenti warmup (Critic
+        # non ancora caldo) oppure online. Usata per i metadati del recorder e i log.
+        current_phase = "time_attack" if time_attack else ("warmup" if global_step < 15000 else "online")
 
         # Frame Stacking: concatenazione di 3 frame temporali distanziati (t-12, t-6, t)
         # per fornire informazioni sulla dinamica temporale (velocità e accelerazione).
@@ -1496,7 +574,11 @@ def train():
             torcs_action[3] = current_gear
             env_action[3] = current_gear
 
+            # Lap recorder: stato grezzo pre-step + azione realmente eseguita su TORCS.
+            lap_recorder.record_step(cur_ob, torcs_action)
+
             next_ob, reward, env_done, info = env.step(torcs_action)
+            cur_ob = next_ob
             cur_speed_kmh = float(np.array(next_ob.get('speedX', 0.0)).flat[0]) * 50.0
             cur_rpm = float(np.array(next_ob.get('rpm', 0.0)).flat[0])
             next_f_state = flatten_state(next_ob)
@@ -1522,6 +604,9 @@ def train():
                 # senza questo termine un giro da 70s e uno da 85s sarebbero premiati quasi uguale.
                 reward += LAP_SUCCESS_BONUS + LAP_TIME_BONUS_PER_S * max(0.0, LAP_TIME_BONUS_REF_S - last_lap_time)
                 if last_lap_time < best_lap_time:
+                    # Bonus di RECORD PERSONALE: premia il battere il proprio miglior tempo
+                    # (time-attack), oltre al bonus di completamento. Calcolato sul best PRECEDENTE.
+                    reward += personal_best_bonus(best_lap_time, last_lap_time)
                     best_lap_time = last_lap_time
                     new_record = True
                     safe_save(agent.actor.state_dict(), 'train_set/checkpoints/td3_expl_best_lap.pth')
@@ -1576,6 +661,13 @@ def train():
                         is_danger = (termination_reason == "CRASH") and (i >= n_trans - 50)
                         elite_memory.push(t[0], t[1], t[2], t[3], t[4], expert=0.0 if is_danger else 1.0)
                     elite_threshold = max(500.0, best_distance * 0.7)  # Soglia monotonicamente crescente
+
+                # Lap recorder: salva il giro solo se completato pulito (gate qualità interno).
+                if termination_reason == "SUCCESS":
+                    lap_recorder.finish_lap(completed_lap_time, phase=current_phase,
+                                            episode=episode, global_step=global_step)
+                else:
+                    lap_recorder.discard()
                 break
 
         # Rilevamento del tempo sul giro fornito dai sensori di TORCS.

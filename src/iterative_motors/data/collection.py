@@ -29,11 +29,14 @@ from datetime import datetime
 # Forza la visualizzazione della GUI di TORCS per la data collection
 os.environ['SHOW_GUI'] = '1'
 
-# Aggiunge il wrapper TORCS locale al path di import.
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'gym_torcs')))
+# Iterative Motors: package (ambiente + flatten_state RAW come gli HDF5).
+_SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir))
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+from iterative_motors.common.state import flatten_state_raw as flatten_state
 
 try:
-    from gym_torcs import TorcsEnv
+    from iterative_motors.env.gym_torcs import TorcsEnv
 except ImportError as e:
     print(f"ERRORE FATALE: Impossibile importare gym_torcs o una sua dipendenza.")
     print(f"Dettagli errore: {e}")
@@ -265,53 +268,6 @@ def _extract_segments(dists, zones, margin_steps=15):
     return segs
 
 
-# Flattening dello stato, rende il dizionario di osservazione TORCS in un vettore 1D con 29 elementi.
-# Le variabili sono normalizzate e scalate per essere compatibili con la rete neurale.
-def flatten_state(state_dict: dict) -> np.ndarray:
-    """Appiattisce il dizionario di osservazione TORCS in un vettore 1D (29D).
-
-    Ordine: [angle(1), track(19), trackPos(1), speedX(1), speedY(1), speedZ(1),
-             wheelSpinVel(4)/100, rpm(1)/10000]
-
-    NOTA: distFromStart non fa parte dello stato 29D. Viene salvata solo come
-    metadato per analisi/segmentazione, perché la policy deve guidare dai sensori.
-
-    Usa .get() con default per evitare crash su chiavi mancanti.
-    """
-    def _scalar(key: str, default: float = 0.0) -> float:
-        val = state_dict.get(key, default)
-        if val is None:
-            return default
-        if isinstance(val, np.ndarray):
-            return float(val.flat[0])
-        return float(val)
-
-    def _array(key: str, size: int) -> np.ndarray:
-        val = state_dict.get(key, None)
-        if val is None:
-            return np.zeros(size, dtype=np.float32)
-        arr = np.array(val, dtype=np.float32).flatten()
-        if arr.shape[0] != size:
-            padded = np.zeros(size, dtype=np.float32)
-            padded[:min(size, arr.shape[0])] = arr[:min(size, arr.shape[0])]
-            return padded
-        return arr
-
-    try:
-        state_vec = np.concatenate([
-            np.array([_scalar('angle')]),
-            _array('track', 19),
-            np.array([_scalar('trackPos')]),
-            np.array([_scalar('speedX')]),
-            np.array([_scalar('speedY')]),
-            np.array([_scalar('speedZ')]),
-            _array('wheelSpinVel', 4) / 100.0,
-            np.array([_scalar('rpm') / 10000.0]),
-        ])
-        return state_vec.astype(np.float32)
-    except Exception as e:
-        print(f"  Errore in flatten_state: {e}. Ritorno vettore zero (29D).")
-        return np.zeros(29, dtype=np.float32)
 
 
 # Estrae distFromStart come float scalare dall'osservazione.

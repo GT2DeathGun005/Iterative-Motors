@@ -1,202 +1,134 @@
 # Iterative Motors
 
-Iterative Motors è un progetto di guida autonoma per TORCS nato con un obiettivo preciso: partecipare alla IBM AI Racing League 2026 e costruire un agente capace di superare i limiti e le prestazioni umane sul giro. L'idea è partire dalla competenza di un pilota reale, trasferirla in una rete neurale tramite Behavioral Cloning e poi spingere oltre quella base con Reinforcement Learning TD3+BC.
+Iterative Motors è un progetto di guida autonoma per TORCS, nato per la **IBM AI Racing League**.
+L'obiettivo: costruire un agente che superi le prestazioni umane sul giro. Il modello non guida
+"da zero": prima **imita** un pilota reale tramite Behavioral Cloning (BC), poi spinge oltre quella
+base con Reinforcement Learning **TD3+BC**, generando giri sempre più veloci e ripetibili.
 
-In pratica, il modello non prova a guidare "da zero". Prima impara a imitare traiettorie, accelerazioni e staccate umane; poi usa il simulatore per esplorare varianti, correggere errori e cercare una guida più veloce e robusta.
+Il miglior tempo umano nel dataset è **69.54s**; l'obiettivo è batterlo e avvicinare il record della
+pista (**~65s**).
 
-Per i dettagli tecnici completi vedi [ARCHITECTURE.md](ARCHITECTURE.md).
+Per i dettagli tecnici completi vedi **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
-## Caratteristiche Principali
+## Caratteristiche principali
 
-- Simulatore TORCS controllato tramite protocollo SCR/UDP.
+- Simulatore TORCS controllato via protocollo SCR/UDP (senza modificarne la fisica — regola IBM League).
 - Raccolta dati umana con controller PS5 DualSense o tastiera.
-- Dataset HDF5 con giri completi e segmenti mirati sulle curve difficili.
-- Policy neurale MLP 87D -> 3D con frame stacking temporale.
-- Behavioral Cloning con loss pesata per sterzo, freno e acceleratore.
-- Data augmentation per recupero laterale, errore angolare e overspeed in curva.
-- Fine-tuning TD3+BC con Actor warm-start da BC e Twin Critic.
-- Replay buffer ibrido: expert, online ed elite.
-- Cambio marcia deterministico separato dalla rete.
-- Checkpoint atomici con backup `.bak`/`.prev` e resume.
-- Evaluation deterministica e auto-detect del miglior checkpoint.
+- Stato sensoriale 29D con frame stacking temporale (t-12, t-6, t → 87D); marcia gestita a parte.
+- Behavioral Cloning con loss pesata per sterzo/freno/acceleratore.
+- Data augmentation Bojarski-style con **clamp on-track** (non insegna a guidare fuori pista) e
+  perturbazione angolare ampliata (~10°).
+- Fine-tuning TD3+BC: Actor con warm-start da BC, Twin Critic, campionamento ibrido expert/online/elite.
+- **Flywheel dati**: la TD3 registra i propri giri puliti (`laps_auto/`) per riaddestrare una BC più forte.
+- **Time-attack** con bonus di record personale: l'agente cerca di battere i propri tempi.
+- Cambio marcia deterministico separato dalla rete; checkpoint atomici con backup e resume robusto.
+- Valutazione deterministica con auto-detect del miglior checkpoint.
+- **Orchestratore unico `run.sh`** per l'intera pipeline, con cruscotto di stato.
 
-## Struttura Del Progetto
+## Struttura del progetto
 
 ```text
 .
-|-- data_collection.py        # raccolta dati umani in TORCS
-|-- behavioral_cloning.py     # training supervisionato BC
-|-- td3_bc.py                 # fine-tuning TD3+BC
-|-- test_agent.py             # test deterministico dell'agente
-|-- gearing.py                # cambio marcia algoritmico
-|-- gym_torcs/                # wrapper TORCS e client SCR
-|-- train_bc.sh               # avvio training BC
-|-- train_rl.sh               # avvio/resume training TD3+BC
-|-- stop_training.sh          # stop processi training/TORCS
-|-- train_set/                # dataset, checkpoint e log locali
-`-- telemetry/                # CSV generati dai test
+|-- run.sh                          # orchestratore unico della pipeline (CLI controller)
+|-- src/iterative_motors/           # PACKAGE: logica del progetto
+|   |-- common/                    # costanti, stato/normalizzazione, checkpoint
+|   |-- env/                       # wrapper TORCS, client SCR, gearing, autostart
+|   |-- models/                    # reti (Actor/PolicyNetwork/Critic) e mapping azioni
+|   |-- data/                      # replay buffer, dataset HDF5, lap recorder, raccolta dati
+|   |-- bc/                        # data augmentation + training Behavioral Cloning
+|   |-- rl/                        # agente TD3+BC, reward/time-attack, training loop
+|   `-- eval/                      # test deterministico dell'agente
+|-- train_set/                      # dataset (laps/, laps_auto/), checkpoint, log (NON in git)
+`-- telemetry/                      # CSV generati dai test
 ```
 
-`train_set/` e `telemetry/` sono ignorate da Git tranne i `.gitkeep`: i dati raccolti, i checkpoint e la telemetria sono artefatti locali.
+Gli entrypoint vivono nel package e si lanciano via `run.sh` o come moduli
+(`PYTHONPATH=src python -m iterative_motors.<sottopacchetto>.<modulo>`).
 
 ## Prerequisiti
 
-Il progetto è pensato per Linux. Servono:
-
-- Python 3;
-- TORCS con server SCR disponibile;
-- `xvfb-run` per training/test headless;
-- `xte`, fornito di solito da `xautomation`, per l'autostart dei menu TORCS;
+Linux con:
+- Python 3; TORCS con server SCR; `xvfb-run` (headless); `xte` (autostart menu TORCS, pacchetto `xautomation`);
 - librerie Python: `torch`, `numpy`, `h5py`, `pygame`, `gym`.
-
-Setup indicativo:
 
 ```bash
 sudo apt install torcs xvfb xautomation
-python -m venv .venv
-source .venv/bin/activate
-pip install numpy torch h5py pygame gym
+python -m venv .venv && source .venv/bin/activate
+pip install numpy torch h5py pygame gym   # per CUDA usare il comando ufficiale PyTorch
 ```
 
-Per PyTorch con CUDA conviene usare il comando ufficiale adatto alla propria GPU.
-
-## Uso Rapido
-
-### 1. Raccogliere Dimostrazioni Umane
-
-Con controller:
+## Uso rapido (via orchestratore)
 
 ```bash
-python data_collection.py --device controller
+./run.sh help        # elenco completo dei comandi
+./run.sh status      # cruscotto: processi attivi, dataset, record, ultimi log
 ```
 
-Con tastiera:
+### 1. Raccogliere dimostrazioni umane
 
 ```bash
-python data_collection.py --device keyboard
+./run.sh collect --device controller     # oppure --device keyboard
 ```
 
-I giri validi vengono salvati in `train_set/laps/lap_XXX.h5`. Per salvare solo segmenti di curve:
+I giri validi finiscono in `train_set/laps/lap_NNN.h5`. Opzioni utili: `--segment_only` (solo
+segmenti di curve), `--zones "670:900,2380:2530"` (zone specifiche).
+
+### 2. Addestrare la Behavioral Cloning
 
 ```bash
-python data_collection.py --device controller --segment_only
+./run.sh bc
 ```
 
-Per indicare zone specifiche:
+Produce `train_set/checkpoints/bc_policy.pth` e `state_norm.npz` (background; segui con
+`./run.sh logs bc` e `./run.sh status`).
+
+### 3. Fine-tuning TD3+BC + raccolta giri (harvest)
 
 ```bash
-python data_collection.py --device controller --segment_only --zones "670:900,2380:2530"
+./run.sh rl --episodes 2500
 ```
 
-### 2. Addestrare Il Behavioral Cloning
+Durante il training l'agente registra automaticamente i propri giri completi e puliti in
+`train_set/laps_auto/` (disattivabile con `IM_RECORD_LAPS=0`). Stop pulito: `./run.sh stop rl`
+(salva il checkpoint prima di uscire).
+
+### 4. Arricchire la BC (flywheel) e time-attack
 
 ```bash
-./train_bc.sh
+# Ri-addestra la BC su giri umani + auto-raccolti
+./run.sh bc-enriched --output train_set/checkpoints/enriched/bc_policy.pth
+
+# Fase time-attack: l'agente ottimizza il tempo battendo il proprio record
+./run.sh time-attack --episodes 4000
 ```
 
-Output principali:
+Per adottare la BC arricchita in una nuova lineage RL: copia i nuovi `bc_policy.pth` +
+`state_norm.npz` da `enriched/` in `train_set/checkpoints/`, azzera i checkpoint TD3 (i record
+deterministici restano protetti) e rilancia `./run.sh rl`.
 
-- `train_set/checkpoints/bc_policy.pth`;
-- `train_set/checkpoints/state_norm.npz`;
-- log in `train_set/session_logs/`.
-
-Comando equivalente manuale:
+### 5. Testare l'agente
 
 ```bash
-python behavioral_cloning.py \
-  --dataset train_set/laps \
-  --epochs 300 \
-  --batch_size 256 \
-  --output train_set/checkpoints/bc_policy.pth
-```
-
-### 3. Avviare Il Fine-Tuning TD3+BC
-
-```bash
-./train_rl.sh
-```
-
-Variabili utili:
-
-```bash
-TD3_EPISODES=500 TD3_MAX_STEPS=5000 TD3_SEED=42 ./train_rl.sh
-```
-
-Flag principali:
-
-```bash
-./train_rl.sh --clean
-./train_rl.sh --rollback
-./train_rl.sh --rollback --actor-freeze-episodes 100
-./train_rl.sh --no-auto-refine
-./train_rl.sh --refine
-```
-
-`--clean` elimina i checkpoint TD3 del run corrente, ma preserva i record deterministici assoluti gestiti dai sidecar dedicati.
-
-Per fermare in modo ordinato:
-
-```bash
-./stop_training.sh
-```
-
-Oppure usa `Ctrl+C`: `td3_bc.py` intercetta il segnale e prova a salvare un checkpoint completo prima di uscire.
-
-### 4. Testare L'Agente
-
-Auto-detect del miglior checkpoint:
-
-```bash
-python test_agent.py
-```
-
-Per guardare TORCS durante il test:
-
-```bash
-SHOW_GUI=1 python test_agent.py
-```
-
-Checkpoint esplicito:
-
-```bash
-python test_agent.py --weights train_set/checkpoints/td3_det_best_lap.pth --laps 5
-```
-
-Se il nome file non contiene `td3` o `bc`, specifica il tipo:
-
-```bash
-python test_agent.py --weights mio_actor.pth --kind rl
-python test_agent.py --weights mio_bc.pth --kind bc
+./run.sh test --laps 3                # auto-detect del miglior checkpoint
+SHOW_GUI=1 ./run.sh test --laps 1     # con finestra TORCS visibile
+./run.sh test --weights train_set/checkpoints/td3_det_best_lap.pth --laps 5
 ```
 
 I CSV di telemetria vengono scritti in `telemetry/`.
 
-## Checkpoint Importanti
+## Idea del modello
 
-| File | Significato |
-| --- | --- |
-| `bc_policy.pth` | Policy addestrata solo con Behavioral Cloning |
-| `state_norm.npz` | Media e deviazione standard degli stati |
-| `td3_checkpoint.pth` | Checkpoint completo per resume TD3+BC |
-| `td3_policy.pth` | Ultima policy TD3 salvata |
-| `td3_det_best_lap.pth` | Miglior giro valido deterministico, candidato submission |
-| `td3_det_best_dist.pth` | Miglior distanza deterministica assoluta |
-| `td3_expl_best_lap.pth` | Miglior giro trovato durante esplorazione |
-| `td3_expl_best_dist.pth` | Miglior distanza trovata durante esplorazione |
-
-Quando `test_agent.py` viene lanciato senza `--weights`, cerca i checkpoint in ordine di priorità e usa il migliore disponibile.
-
-## Idea Del Modello
-
-La policy vede tre istanti temporali dello stato sensoriale TORCS, concatenati in un input 87D. Produce sterzo, acceleratore e freno. La marcia non è appresa: `gearing.py` la calcola con soglie robuste di velocità, RPM e cooldown, riducendo lo spazio d'azione e migliorando la stabilità.
-
-Il Behavioral Cloning fornisce una guida iniziale umana. TD3+BC conserva quell'ancora esperta ma permette alla policy di ottimizzare la reward racing: avanzare lungo la pista, restare entro i limiti, evitare oscillazioni di sterzo, completare il giro e migliorare tempo/distanza in valutazione deterministica.
+La policy vede 3 istanti temporali dello stato sensoriale (input 87D) e produce sterzo, acceleratore
+e freno; la marcia è calcolata da `gearing.py`. La BC dà la competenza iniziale; il TD3+BC conserva
+quell'ancora esperta ma ottimizza la reward racing (avanzare, restare in pista, fluidità, completare
+il giro, abbassare il tempo). Il flywheel dei dati reimmette i giri migliori dell'agente nel dataset
+BC, alzando progressivamente il punto di partenza.
 
 ## Riferimenti
 
-- Lillicrap et al., "Continuous Control with Deep Reinforcement Learning", 2015: https://arxiv.org/abs/1509.02971
-- Fujimoto, van Hoof, Meger, "Addressing Function Approximation Error in Actor-Critic Methods", 2018: https://arxiv.org/abs/1802.09477
-- Fujimoto, Gu, "A Minimalist Approach to Offline Reinforcement Learning", 2021: https://arxiv.org/abs/2106.06860
-- Beeson, Montana, "Improving TD3-BC: Relaxed Policy Constraint for Offline Learning and Stable Online Fine-Tuning", 2022: https://arxiv.org/abs/2211.11802
-- Bojarski et al., "End to End Learning for Self-Driving Cars", 2016: https://arxiv.org/abs/1604.07316
-- Loiacono, Cardamone, Lanzi, "Simulated Car Racing Championship: Competition Software Manual", 2013: https://arxiv.org/abs/1304.1672
+- Lillicrap et al., *Continuous Control with Deep RL*, 2015 — https://arxiv.org/abs/1509.02971
+- Fujimoto, van Hoof, Meger, *Addressing Function Approximation Error in Actor-Critic Methods*, 2018 — https://arxiv.org/abs/1802.09477
+- Fujimoto, Gu, *A Minimalist Approach to Offline RL*, 2021 — https://arxiv.org/abs/2106.06860
+- Beeson, Montana, *Improving TD3-BC*, 2022 — https://arxiv.org/abs/2211.11802
+- Bojarski et al., *End to End Learning for Self-Driving Cars*, 2016 — https://arxiv.org/abs/1604.07316
+- Loiacono, Cardamone, Lanzi, *SCR Championship: Competition Software Manual*, 2013 — https://arxiv.org/abs/1304.1672

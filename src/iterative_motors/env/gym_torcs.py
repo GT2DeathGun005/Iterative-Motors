@@ -1,6 +1,6 @@
-from gym import spaces 
+from gym import spaces
 import numpy as np
-import snakeoil3_gym as snakeoil3
+from . import snakeoil3_gym as snakeoil3
 import os
 import time
 
@@ -16,6 +16,10 @@ def _kill_torcs():
     è il workaround operativo contro il memory leak osservato nei run lunghi di TORCS
     ed è corretto per il flusso single-instance di training/test.
 
+    TODO(parallel): per velocizzare l'RL con N ambienti TORCS in parallelo (porte 3001+i,
+    display Xvfb separati) questo kill globale va sostituito con un teardown per-istanza
+    (PID/porta tracciati). È il punto da modificare quando si valuterà lo speedup; vedi anche
+    il seam ``EnvRunner`` e ``updates_per_step`` documentati in train (punto differito del piano).
     """
     if os.environ.get('TORCS_KILL_ALL', '1') != '0':
         os.system('pkill -9 -f torcs')

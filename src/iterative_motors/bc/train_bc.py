@@ -40,6 +40,7 @@ Il cambio è affidato allo script gearing.py che si occupa di selezionare la mar
 """
 
 import os
+import sys
 import glob
 import argparse
 import numpy as np
@@ -50,225 +51,21 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, random_split
 from datetime import datetime
 
+# Iterative Motors: rete della BC condivisa dal package.
+_SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir))
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+from iterative_motors.models.networks import PolicyNetwork
+from iterative_motors.data.hdf5_dataset import TorcsHDF5Dataset, load_dataset
+from iterative_motors.bc.augmentation import AugmentConfig, augment_batch
+
 BATCH_SIZE = 256
 LR = 3e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# Dataset HDF5
-
-class TorcsHDF5Dataset(Dataset):
-    """Estende la classe Dataset di PyTorch per caricare dati da un file HDF5 contenente osservazioni e azioni del pilota.
-    Feature principali:
-     - Frame stacking temporale di tre frame a intervalli regolari k=6 (equivalenti a 0.24s a 50Hz), al modello quindi vengono forniti gli stati (t-12, t-6, t) e lo stato da 29D passa 87D.
-       Questa feature è stata pensata per rendere il modello consapevole del moto della vettura, aiutandolo a prevedere la traiettoria futura.
-     - Sanity check sui dati all'inizializzazione:
-        - Verifica ci siano i gruppi 'states' e 'actions' nei file HDF5.
-        - Verifica l'assenza di NaN e Inf nei dati. È stato deciso di implementare questo check perché la presenza di valori non validi nel dataset provocherebbe l'instabilità o il collasso della policy durante l'addestramento.
-    """
-
-    def __init__(self, file_path: str):
-        super().__init__()
-
-        # Se nel file path specificato non ci sono file HDF5, solleva un errore di tipo FileNotFoundError
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"File dataset non trovato: {file_path}")
-
-        self.file_path = file_path
-
-        # Legge il file h5 in modalità read-only nel path specificato e gli da l'alias h5f
-        # La chiusura del file è gestita automaticamente dal costrutto 'with'
-        with h5py.File(self.file_path, 'r') as h5f:
-
-            # Verifica la presenza dei gruppi 'states' e 'actions' nel file h5
-            if 'states' not in h5f:
-                raise KeyError(f"Gruppo 'states' mancante in {file_path}")
-            if 'actions' not in h5f:
-                raise KeyError(f"Gruppo 'actions' mancante in {file_path}")
-
-            states_np = h5f['states'][:]
-            actions_np = h5f['actions'][:]
-
-            # Sanity check sui NAN e INF 
-            if np.any(np.isnan(states_np)):
-                raise ValueError(f"NaN rilevati in 'states' di {file_path}")
-            if np.any(np.isinf(states_np)):
-                raise ValueError(f"Inf rilevati in 'states' di {file_path}")
-            if np.any(np.isnan(actions_np)):
-                raise ValueError(f"NaN rilevati in 'actions' di {file_path}")
-            if np.any(np.isinf(actions_np)):
-                raise ValueError(f"Inf rilevati in 'actions' di {file_path}")
-
-            # Crea i tensor di torch partendo dagli array numpy appena letti dall'h5
-            # I tensor sono delle strutture dati di pytorch, simili agli array, possono avere molte dimensioni
-            # e sono ottimizzati per lavorare con la GPU, inoltre tengono traccia di ogni operazione effettuata su di essi
-            # consentendo un calcolo automatico dei gradienti (autograd)
-            self.states = torch.tensor(states_np, dtype=torch.float32)
-            self.actions = torch.tensor(actions_np, dtype=torch.float32)
-
-        # Calcola la lunghezza del dataset
-        self.length = self.states.shape[0]
-
-    # Restituisce la lunghezza del dataset
-    def __len__(self) -> int:
-        return self.length
-
-    # Restituisce il frame-stacking di tre frame (t-12, t-6, t) e la corrispondente azione target
-    def __getitem__(self, idx: int):
-        k = 6
-        idx_t6 = max(0, idx - k)
-        idx_t12 = max(0, idx - 2 * k)
-
-        stacked = torch.cat([
-            self.states[idx_t12],
-            self.states[idx_t6],
-            self.states[idx]
-        ])
-        return stacked, self.actions[idx]
 
 
-def load_dataset(path: str) -> Dataset:
-    """Carica l'intero dataset di giri completi dai file h5 e li unisce in un unico dataset."""
-    # Se il path è una directory
-    if os.path.isdir(path):
-        
-        # Cerca tutti i file h5 nel percorso specificato, li ordina e restituisce solo quelli che contengono i giri completi
-        # (lap_[numero].h5). Escludendo i segmenti di curve, mancanti quindi di alcune parti. 
-        # Questo perché la BC cerca esclusivamente di minimizzare l'errore medio tra l'azione predetta e l'azione del pilota umano
-        # e la presenza di segmenti con solo curve e incompleti dell'intero giro sbilancerebbe notevolmente il dataset, causando un 
-        # deterioramento delle performance della BC.
-        h5_files = sorted(glob.glob(os.path.join(path, "**/lap_[0-9]*.h5"), recursive=True))
-
-        # Se non sono stati trovati file h5, solleva un errore di tipo FileNotFoundError
-        if not h5_files:
-            raise FileNotFoundError(
-                f"Nessun file lap_[0-9]*.h5 (giro intero) trovato in {path} o nelle sue sottocartelle"
-            )
-
-        # Informa l'utente di quanti file h5 sono stati trovati e che verranno caricati
-        print(f"Trovati {len(h5_files)} file HDF5. Carico l'intero dataset...")
-        
-        datasets = [] # Lista di dataset, uno per ogni file h5
-        total_samples = 0 # Conteggio totale dei campioni
-        
-        # Per ogni file h5 trovato, crea un dataset e aggiungilo alla lista. In caso di errore, informa l'utente con un warning.
-        for f in h5_files:
-            try:
-                ds = TorcsHDF5Dataset(f)
-                datasets.append(ds)
-                total_samples += len(ds)
-            except Exception as e:
-                print(f"Warning: Impossibile leggere {f}: {e}")
-
-        # Check per verificare che almeno un dataset sia stato caricato con successo        
-        if not datasets:
-            raise ValueError("Nessun dataset valido trovato.")
-        # Stampa un riepilogo del dataset caricato    
-        print(f"Dataset caricato: {len(datasets)} giri, {total_samples} campioni totali.")
-        
-        # Restituisce il dataset concatenato e il numero totale di campioni
-        return ConcatDataset(datasets), total_samples
-    
-    # Se il path è un file h5 carica solo quello e restituiscilo
-    else: 
-        ds = TorcsHDF5Dataset(path)
-        return ds, len(ds)
-
-
-class PolicyNetwork(nn.Module):
-    """
-    Classe che definisce la rete neurale a 87D stacked di 3 frame da 29D, estende la classe nn.Module
-    di pytorch che fornisce molte funzionalità utili per la costruzione di reti neurali.
-
-    La rete ha una hidden size di 512 neuroni per strato, quattro strati nascosti e layer normalization.
-    Queste sono state scelte per dare alla rete una grande capacità di apprendimento e per evitare il collasso della policy.
-
-    Riassunto della struttura della rete:
-    - Input: 87D (3 frame stacked da 29D ciascuno)
-  
-    - Quattro strati (profondità 4 della rete) nascosti costituiscono la backbone della rete neurale essi agiscono in sequenza:
-        - Linear (87 -> 512) -> Layer Norm -> ReLU
-            In questo strato i dati dei sensori vengono elaborati per la prima volta e la rete produce un output a 512 dimensioni
-            (ogni neurone processa questi dati e ne ricava un output), questo output viene passato al layer di normalizzazione,
-            che si occupa di normalizzare i dati, calcolando media e varianza per ogni feature e facendo in modo che abbiano tutti media 0 e deviazione standard 1 (per evitare la dominanza di alcune feature),
-            stabilizzando così il processo di addestramento. L'output passa poi al layer ReLU, che applica la funzione di attivazione ReLU (Rectified Linear Unit),
-            che introduce non linearità nel modello. 
-
-            Tale funzione opera nel seguente modo:  
-            - Se l'input è positivo, restituisce l'input stesso
-            - Se l'input è negativo, restituisce 0
-
-            In questo modo la rete non si attiva sempre, ma solo quando l'input è positivo. Permettendogli di apprendere pattern che non sempre
-            usano tutte le feature disponibili.
-
-        - Linear (512 -> 512) -> Layer Norm -> ReLU
-            Questo strato è identico al precedente, aumentando la profondità della rete e permettendo di apprendere relazioni più complesse.
-        
-        - Linear (512 -> 512) -> Layer Norm -> ReLU
-            Questo strato è identico ai precedenti, aumentando ulteriormente la profondità della rete.
-        
-        - Linear (512 -> 512) -> Layer Norm -> ReLU
-            Questo strato è identico ai precedenti, aumentando ancora di più la profondità della rete.
-  
-    - Strato di Output (Continuous Head), restituisce valori in un intervallo continuo: 
-        - Linear (512 -> 3D) con funzioni di attivazione:
-            - Sterzata (Indice [0]) -> Tanh (codominio [-1, 1])
-            - Accelerazione (Indice [1]) -> Sigmoid (codominio [0, 1])
-            - Freno (Indice [2]) -> Sigmoid (codominio [0, 1])
-
-    Il numero di layer e di neuroni per layer sono state scelte in base ai riferimenti trovati in letteratura, in particolare sono state prese come 
-    base i paper:
-        - A minimalist approach to offline reinforcement learning. Fujimoto & Gu, Google Research Brain team(2021)
-        - Improving TD3-BC: Relaxed Policy Constraint for Offline Learning and Stable Online Fine-Tuning. Beeson & Montana, University of Warwick, Alan Turing Institute (2022)
-
-    Valori troppo bassi di neuroni o layer porterebbero ad un Underfitting, dove la rete non riuscirebbe a catturare le relazioni complesse tra gli input e gli output, mentre valori troppo alti porterebbero ad un Overfitting, dove la rete imparerebbe a memoria il dataset di training senza generalizzare a nuovi dati.
-    """
-
-    def __init__(self, state_dim: int = 87, hidden_size: int = 512):
-        super(PolicyNetwork, self).__init__()
-
-        # Backbone della rete neurale (4 strati nascosti)
-        self.backbone = nn.Sequential(
-            nn.Linear(state_dim, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-            
-            nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-            
-            nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-            
-            nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-        )
-
-        # Continuous Head per l'output della rete neurale
-        self.continuous_head = nn.Linear(hidden_size, 3)
-
-    # Funzione di forward pass, prende in input lo stato e restituisce l'azione predetta
-    # Restituisce di fatto l'output della rete neurale
-    def forward(self, state: torch.Tensor):
-        # Variabile che contiene le features estratte dal backbone
-        features = self.backbone(state)
-        #La funzione backbone si occupa di eseguire tutto il processo che poi fornisce in output le feature estratte
-        
-        
-        # Variabile che contiene l'output del continuous head
-        cont_out = self.continuous_head(features)
-        #Continous head si occupa di fornire in output l'azione predetta 
-        
-        # Applichiamo le activation function per ogni output
-        steer = torch.tanh(cont_out[:, 0:1])          # [-1, 1]
-        accel_brake = torch.sigmoid(cont_out[:, 1:3])   # [0, 1]
-        
-        # Riuniamo l'output del continuous head in un unico tensore di dimensione 3
-        continuous = torch.cat([steer, accel_brake], dim=1) # 3D: [steer, accel, brake]
-
-        return continuous
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -301,20 +98,25 @@ class BehaviorCloningTrainer:
         - Durante le varie epoche di allenamento, la rete neurale viene salvata solo qualora il suo punteggio sulla validation loss sia migliore rispetto ai precedenti.
     """
 
-    STEER_CURVE_THRESHOLD = 0.10  # soglia sterzo per curva (nel range [-1,1])
-    STEER_BOOST_FACTOR = 3.0      # moltiplicatore dell'errore sullo sterzo in curva
+    # Pesi della loss rivisti (Iterative Motors): il vecchio freno (base 5 × boost 25 = fino a
+    # 125× lo sterzo) rendeva la loss quasi un solo regressore di frenata, peggiorando la
+    # precisione di sterzo. Ridotti a un picco ~24× (base 3 × boost 8); più enfasi in curva.
+    STEER_CURVE_THRESHOLD = 0.07  # soglia sterzo per curva (nel range [-1,1])
+    STEER_BOOST_FACTOR = 4.0      # moltiplicatore dell'errore sullo sterzo in curva
     BRAKE_ACTIVE_THRESHOLD = 0.05  # soglia sopra la quale consideriamo che l'umano stia frenando
-    BRAKE_BOOST_FACTOR = 25.0      # moltiplicatore dell'errore sul freno quando attivo
+    BRAKE_BOOST_FACTOR = 8.0       # moltiplicatore dell'errore sul freno quando attivo
 
     # I default globali vengono sovrascritti dagli argomenti CLI passati da train_bc.sh/main().
 
     def __init__(self, model: nn.Module, dataset: Dataset,
                  batch_size: int = BATCH_SIZE, lr: float = LR, device: str = DEVICE,
-                 state_mean=None, state_std=None):
+                 state_mean=None, state_std=None, aug_cfg: AugmentConfig = None):
 
         ## Controllo del device e spostamento del modello su GPU se disponibile
         self.device = torch.device(device)
         self.model = model.to(self.device)
+        # Configurazione della data augmentation Bojarski-style (default = AugmentConfig()).
+        self.aug_cfg = aug_cfg or AugmentConfig()
         print(f"  Modello spostato su: {self.device}")
 
 
@@ -373,8 +175,8 @@ class BehaviorCloningTrainer:
         targets_cont = target_actions[:, 0:3]
         sq_error = (pred_continuous - targets_cont) ** 2
 
-        # Pesi per canale continuo: [steer, accel, brake]
-        channel_weights = torch.tensor([1.0, 1.0, 5.0], device=pred_continuous.device)
+        # Pesi per canale continuo: [steer, accel, brake] (freno base ridotto 5 -> 3)
+        channel_weights = torch.tensor([1.0, 1.0, 3.0], device=pred_continuous.device)
 
         # Boost freno dinamico se l'umano frena
         brake_target = targets_cont[:, 2]
@@ -404,112 +206,8 @@ class BehaviorCloningTrainer:
             batch_size = states.size(0)
             states = states.view(batch_size, 3, 29)
 
-            # Data Augmentation Bojarski-Style
-            delta_pos = torch.randn(batch_size, device=states.device) * 0.20
-            delta_pos = torch.clamp(delta_pos, -0.40, 0.40)
-
-            # Perturbazione Angolare (angle)
-            delta_angle = torch.randn(batch_size, device=states.device) * 0.04
-            delta_angle = torch.clamp(delta_angle, -0.08, 0.08)
-
-            # Gating dell'augmentation (50%)
-            # Perturbare ogni batch significa che l'agente vedrà ad ogni passo una traiettoria leggermente diversa
-            # ma rischia di non vedere la traiettoria corretta e ideale, quindi applichiamo l'augmentation solo su il 50% dei campioni.
-            # A scegliere dove applicare l'augmentation e dove no è il termine aug_mask, viene scelto un numero casuale tra 0 e 1,
-            # se il numero è inferiore a 0.5 la maschera vale 1 (applichiamo l'augmentation), altrimenti vale 0 (non applichiamo l'augmentation).  
-            aug_mask = (torch.rand(batch_size, device=states.device) < 0.5).float()
-            delta_pos = delta_pos * aug_mask
-            delta_angle = delta_angle * aug_mask
-
-            # Per ognuno dei 3 frame, viene calcolata la perturbazione geometrica coerente con l'augmentation
-            # Dato che i frame sono stacked nel tempo ad un certo punto si sovrapporranno e la perturbazione si accumula
-            # Questo non è un problema se i parametri dell'augmentation sono ben tarati per il nostro applicativo. 
-            for f_idx in range(3):
-                frame_states = states[:, f_idx, :]
-                
-                # Estrazione dei valori dei sensori di pista e angle
-                angle = frame_states[:, 0]
-                # Moltiplicati per 200 per riportarli nella scala dei metri
-                L_0 = frame_states[:, 1] * 200.0  # Sensore -45 gradi
-                L_18 = frame_states[:, 19] * 200.0  # Sensore 45 gradi
-                
-                # Calcolo geometrico dinamico della semi-larghezza della pista
-                W_L = L_18 * torch.sin(angle + 0.785398) # 45 gradi = 0.785398 rad
-                W_R = L_0 * torch.sin(0.785398 - angle)
-                W_half = torch.clamp((W_L + W_R) / 2.0, 4.0, 10.0) # clamping tra 4m e 10m
-                
-                # Spostamento laterale fisico in metri (scalato del 50% per correzione più leggera)
-                dy = delta_pos * W_half * 0.5
-                
-                # Perturbazione trackPos (indice 20)
-                frame_states[:, 20] = frame_states[:, 20] + delta_pos
-                
-                # Perturbazione angolare (indice 0)
-                # L'angle è già in radianti — aggiungiamo la perturbazione direttamente
-                frame_states[:, 0] = frame_states[:, 0] + delta_angle
-                
-                # Perturbazione geometricamente coerente dei 19 sensori track (indici 1:20)
-                alpha = torch.tensor([
-                    -45.0, -19.0, -12.0, -7.0, -4.0, -2.5, -1.7, -1.0, -0.5, 0.0, 
-                    0.5, 1.0, 1.7, 2.5, 4.0, 7.0, 12.0, 19.0, 45.0
-                ], device=states.device) * 3.14159265 / 180.0
-                
-                # Angolo assoluto di ciascun raggio (usa l'angle perturbato)
-                perturbed_angle = frame_states[:, 0]
-                beta = perturbed_angle.unsqueeze(1) + alpha.unsqueeze(0)
-                
-                # Perturbazione lineare sui 19 raggi (combinata: laterale + angolare)
-                dL = - dy.unsqueeze(1) * torch.sin(beta)
-                frame_states[:, 1:20] = torch.clamp(frame_states[:, 1:20] + dL / 200.0, 0.0, 1.0)
-                
-            # Correzione del target di sterzata per compensare le perturbazioni introdotte:
-            #   - Il termine 'delta_pos' (con guadagno 0.25) corregge lo sterzo per far rientrare l'auto verso il centro della pista.
-            #   - Il termine 'delta_angle' (con guadagno 1.5) agisce sull'orientamento per riallineare l'auto parallelamente alla mezzeria.
-            #   - Il target finale dello sterzo viene infine limitato al range fisico [-1.0, 1.0].
-            targets[:, 0] = targets[:, 0] - 0.25 * delta_pos - 1.5 * delta_angle
-            targets[:, 0] = torch.clamp(targets[:, 0], -1.0, 1.0)
-            
-            # Regolazione (parzializzazione) dell'acceleratore in base all'entità della perturbazione:
-            # - Calcoliamo una perturbazione combinata sommando i moduli dello spostamento laterale e angolare.
-            # - Riduciamo proporzionalmente il target dell'acceleratore per insegnare alla rete a rilasciare il gas
-            #   quando il veicolo sbanda o è fuori traiettoria, facilitando il recupero di aderenza.
-            # - Infine, limitiamo l'acceleratore nel range fisico [0.0, 1.0].   
-            combined_perturbation = delta_pos.abs() + delta_angle.abs() * 5.0
-            targets[:, 1] = targets[:, 1] * (1.0 - 0.15 * combined_perturbation)
-            targets[:, 1] = torch.clamp(targets[:, 1], 0.0, 1.0)
-
-
-            # Data Augmentation: Simulazione di velocità eccessiva in curva (Overspeed Recovery):
-            # - Condizione: Il veicolo viaggia a velocità elevata (> 90 km/h) ed è in prossimità di una curva
-            #   (rilevata tramite sterzata del pilota o riduzione del sensore di distanza frontale).
-            # - Operazione: Incrementiamo artificialmente la velocità percepita (speedX), forzando una 
-            #   proporzionale riduzione dell'acceleratore e un incremento del freno target.
-            # - Scopo: Insegnare preventivamente alla policy a rallentare e frenare prima delle curve 
-            #   qualora la velocità di ingresso sia superiore al limite di stabilità dinamica.
-            if torch.rand(1).item() < 0.5:
-                # Estraiamo speedX (indice 21) dall'ultimo frame (de-normalizzato)
-                speedX_latest = states[:, 2, 21] * 50.0
-                steer_target_abs = targets[:, 0].abs()
-                sensor_front_latest = states[:, 2, 10]  # track_s9 (indice 10, cioè 0 gradi)
-
-                is_speed_critical = (speedX_latest > 90.0) & ((steer_target_abs > 0.10) | (sensor_front_latest < 0.60))
-
-                if is_speed_critical.any():
-                    # Genera un incremento del 10% - 30% per i campioni critici
-                    speed_factor = 0.10 + 0.20 * torch.rand(batch_size, device=states.device)
-                    speed_factor = speed_factor * is_speed_critical.float()
-
-                    # Aumentiamo speedX in tutti e 3 i frame
-                    for f_idx in range(3):
-                        states[:, f_idx, 21] = states[:, f_idx, 21] * (1.0 + speed_factor)
-
-                    # Riduciamo l'accelerazione target
-                    targets[:, 1] = targets[:, 1] * (1.0 - 0.7 * speed_factor)
-                    targets[:, 1] = torch.clamp(targets[:, 1], 0.0, 1.0)
-
-                    # Aumentiamo il freno target (insegniamo a frenare correttivamente)
-                    targets[:, 2] = targets[:, 2] + 0.8 * speed_factor
-                    targets[:, 2] = torch.clamp(targets[:, 2], 0.0, 1.0)
+            # Data augmentation Bojarski-style (parametri configurabili in AugmentConfig).
+            states, targets = augment_batch(states, targets, self.aug_cfg)
 
             # Standardizzazione dello stato e flattening finale:
             # - La normalizzazione (z-score) viene applicata in questa fase poiché l'augmentation precedente
@@ -644,10 +342,16 @@ def main():
     # argomento per modificare il path di output
     parser.add_argument(
         "--output", type=str, default="train_set/checkpoints/bc_policy.pth",
-        help="Path di output per i pesi del modello"
+        help="Path di output per i pesi del modello (state_norm.npz viene salvato nella stessa cartella)"
+    )
+    parser.add_argument(
+        "--auto_laps", type=str, default=None,
+        help="Directory opzionale di giri auto-raccolti dalla TD3 (lap_*.h5) da unire al dataset "
+             "umano per l'arricchimento (flywheel dati). La normalizzazione viene ricalcolata sull'unione."
     )
 
     args = parser.parse_args() #legge gli argomenti da riga di comando
+    auto_dirs = [args.auto_laps] if args.auto_laps else []
 
     # Controlla se è disponibile una GPU, altrimenti usa la CPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -660,9 +364,9 @@ def main():
     print(f"  Stride Type: static (k=6, 0.24s)")
     print(f"{'=' * 64}\n")
 
-    # Caricamento dataset
+    # Caricamento dataset (umano + eventuali giri auto-raccolti per l'arricchimento)
     print("  Caricamento dataset...")
-    dataset, total_samples = load_dataset(args.dataset)
+    dataset, total_samples = load_dataset(args.dataset, extra_dirs=auto_dirs)
 
     # Rileva le dimensioni del dataset
     sample_state, _sample_action = dataset[0]
@@ -676,6 +380,10 @@ def main():
         _h5s = sorted(glob.glob(os.path.join(args.dataset, "**/lap_[0-9]*.h5"), recursive=True))
     else:
         _h5s = [args.dataset]
+    # Includi anche i giri auto-raccolti nel calcolo della normalizzazione (coerenza con il dataset).
+    for _ad in auto_dirs:
+        if _ad and os.path.isdir(_ad):
+            _h5s.extend(sorted(glob.glob(os.path.join(_ad, "**/lap_*.h5"), recursive=True)))
     _all_states = []
     for _f in _h5s:
         try:

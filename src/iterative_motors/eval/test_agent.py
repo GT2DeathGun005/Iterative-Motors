@@ -41,10 +41,18 @@ import torch
 import torch.nn as nn
 from collections import deque
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'gym_torcs')))
-
-from gym_torcs import TorcsEnv
-from gearing import compute_gear  # cambio marcia deterministico (anti-hunting), condiviso col training
+# Iterative Motors: package (ambiente, utility stato, reti, mapping azioni)
+_SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir))
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+from iterative_motors.env.gym_torcs import TorcsEnv
+from iterative_motors.env.gearing import compute_gear  # cambio marcia deterministico (anti-hunting)
+from iterative_motors.common.state import apply_state_norm, flatten_state_norm as flatten_state
+from iterative_motors.common.constants import CHECKPOINT_ROOT, TELEMETRY_DIR
+from iterative_motors.models.networks import PolicyNetwork as PolicyActor
+from iterative_motors.models.action_mapping import (
+    bc_to_pedals as denormalize_action_bc, rl_to_pedals as denormalize_action_rl,
+)
 
 # Riproducibilità
 # Costringe la GPU a effettuare calcoli deterministici (piu lenti)
@@ -53,207 +61,11 @@ torch.backends.cudnn.deterministic = True
 # Impedisce che la gpu scelga l'algoritmo migliore ma con possibilità di cambiarlo ogni volta (non deterministico)
 torch.backends.cudnn.benchmark = False 
 
-# PolicyActor — Rete continua BC/TD3+BC
-class PolicyActor(nn.Module):
-    """
-    Definisce l'architettura neurale dell'agente (l'Actor) condivisa tra BC e TD3+BC.
-    
-    La rete accetta in ingresso uno stato a 87 dimensioni (composto da 3 frame a 29 dimensioni concatenati)
-    e produce 3 comandi continui: sterzo, acceleratore e freno.
-    
-    L'architettura è composta da:
-      - Un backbone di 4 livelli lineari (Fully-Connected) da 512 unità ciascuno.
-      - Strati di Layer Normalization (LayerNorm) e attivazioni ReLU dopo ogni livello lineare
-        per prevenire l'esplosione o l'annullamento del gradiente.
-      - Una testa di uscita lineare ('continuous_head') a 3 dimensioni per mappare i comandi finali.
-    """
-
-    def __init__(self, state_dim: int = 87, hidden_size: int = 512):
-        super(PolicyActor, self).__init__()
-
-        self.backbone = nn.Sequential(
-            nn.Linear(state_dim, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-
-            nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-
-            nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-
-            nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-        )
-
-        # Testa lineare a 3 canali continui: [sterzo, acceleratore, freno]
-        self.continuous_head = nn.Linear(hidden_size, 3)
-
-    def forward(self, state: torch.Tensor):
-        """
-        Esegue l'inferenza usando l'attivazione classica del Behavioral Cloning (BC).
-        
-        Questa funzione viene invocata quando l'agente utilizza pesi addestrati tramite BC.
-        Come funziona:
-          - Lo sterzo (canale 0) viene normalizzato in [-1, 1] tramite una tangente iperbolica (Tanh).
-          - L'acceleratore e il freno (canali 1 e 2) vengono mappati in [0, 1] tramite la funzione Sigmoidea.
-          
-        Args:
-            state: Tensore PyTorch dello stato di input 87D (dimensione del batch: [B, 87]).
-        Returns:
-            Un tensore di dimensione [B, 3] contenente [steer, accel, brake].
-        """
-        features = self.backbone(state)
-        cont_out = self.continuous_head(features)
-
-        # Applica le funzioni di attivazione specifiche della policy BC
-        steer = torch.tanh(cont_out[:, 0:1])            # Limitato a [-1, 1] per la sterzata
-        accel_brake = torch.sigmoid(cont_out[:, 1:3])   # Limitati a [0, 1] per acceleratore/freno
-
-        continuous = torch.cat([steer, accel_brake], dim=1)
-        return continuous
-
-    def sample(self, state: torch.Tensor, evaluate: bool = False):
-        """
-        Esegue l'inferenza deterministica per la policy RL (TD3+BC).
-        
-        Questa funzione viene invocata quando l'agente utilizza pesi TD3+BC in modalità deterministica.
-        Come funziona:
-          - Applica la tangente iperbolica (Tanh) su tutti e tre i canali di output.
-          - Questo restituisce un vettore di comandi in [-1, 1] per tutti i controlli (sterzo, acceleratore, freno).
-          - In fase di guida, acceleratore e freno verranno riscalati linearmente da [-1, 1] a [0, 1] mediante denormalize_action_rl().
-          
-        Args:
-            state: Tensore PyTorch dello stato di input 87D (dimensione del batch: [B, 87]).
-            evaluate: Se True (default in test_agent), disabilita il rumore e restituisce la media deterministica.
-        Returns:
-            Un tensore di dimensione [B, 3] contenente [steer, accel, brake] in [-1, 1].
-        """
-        features = self.backbone(state)
-        mean = self.continuous_head(features)
-        return torch.tanh(mean)
 
 
 
-# Utilities di Normalizzazione e Elaborazione dello Stato
-
-# Caricamento delle statistiche di normalizzazione dello stato (mean-0 / std-1).
-# Per far convergere correttamente le reti neurali, le osservazioni 29D vengono normalizzate usando
-# media e deviazione standard calcolate sull'intero dataset esperto (salvate in 'state_norm.npz').
-# Questo garantisce che tutte le feature siano in una scala numerica adatta ad evitare gradienti instabili.
-# Questo file DEVE coincidere esattamente con quello caricato durante la fase di addestramento.
-_STATE_NORM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                'train_set', 'checkpoints', 'state_norm.npz')
-if os.path.exists(_STATE_NORM_PATH):
-    _sn = np.load(_STATE_NORM_PATH)
-    _STATE_MEAN, _STATE_STD = _sn['mean'].astype(np.float32), _sn['std'].astype(np.float32)
-else:
-    _STATE_MEAN, _STATE_STD = None, None
 
 
-def apply_state_norm(s):
-    """
-    Applica la standardizzazione mean-0/std-1 a un vettore di stato numpy.
-    
-    Formula applicata: s_norm = (s - media) / (dev_std + epsilon), dove epsilon = 1e-3 previene divisioni per zero.
-    Se il file delle statistiche non è presente, restituisce lo stato invariato (fallback).
-    
-    Args:
-        s: Vettore di stato grezzo.
-    Returns:
-        Il vettore standardizzato float32.
-    """
-    if _STATE_MEAN is None:
-        return s
-    return ((s - _STATE_MEAN) / (_STATE_STD + 1e-3)).astype(np.float32)
-
-
-def flatten_state(state_dict: dict) -> np.ndarray:
-    """
-    Estrae le grandezze fisiche dal dizionario di TORCS e le appiattisce in un vettore standardizzato a 29 dimensioni.
-    
-    Come funziona:
-      - Estrae i valori scalari o vettoriali (es. track a 19 direzioni) dal dizionario inviato dal wrapper di Gym.
-      - Riduce in scala specifiche grandezze per allineare gli intervalli numerici (es. velocità delle ruote divisa per 100.0, RPM diviso per 10000.0).
-      - Ordine del vettore risultante (29D):
-          - angle (1 dimensione): Angolo tra l'auto e la direzione della pista.
-          - track (19 dimensioni): Distanza dal bordo pista in 19 direzioni (già scalata per 200.0 dal wrapper).
-          - trackPos (1 dimensione): Posizione trasversale rispetto al centro pista [-1.0, 1.0].
-          - speedX, speedY, speedZ (3 dimensioni): Velocità longitudinali, trasversali e verticali (già scalate per 50.0).
-          - wheelSpinVel (4 dimensioni): Velocità di rotazione delle 4 ruote riscalata (/100.0).
-          - rpm (1 dimensione): Giri motore riscaldati (/10000.0).
-      - Infine, applica la normalizzazione mean-0/std-1 tramite apply_state_norm().
-      
-    Args:
-        state_dict: Dizionario contenente le letture dei sensori di bordo di TORCS.
-    Returns:
-        Un array numpy normalizzato di dimensione (29,).
-    """
-    def _s(key, default=0.0):
-        v = state_dict.get(key, default)
-        if isinstance(v, np.ndarray):
-            return float(v.flat[0])
-        return float(v) if v is not None else default
-
-    def _a(key, size):
-        v = state_dict.get(key, None)
-        if v is None:
-            return np.zeros(size, dtype=np.float32)
-        return np.array(v, dtype=np.float32).flatten()[:size]
-
-    try:
-        s = np.concatenate([
-            [_s('angle')],
-            _a('track', 19),              # 19 sensori di distanza dai bordi
-            [_s('trackPos')],             # Posizione rispetto al centro della carreggiata
-            [_s('speedX')],               # Velocità in avanti
-            [_s('speedY')],               # Velocità laterale
-            [_s('speedZ')],               # Velocità verticale
-            _a('wheelSpinVel', 4) / 100.0,# Velocità angolare delle ruote normalizzata
-            [_s('rpm') / 10000.0],        # Giri al minuto del motore normalizzati
-        ]).astype(np.float32)
-        return apply_state_norm(s)  # standardizzazione coerente col training
-    except Exception as e:
-        # NON silenziare: uno stato a zero falserebbe completamente l'inferenza e causerebbe incidenti
-        print(f"flatten_state fallita (stato a zero): {e}")
-        return apply_state_norm(np.zeros(29, dtype=np.float32))
-
-
-def denormalize_action_bc(cont_action: np.ndarray) -> np.ndarray:
-    """
-    Converte le azioni predette dalla policy Behavioral Cloning (BC) nel formato nativo richiesto da TORCS.
-    
-    Come funziona:
-      - Riceve le azioni generate dalla rete neurale (sterzo limitato a [-1, 1] tramite Tanh, acceleratore/freno in [0, 1] tramite Sigmoid).
-      - Esegue un clipping di sicurezza per assicurarsi che i valori rimangano all'interno dei limiti fisici del gioco.
-      - Struttura del vettore di output (4D): [sterzo, acceleratore, freno, marcia] (la marcia è provvisoria e viene sovrascritta dopo).
-    """
-    env_action = np.zeros(4, dtype=np.float32)
-    env_action[0] = np.clip(cont_action[0], -1.0, 1.0)               # sterzo clippato
-    env_action[1] = np.clip(cont_action[1], 0.0, 1.0)                # acceleratore (già Sigmoid)
-    env_action[2] = np.clip(cont_action[2], 0.0, 1.0)                # freno (già Sigmoid)
-    return env_action
-
-
-def denormalize_action_rl(cont_action: np.ndarray) -> np.ndarray:
-    """
-    Mappa e denormalizza le azioni predette dalla policy RL (TD3+BC) nel formato nativo richiesto da TORCS.
-    
-    Come funziona:
-      - Riceve le azioni generate dalla rete neurale (tutte normalizzate in [-1, 1] tramite Tanh).
-      - Mantiene lo sterzo invariato nell'intervallo [-1, 1].
-      - Mappa l'acceleratore e il freno dall'intervallo [-1, 1] all'intervallo [0, 1] tramite la trasformazione
-        affine: x_real = (x_tanh + 1.0) / 2.0.
-      - Applica clipping di sicurezza e restituisce il vettore [sterzo, accelerazione, freno, marcia].
-    """
-    env_action = np.zeros(4, dtype=np.float32)
-    env_action[0] = np.clip(cont_action[0], -1.0, 1.0)               # sterzo clippato
-    env_action[1] = np.clip((cont_action[1] + 1.0) / 2.0, 0.0, 1.0) # acceleratore mappato da [-1, 1] a [0, 1]
-    env_action[2] = np.clip((cont_action[2] + 1.0) / 2.0, 0.0, 1.0) # freno mappato da [-1, 1] a [0, 1]
-    return env_action
 
 
 
@@ -279,8 +91,7 @@ def load_best_weights(model, weights_arg, device, kind='auto'):
     Returns:
         Una tupla (model, is_rl: bool) indicante il modello caricato e se si trata di una policy RL.
     """
-    checkpoint_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  'train_set', 'checkpoints')
+    checkpoint_dir = CHECKPOINT_ROOT
     td3_det_best_lap_path = os.path.join(checkpoint_dir, 'td3_det_best_lap.pth')
     td3_det_best_dist_path = os.path.join(checkpoint_dir, 'td3_det_best_dist.pth')
     td3_det_best_dist_run_path = os.path.join(checkpoint_dir, 'td3_det_best_dist_run.pth')
@@ -573,7 +384,7 @@ def main():
                 if env_done: break
 
             # Scrittura telemetria su file CSV al termine di ogni tentativo
-            telemetry_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'telemetry')
+            telemetry_dir = TELEMETRY_DIR
             os.makedirs(telemetry_dir, exist_ok=True)
             csv_path = os.path.join(telemetry_dir, f'telemetry_attempt_{total_attempts}.csv')
             with open(csv_path, 'w', newline='') as f_csv:
