@@ -136,7 +136,7 @@ start_bg() {  # start_bg <task> <comando...>
     setsid bash -c '
         lf="$1"; shift
         "$@" > >(
-            sed -E \
+            sed -u -E \
                 -e "/Gym has been|Please upgrade|Users of this|migration guide|Waiting for server|Client connected/d" \
                 -e "/^[.][[:space:]]*$/d" \
                 -e "/^### TORCS is RELAUNCHED ###$/d" \
