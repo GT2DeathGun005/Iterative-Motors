@@ -106,7 +106,7 @@ class BehaviorCloningTrainer:
     BRAKE_ACTIVE_THRESHOLD = 0.05  # soglia sopra la quale consideriamo che l'umano stia frenando
     BRAKE_BOOST_FACTOR = 8.0       # moltiplicatore dell'errore sul freno quando attivo
 
-    # I default globali vengono sovrascritti dagli argomenti CLI passati da train_bc.sh/main().
+    # I default globali vengono sovrascritti dagli argomenti CLI passati da main().
 
     def __init__(self, model: nn.Module, dataset: Dataset,
                  batch_size: int = BATCH_SIZE, lr: float = LR, device: str = DEVICE,
@@ -414,24 +414,8 @@ def main():
         state_std=state_std
     )
 
-    # Crea il log di sessione se non esiste ad un path prestabilito (train_set/session_logs/)
-    try:
-        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(args.output))), "session_logs")
-        os.makedirs(log_dir, exist_ok=True)
-    except OSError:
-        log_dir = os.path.dirname(os.path.abspath(args.output)) or "."
-        os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f"bc_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write("=== BEHAVIORAL CLONING TRAINING LOG ===\n")
-        f.write(f"Avvio:        {datetime.now().isoformat()}\n")
-        f.write(f"Dataset:      {args.dataset} | Campioni: {total_samples} | Device: {device}\n")
-        f.write(f"Iperparam:    epochs={args.epochs} batch={args.batch_size} lr={args.lr} state_dim={state_dim}\n")
-        f.write(f"Output:       {args.output}\n")
-    print(f"  Log di sessione: {log_path}")
-
     # Avvia l'addestramento
-    trainer.train(max_epochs=args.epochs, checkpoint_path=args.output, patience=100, log_path=log_path)
+    trainer.train(max_epochs=args.epochs, checkpoint_path=args.output, patience=100)
 
     print("\n  Addestramento Behavioral Cloning completato.")
     print(f"  Pesi salvati in: {args.output}\n")

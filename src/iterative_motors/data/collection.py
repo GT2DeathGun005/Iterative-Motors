@@ -394,7 +394,7 @@ def main():
     laps_dir = os.path.join(output_dir, "laps")
     os.makedirs(laps_dir, exist_ok=True)
 
-    # Session log
+    # Session log della raccolta dati: distinto dai tre log top-level della pipeline training.
     log_dir = os.path.join(output_dir, "session_logs", "giri")
     os.makedirs(log_dir, exist_ok=True)
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")

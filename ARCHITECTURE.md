@@ -319,15 +319,14 @@ File principali in `train_set/checkpoints/`:
 
 ## 11. Orchestratore run.sh
 
-`run.sh` è il controller unico della pipeline (sostituisce i vecchi `train_bc.sh`/`train_rl.sh`/
-`stop_training.sh`). Imposta `PYTHONPATH=src`, lancia i task lunghi in background salvando PID e log,
-e offre un cruscotto di stato.
+`run.sh` è il controller unico della pipeline. Imposta `PYTHONPATH=src`, lancia i task lunghi in
+background salvando PID e log, e offre un cruscotto di stato.
 
 ```
 ./run.sh collect [args]       # raccolta giri umani (foreground)
 ./run.sh bc [args]            # training BC (background)
 ./run.sh bc-enriched [args]   # training BC su umano+auto (background)
-./run.sh rl [args]            # TD3+BC + harvest dei giri (background)
+./run.sh td3 [args]           # TD3+BC + harvest dei giri (background)
 ./run.sh time-attack [args]   # fase time-attack (background)
 ./run.sh test [args]          # valutazione deterministica (foreground)
 ./run.sh status               # processi attivi, dataset, record, ultimi log
@@ -376,7 +375,7 @@ Punto lasciato volutamente non implementato (da valutare in futuro), con i ganci
 - **Lineage dei checkpoint dopo l'enrichment.** Ricalcolare `state_norm.npz` cambia la normalizzazione:
   i checkpoint TD3 addestrati con la vecchia non sono più coerenti. Per adottare una BC arricchita
   conviene avviare una **nuova lineage**: copiare i nuovi `bc_policy.pth` + `state_norm.npz` in
-  `checkpoints/`, poi `./run.sh rl` dopo aver azzerato i checkpoint TD3 (i record deterministici sono
+  `checkpoints/`, poi `./run.sh td3` dopo aver azzerato i checkpoint TD3 (i record deterministici sono
   protetti dai sidecar). I checkpoint vecchi restano come archivio.
 - I dati e i checkpoint in `train_set/` non sono tracciati da git (scelta del progetto): vanno
   salvati con backup esterni.

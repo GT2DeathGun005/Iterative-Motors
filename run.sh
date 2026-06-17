@@ -7,9 +7,7 @@
 #  Behavioral Cloning, fine-tuning TD3+BC (con harvest dei giri), fase time-attack,
 #  valutazione, oltre a un cruscotto di STATO dei processi e allo STOP pulito.
 #
-#  Sostituisce i vecchi train_bc.sh / train_rl.sh / stop_training.sh.
-#
-#  I task lunghi (bc, rl, time-attack) girano in BACKGROUND: lo script salva PID e
+#  I task lunghi (bc, td3, time-attack) girano in BACKGROUND: lo script salva PID e
 #  log in train_set/.run/ e in train_set/session_logs/, così "status" e "stop"
 #  funzionano anche tra invocazioni diverse del terminale. I task interattivi o brevi
 #  (collect, test) girano in FOREGROUND, così vedi l'output dal vivo.
@@ -22,7 +20,7 @@
 #    collect [args...]        Raccolta giri umani in TORCS (foreground, controller/tastiera)
 #    bc [args...]             Addestra la BC sui giri umani (background)
 #    bc-enriched [args...]    Addestra la BC su giri umani + auto-raccolti (background)
-#    rl [args...]             Fine-tuning TD3+BC con harvest dei giri (background)
+#    td3 [args...]            Fine-tuning TD3+BC con harvest dei giri (background)
 #    time-attack [args...]    Fase time-attack: l'agente batte i propri tempi (background)
 #    test [args...]           Valutazione deterministica dell'agente (foreground)
 #    status                   Cruscotto: processi attivi, dataset, checkpoint, ultimi log
@@ -34,11 +32,11 @@
 #    ./run.sh                  apre il menu interattivo
 #    ./run.sh bc
 #    ./run.sh bc-enriched --output train_set/checkpoints/enriched/bc_policy.pth
-#    ./run.sh rl --episodes 2500
+#    ./run.sh td3 --episodes 2500
 #    ./run.sh time-attack --episodes 4000
 #    ./run.sh test --laps 3
 #    ./run.sh status
-#    ./run.sh stop rl
+#    ./run.sh stop td3
 # =============================================================================
 
 set -u
@@ -70,8 +68,24 @@ MENU_ARGS=()
 
 # --- gestione task in background -------------------------------------------
 # pid_file <task> -> percorso del pidfile; log_file <task> -> percorso del log
-pid_file() { echo "$RUN_DIR/$1.pid"; }
-log_file() { echo "$LOG_DIR/$1.log"; }
+canonical_task() {
+    case "$1" in
+        rl) echo "td3" ;;
+        *)  echo "$1" ;;
+    esac
+}
+
+pid_file() {
+    local task; task="$(canonical_task "$1")"
+    echo "$RUN_DIR/$task.pid"
+}
+log_file() {
+    case "$1" in
+        bc|bc-enriched) echo "$LOG_DIR/bc.log" ;;
+        rl|td3)         echo "$LOG_DIR/td3_training.log" ;;
+        *)              echo "$LOG_DIR/$1.log" ;;
+    esac
+}
 
 is_running() {  # is_running <task> -> 0 se vivo
     local pf; pf="$(pid_file "$1")"
@@ -81,7 +95,7 @@ is_running() {  # is_running <task> -> 0 se vivo
 }
 
 start_bg() {  # start_bg <task> <comando...>
-    local task="$1"; shift
+    local task; task="$(canonical_task "$1")"; shift
     if is_running "$task"; then
         err "Il task '${task}' è già in esecuzione (PID $(cat "$(pid_file "$task")")). Usa './run.sh stop ${task}' prima."
         return 1
@@ -89,7 +103,7 @@ start_bg() {  # start_bg <task> <comando...>
     local lf; lf="$(log_file "$task")"
     log "Avvio '${task}' in background → log: ${lf}"
     # setsid stacca il processo dal terminale: chiudere la shell non lo uccide.
-    setsid bash -c "exec $* >'$lf' 2>&1" &
+    setsid bash -c "exec $* >>'$lf' 2>&1" &
     local pid=$!
     echo "$pid" > "$(pid_file "$task")"
     sleep 1
@@ -103,8 +117,9 @@ start_bg() {  # start_bg <task> <comando...>
 
 cmd_stop() {  # stop pulito (SIGINT) di un task o di tutti
     local targets
-    if [ $# -ge 1 ]; then targets="$1"; else targets="rl time-attack bc bc-enriched"; fi
+    if [ $# -ge 1 ]; then targets="$1"; else targets="td3 time-attack bc bc-enriched"; fi
     for task in $targets; do
+        task="$(canonical_task "$task")"
         if is_running "$task"; then
             local pid; pid="$(cat "$(pid_file "$task")")"
             log "SIGINT a '${task}' (PID ${pid}) — uscita pulita con salvataggio del checkpoint..."
@@ -115,12 +130,25 @@ cmd_stop() {  # stop pulito (SIGINT) di un task o di tutti
     done
 }
 
+clean_task_log() {
+    sed -E \
+        -e '/Gym has been|Please upgrade|Users of this|migration guide|Waiting for server|Client connected/d' \
+        -e '/^[.][[:space:]]*$/d' \
+        -e '/^### TORCS is RELAUNCHED ###$/d' \
+        -e 's/^[.][[:space:]]+//'
+}
+
+log_status_line() {
+    local lf="$1"
+    clean_task_log < "$lf" | grep -E 'Epoch [0-9]+/[0-9]+|Training completato|Addestramento|Pesi salvati|Ep [0-9]+|\[EVAL\]|SUCCESS|CRASH|STOP|NUOVO|Record|Checkpoint|Traceback|Errore|ERROR|Exception' | tail -n 1
+}
+
 # --- cruscotto di stato ----------------------------------------------------
 cmd_status() {
     echo -e "${B}== Iterative Motors — stato pipeline ==${N}"
     echo -e "${B}Processi:${N}"
     local any=0
-    for task in collect bc bc-enriched rl time-attack test; do
+    for task in collect bc bc-enriched td3 time-attack test; do
         if is_running "$task"; then
             local pid; pid="$(cat "$(pid_file "$task")")"
             echo -e "  ${G}● ${task}${N}  PID ${pid}  $(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ' | sed 's/^/uptime /')"
@@ -144,10 +172,10 @@ PY
     fi
 
     echo -e "${B}Ultima riga di log dei task:${N}"
-    for task in bc bc-enriched rl time-attack; do
+    for task in bc td3 time-attack; do
         local lf; lf="$(log_file "$task")"
         if [ -f "$lf" ]; then
-            local line; line="$(grep -v 'Gym has been\|Please upgrade\|Users of this\|migration guide\|Waiting for server\|Client connected' "$lf" 2>/dev/null | tail -n 1)"
+            local line; line="$(log_status_line "$lf")"
             [ -n "$line" ] && echo "  [${task}] ${line}"
         fi
     done
@@ -158,7 +186,7 @@ cmd_logs() {
     [ -z "$task" ] && { err "Uso: ./run.sh logs <task> [n_righe]"; return 1; }
     local lf; lf="$(log_file "$task")"
     [ -f "$lf" ] || { err "Nessun log per '${task}' ($lf)"; return 1; }
-    grep -v 'Gym has been\|Please upgrade\|Users of this\|migration guide' "$lf" | tail -n "$n"
+    clean_task_log < "$lf" | tail -n "$n"
 }
 
 # --- comandi della pipeline ------------------------------------------------
@@ -166,8 +194,9 @@ cmd_collect()     { log "Raccolta giri umani (foreground)…"; exec "$PYTHON" -m
 cmd_test()        { log "Valutazione deterministica (foreground)…"; exec "$PYTHON" -m iterative_motors.eval.test_agent "$@"; }
 cmd_bc()          { start_bg bc          "$PYTHON" -u -m iterative_motors.bc.train_bc "$@"; }
 cmd_bc_enriched() { start_bg bc-enriched "$PYTHON" -u -m iterative_motors.bc.train_bc --auto_laps "$LAPS_AUTO_DIR" "$@"; }
-cmd_rl()          { start_bg rl          env IM_RECORD_LAPS=1 "$PYTHON" -u -m iterative_motors.rl.train_rl "$@"; }
-cmd_time_attack() { start_bg time-attack env IM_TIME_ATTACK=1 IM_RECORD_LAPS=1 "$PYTHON" -u -m iterative_motors.rl.train_rl "$@"; }
+cmd_td3()         { start_bg td3         env IM_WRAPPER_LOG_ONLY=1 IM_RECORD_LAPS=1 "$PYTHON" -u -m iterative_motors.rl.train_rl "$@"; }
+cmd_rl()          { cmd_td3 "$@"; }
+cmd_time_attack() { start_bg time-attack env IM_WRAPPER_LOG_ONLY=1 IM_TIME_ATTACK=1 IM_RECORD_LAPS=1 "$PYTHON" -u -m iterative_motors.rl.train_rl "$@"; }
 
 usage() {
     awk '
@@ -200,7 +229,7 @@ menu_count_glob() {
 
 menu_running_tasks() {
     local out="" task
-    for task in bc bc-enriched rl time-attack; do
+    for task in bc bc-enriched td3 time-attack; do
         if is_running "$task"; then
             out="${out}${out:+ }${task}"
         fi
@@ -340,12 +369,8 @@ menu_run_action() {
             cmd_logs bc 80
             menu_pause
             ;;
-        logs-bc-enriched)
-            cmd_logs bc-enriched 80
-            menu_pause
-            ;;
-        logs-rl)
-            cmd_logs rl 80
+        logs-td3)
+            cmd_logs td3 80
             menu_pause
             ;;
         logs-time-attack)
@@ -368,9 +393,9 @@ menu_run_action() {
             cmd_bc_enriched "${MENU_ARGS[@]}"
             menu_pause
             ;;
-        rl)
-            menu_prompt_args "rl"
-            cmd_rl "${MENU_ARGS[@]}"
+        td3)
+            menu_prompt_args "td3"
+            cmd_td3 "${MENU_ARGS[@]}"
             menu_pause
             ;;
         time-attack)
@@ -394,8 +419,8 @@ menu_run_action() {
             cmd_stop bc-enriched
             menu_pause
             ;;
-        stop-rl)
-            cmd_stop rl
+        stop-td3)
+            cmd_stop td3
             menu_pause
             ;;
         stop-time-attack)
@@ -421,8 +446,7 @@ cmd_menu() {
     MENU_LABELS=(
         "[Dashboard] Stato pipeline"
         "[Log] Time attack"
-        "[Log] BC arricchita"
-        "[Log] RL"
+        "[Log] TD3"
         "[Log] BC"
         "[Dati] Raccolta con controller"
         "[Dati] Raccolta con tastiera"
@@ -434,7 +458,7 @@ cmd_menu() {
         "[Stop] Tutti i task"
         "[Stop] BC"
         "[Stop] BC arricchita"
-        "[Stop] RL"
+        "[Stop] TD3"
         "[Stop] Time attack"
         "[Info] Help"
         "[Exit] Esci"
@@ -442,20 +466,19 @@ cmd_menu() {
     MENU_ACTIONS=(
         "status"
         "logs-time-attack"
-        "logs-bc-enriched"
-        "logs-rl"
+        "logs-td3"
         "logs-bc"
         "collect-controller"
         "collect-keyboard"
         "bc"
         "bc-enriched"
-        "rl"
+        "td3"
         "time-attack"
         "test"
         "stop-all"
         "stop-bc"
         "stop-bc-enriched"
-        "stop-rl"
+        "stop-td3"
         "stop-time-attack"
         "help"
         "exit"
@@ -463,7 +486,6 @@ cmd_menu() {
     MENU_DESCRIPTIONS=(
         "Mostra processi, dataset, checkpoint e ultime righe dei log."
         "Apre le ultime 80 righe del log time-attack."
-        "Apre le ultime 80 righe del training BC su umano + auto-laps."
         "Apre le ultime 80 righe del training TD3+BC."
         "Apre le ultime 80 righe del training BC base."
         "Avvia la raccolta dati in foreground usando il controller."
@@ -545,6 +567,7 @@ case "$cmd" in
     collect)      cmd_collect "$@" ;;
     bc)           cmd_bc "$@" ;;
     bc-enriched)  cmd_bc_enriched "$@" ;;
+    td3)          cmd_td3 "$@" ;;
     rl)           cmd_rl "$@" ;;
     time-attack)  cmd_time_attack "$@" ;;
     test)         cmd_test "$@" ;;

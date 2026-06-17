@@ -90,11 +90,11 @@ Produce `train_set/checkpoints/bc_policy.pth` e `state_norm.npz` (background; se
 ### 3. Fine-tuning TD3+BC + raccolta giri (harvest)
 
 ```bash
-./run.sh rl --episodes 2500
+./run.sh td3 --episodes 2500
 ```
 
 Durante il training l'agente registra automaticamente i propri giri completi e puliti in
-`train_set/laps_auto/` (disattivabile con `IM_RECORD_LAPS=0`). Stop pulito: `./run.sh stop rl`
+`train_set/laps_auto/` (disattivabile con `IM_RECORD_LAPS=0`). Stop pulito: `./run.sh stop td3`
 (salva il checkpoint prima di uscire).
 
 ### 4. Arricchire la BC (flywheel) e time-attack
@@ -107,9 +107,9 @@ Durante il training l'agente registra automaticamente i propri giri completi e p
 ./run.sh time-attack --episodes 4000
 ```
 
-Per adottare la BC arricchita in una nuova lineage RL: copia i nuovi `bc_policy.pth` +
+Per adottare la BC arricchita in una nuova lineage TD3: copia i nuovi `bc_policy.pth` +
 `state_norm.npz` da `enriched/` in `train_set/checkpoints/`, azzera i checkpoint TD3 (i record
-deterministici restano protetti) e rilancia `./run.sh rl`.
+deterministici restano protetti) e rilancia `./run.sh td3`.
 
 ### 5. Testare l'agente
 

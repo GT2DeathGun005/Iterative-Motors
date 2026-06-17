@@ -98,7 +98,7 @@ if _SRC_DIR not in sys.path:
 from iterative_motors.env.gym_torcs import TorcsEnv
 from iterative_motors.env import snakeoil3_gym as snakeoil3
 from iterative_motors.env.gearing import compute_gear  # cambio marcia algoritmico
-from iterative_motors.common.constants import TRACK_LENGTH_M, LAPS_AUTO_DIR
+from iterative_motors.common.constants import TRACK_LENGTH_M, LAPS_AUTO_DIR, SESSION_LOGS_DIR
 from iterative_motors.common.checkpoint import (
     safe_save, safe_write_text, safe_read_float, safe_save_npz,
     _fsync_file, _fsync_dir, _backup_paths, _rotate_backup, _checkpoint_candidates,
@@ -314,9 +314,14 @@ def train():
     agent.refine_mode = False
     agent.refine_bc_weight = 1.0
     recent_eval_window = deque(maxlen=REFINE_WINDOW)  # Coda mobile per le ultime valutazioni.
+    time_attack = (os.environ.get('IM_TIME_ATTACK', '0') == '1')
+    phase_log_file = os.path.join(
+        SESSION_LOGS_DIR,
+        'time-attack.log' if time_attack else 'td3_training.log',
+    )
 
     # Popoliamo la finestra leggendo i dati recenti direttamente dal log
-    initial_evals = load_recent_evals_from_log('train_set/session_logs/td3_training.log', REFINE_WINDOW)
+    initial_evals = load_recent_evals_from_log(phase_log_file, REFINE_WINDOW)
     for ev in initial_evals:
         recent_eval_window.append(ev)
     if len(recent_eval_window) > 0:
@@ -415,8 +420,8 @@ def train():
             print("Ripresa regolare dal checkpoint (nessun rollback o congelamento Actor).")
 
     os.makedirs('train_set/checkpoints', exist_ok=True)
-    os.makedirs('train_set/session_logs', exist_ok=True)
-    log_file = 'train_set/session_logs/td3_training.log'
+    os.makedirs(SESSION_LOGS_DIR, exist_ok=True)
+    log_file = os.devnull if os.environ.get('IM_WRAPPER_LOG_ONLY', '0') == '1' else phase_log_file
 
     def _control_log(message):
         """
@@ -456,21 +461,18 @@ def train():
 
     # Registrazione sul file di log dei parametri di avvio selezionati per tracciare la sessione.
     if getattr(args, 'refine', False):
-        with open(log_file, 'a', encoding='utf-8') as f:
-            initial_ref = f"{refine_plateau_level:.0f}m" if refine_plateau_level > 0.0 else "da impostare"
-            f.write(f"AVVIO con --refine: REFINEMENT armata da subito "
-                    f"(aggiornamento Critic disattivato, loss Critic solo diagnostica, "
-                    f"peso Behavioral Cloning={REFINE_BC_WEIGHT}, riferimento plateau={initial_ref}, "
-                    f"episodio iniziale {start_episode})\n")
+        initial_ref = f"{refine_plateau_level:.0f}m" if refine_plateau_level > 0.0 else "da impostare"
+        _control_log(f"AVVIO con --refine: REFINEMENT armata da subito "
+                     f"(aggiornamento Critic disattivato, loss Critic solo diagnostica, "
+                     f"peso Behavioral Cloning={REFINE_BC_WEIGHT}, riferimento plateau={initial_ref}, "
+                     f"episodio iniziale {start_episode})")
     if getattr(args, 'rollback', False):
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"AVVIO con --rollback: Actor congelato per {actor_freeze_episodes} episodi "
-                    f"(0 = nessun congelamento), auto-refinement automatica="
-                    f"{'attiva' if auto_refine_enabled else 'disattivata'}.\n")
+        _control_log(f"AVVIO con --rollback: Actor congelato per {actor_freeze_episodes} episodi "
+                     f"(0 = nessun congelamento), auto-refinement automatica="
+                     f"{'attiva' if auto_refine_enabled else 'disattivata'}.")
     elif not auto_refine_enabled:
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write("AVVIO con --no-auto-refine: refinement automatica disattivata; "
-                    "--refine manuale resta disponibile.\n")
+        _control_log("AVVIO con --no-auto-refine: refinement automatica disattivata; "
+                     "--refine manuale resta disponibile.")
 
     elite_threshold = 500.0
 
@@ -478,7 +480,6 @@ def train():
     # Da attivare DOPO aver raccolto abbastanza giri completi e riaddestrato la BC: riduce
     # l'ancoraggio alla BC (alpha più alto) e abbassa il floor del rumore esplorativo per
     # limare i tempi. Il bonus di record personale è invece sempre attivo (vedi blocco SUCCESS).
-    time_attack = (os.environ.get('IM_TIME_ATTACK', '0') == '1')
     noise_floor = TIME_ATTACK_NOISE_FLOOR if time_attack else EXPL_NOISE_END
     if time_attack:
         agent.bc_alpha = TIME_ATTACK_BC_ALPHA
