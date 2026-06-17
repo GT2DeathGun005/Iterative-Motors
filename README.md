@@ -60,9 +60,14 @@ pip install numpy torch h5py pygame gym   # per CUDA usare il comando ufficiale 
 ## Uso rapido (via orchestratore)
 
 ```bash
-./run.sh help        # elenco completo dei comandi
+./run.sh             # menu interattivo con frecce + Enter
+./run.sh help        # elenco completo dei comandi diretti
 ./run.sh status      # cruscotto: processi attivi, dataset, record, ultimi log
 ```
+
+Il menu di `run.sh` funziona come un piccolo pit wall: mostra una Formula 1 in ASCII, riepilogo
+di processi/dataset/record e opzioni selezionabili con le frecce. I comandi diretti restano
+disponibili per automazione e script.
 
 ### 1. Raccogliere dimostrazioni umane
 

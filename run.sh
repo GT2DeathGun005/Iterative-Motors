@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Iterative Motors — orchestratore unico della pipeline (CLI controller)
+#  Iterative Motors — orchestratore unico della pipeline (menu + CLI)
 # =============================================================================
 #
 #  Punto di ingresso unico per TUTTA la pipeline del progetto: raccolta dati,
@@ -15,6 +15,7 @@
 #  (collect, test) girano in FOREGROUND, così vedi l'output dal vivo.
 #
 #  USO:
+#    ./run.sh                  Menu interattivo con frecce + Enter
 #    ./run.sh <comando> [opzioni]
 #
 #  COMANDI:
@@ -30,6 +31,7 @@
 #    help                     Questo messaggio
 #
 #  ESEMPI:
+#    ./run.sh                  apre il menu interattivo
 #    ./run.sh bc
 #    ./run.sh bc-enriched --output train_set/checkpoints/enriched/bc_policy.pth
 #    ./run.sh rl --episodes 2500
@@ -54,11 +56,17 @@ CKPT_DIR="$ROOT/train_set/checkpoints"
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 
 # Colori (disattivati se non TTY)
-if [ -t 1 ]; then B="\033[1m"; G="\033[32m"; Y="\033[33m"; R="\033[31m"; C="\033[36m"; N="\033[0m"; else B=""; G=""; Y=""; R=""; C=""; N=""; fi
+if [ -t 1 ]; then
+    B="\033[1m"; D="\033[2m"; U="\033[4m"; INV="\033[7m"
+    G="\033[32m"; Y="\033[33m"; R="\033[31m"; C="\033[36m"; M="\033[35m"; W="\033[37m"; K="\033[90m"; N="\033[0m"
+else
+    B=""; D=""; U=""; INV=""; G=""; Y=""; R=""; C=""; M=""; W=""; K=""; N=""
+fi
 log()  { echo -e "${C}[run]${N} $*"; }
 err()  { echo -e "${R}[run]${N} $*" >&2; }
 
 PYTHON="${PYTHON:-python}"
+MENU_ARGS=()
 
 # --- gestione task in background -------------------------------------------
 # pid_file <task> -> percorso del pidfile; log_file <task> -> percorso del log
@@ -161,11 +169,379 @@ cmd_bc_enriched() { start_bg bc-enriched "$PYTHON" -u -m iterative_motors.bc.tra
 cmd_rl()          { start_bg rl          env IM_RECORD_LAPS=1 "$PYTHON" -u -m iterative_motors.rl.train_rl "$@"; }
 cmd_time_attack() { start_bg time-attack env IM_TIME_ATTACK=1 IM_RECORD_LAPS=1 "$PYTHON" -u -m iterative_motors.rl.train_rl "$@"; }
 
-usage() { sed -n '2,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() {
+    awk '
+        NR == 1 { next }
+        /^#/ { sub(/^# ?/, ""); print; next }
+        { exit }
+    ' "${BASH_SOURCE[0]}"
+}
+
+# --- menu interattivo ------------------------------------------------------
+menu_pause() {
+    echo
+    read -r -p "Premi Enter per tornare al menu..." _
+}
+
+menu_prompt_args() {
+    local label="$1"
+    echo
+    echo -e "${B}${C}${label}${N}"
+    echo "Puoi aggiungere opzioni come faresti da CLI."
+    echo -e "${K}Esempio: --episodes 4000${N}"
+    MENU_ARGS=()
+    read -r -p "Argomenti extra per ${label} (Enter = default): " -a MENU_ARGS
+}
+
+menu_count_glob() {
+    local pattern="$1"
+    compgen -G "$pattern" | wc -l
+}
+
+menu_running_tasks() {
+    local out="" task
+    for task in bc bc-enriched rl time-attack; do
+        if is_running "$task"; then
+            out="${out}${out:+ }${task}"
+        fi
+    done
+    [ -n "$out" ] && echo "$out" || echo "nessuno"
+}
+
+menu_f1_art() {
+    printf "%b" "${G}"
+    cat <<'EOF'
+                         __
+                   _.--""  |
+    .----.     _.-'   |/\| |.--.
+    | IBM|__.-'   _________|  |_)  _______________
+    |  .-""-.""""" ___,    `----'"))   __   .-""-.""""--._
+    '-' ,--. `    |   |   .---.       |:.| ' ,--. `      _`.
+     ( (    ) ) __|   |__ \\|// _..--  \/ ( (    ) )--._".-.
+      . `--' ;\__________________..--------. `--' ;--------'
+       `-..-'                               `-..-'
+EOF
+    printf "%b" "${N}"
+}
+
+menu_header() {
+    local human_laps auto_laps running best_lap
+    human_laps="$(menu_count_glob "$LAPS_DIR/lap_[0-9]*.h5")"
+    auto_laps="$(menu_count_glob "$LAPS_AUTO_DIR/*.h5")"
+    running="$(menu_running_tasks)"
+    best_lap="n/d"
+    [ -f "$CKPT_DIR/td3_det_best_lap.txt" ] && best_lap="$(cat "$CKPT_DIR/td3_det_best_lap.txt" 2>/dev/null)s"
+
+    menu_f1_art
+    echo
+    echo -e "${B}${W}ITERATIVE MOTORS PIT WALL${N}  ${K}TORCS | BC -> TD3+BC -> TIME ATTACK${N}"
+    echo -e "${K}────────────────────────────────────────────────────────────────────────${N}"
+    echo -e "${C}Processi:${N} ${running}   ${C}Giri umani:${N} ${human_laps}   ${C}Giri auto:${N} ${auto_laps}   ${C}Best lap:${N} ${best_lap}"
+    echo -e "${K}────────────────────────────────────────────────────────────────────────${N}"
+}
+
+menu_easter_egg() {
+    clear 2>/dev/null || true
+    printf "%b" "${G}"
+    cat <<'EOF'
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠀⠀⠐⣆⢠⡈⠂⠀⢻⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃⠀⠀⠀⢹⡈⢿⡄⠀⠘⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠂⠀⠀⠀⠈⣧⠘⢧⠀⠀⢻⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄⠀⠀⠀⠀⠈⠀⠀⠀⠀⢸⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠃⠠⠀⠀⠀⠀⠀⠂⠙⠀⢰⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⡿⠿⠟⠁⠀⡇⡀⠀⠀⠀⣶⣰⠀⠀⢸⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⡟⠀⠀⢀⡄⠀⠃⠿⠀⠀⠀⠘⡿⠀⠀⣾⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⡿⢠⠀⣠⡿⠁⠀⢃⠀⣸⡇⠀⠀⠀⠀⠀⢹⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⢁⡿⠀⣿⠷⠀⠀⠸⠄⢻⣿⣄⠀⠀⠀⠀⣾⣿⣿⣿
+⣿⣿⣿⣿⣿⡇⢸⣇⠀⣿⣷⠀⠀⠀⠀⢸⣿⣿⣷⣶⣆⢠⣿⣿⣿⣿
+⣿⡿⠟⠻⣿⡇⢸⣿⠀⣿⣷⡂⠀⠀⠀⢸⡿⣿⡿⢿⡟⢸⣿⣿⣿⣿
+⠛⠁⠀⢀⣀⠁⠸⠟⠀⣿⣿⡇⠀⢀⠀⢸⣾⣿⡇⠺⠇⣸⣿⣿⣿⣿
+⣷⡀⢀⣿⠏⠀⣦⣤⣼⣿⣿⡇⠀⣸⠀⠸⣿⠟⠓⠀⠀⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣴⣶⣿⣿⣿⣿⡟⠀⠀⠹⠄⠀⢻⣄⡐⠀⢠⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠁⣰⡄⠀⠀⠀⠀⣿⠉⠓⢸⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⡟⠀⣇⠸⠀⠀⠀⠀⠻⠟⠀⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⠇⠀⢿⣶⣤⠆⠀⠀⠐⠛⠀⠻⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⠏⡀⠀⠈⡿⠛⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⠟⠀⢀⣾⡄⠃⢀⠀⠀⠀⠀⠀⠀⢠⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⡟⣰⢀⣾⡿⢹⡀⠻⠀⠀⠂⠀⠀⠀⣾⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⡟⢴⣣⢾⣾⠇⢸⣷⡀⠀⠀⠀⠰⠀⣦⡹⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⡟⠀⠐⠘⠇⠋⢠⢿⣿⣷⠀⠀⠀⠀⠑⢸⡇⠙⣿⣿⣿⣿
+⣿⣿⣿⡿⠀⡄⠲⠄⠀⠀⣾⠘⣿⣿⡆⠀⠀⡀⠀⠀⡇⠀⠘⣿⣿⣿
+⣿⣿⣿⡇⠘⣇⡀⠈⡇⠀⠀⠀⣿⢿⣿⠀⠀⢻⣷⡀⢸⠀⠀⢻⣿⣿
+⣿⣿⣿⠀⡈⢛⣩⡆⢸⣦⠀⠀⠈⣸⣿⡇⢹⠘⣿⣵⠘⣇⠀⢸⣿⣿
+⣿⣿⣿⠀⢁⣼⠟⠡⣆⢻⣧⠀⢰⣸⠟⣷⠘⡇⣿⣿⡆⢿⡄⠀⣿⣿
+⣿⣿⣟⠀⢀⣤⠠⣦⣿⠀⠈⠄⠈⠁⠈⣻⡀⣧⢸⣿⣧⢸⠀⠀⢹⣿
+⣿⣿⡯⠀⡄⡅⢧⣿⣿⡆⡇⠀⠀⡸⢰⣿⡇⢹⡀⣿⣿⡘⡇⠀⢸⣿
+⣿⣿⡇⠀⢣⠡⠘⢃⣿⣣⠙⠀⠀⢁⠀⣤⣤⠘⠇⠙⣿⣧⠙⠀⠀⣿
+⣿⣿⡇⠀⠈⠁⠡⠈⢿⠸⠀⠀⠀⠜⠁⣿⣿⡀⢰⡷⢸⣿⠀⠀⠀⣿
+⣿⣿⠃⠀⠘⠂⠀⣾⣜⠃⢰⠀⠀⠘⡇⣿⡿⠃⠘⡇⢸⣿⡄⠈⠀⢸
+⣿⣿⠀⠀⣴⣖⡲⣿⣿⣿⠀⠀⠁⢀⡇⠆⠀⠀⡆⠀⣿⣿⡇⠰⡀⣴
+⣿⣿⠀⠀⡏⣹⣿⣄⠘⢿⡇⠀⠀⢸⡇⢀⠀⠰⠗⠀⣈⢻⣿⠀⠀⢻
+⣿⣿⠀⠀⠀⣿⣿⡍⢷⠘⡇⠀⠀⠘⠇⢸⠄⠠⣄⠀⣿⡌⣿⡇⠀⣼
+⣿⣿⠀⠀⠀⢀⣀⡀⠀⠃⠁⠀⠀⠀⠀⠸⠀⡆⠉⠀⠈⢃⢛⣧⡄⢹
+⣿⣿⠀⠐⣫⣿⣿⣻⣦⡀⠀⠀⠀⢠⠀⠀⠀⠁⠀⠀⢠⣈⣸⣿⣧⠸
+⣿⣿⠀⣼⣿⣿⣿⣿⣿⣹⡆⠀⠀⠘⠗⠀⠈⠀⠀⠀⢸⣿⣿⣿⣿⢀
+⣿⣿⠃⣛⠛⠛⢿⣉⠙⢿⡏⠀⠀⠀⠀⠀⠀⠀⠐⠒⠚⣹⣿⣿⡟⠈
+⣿⡏⠀⢻⣷⣦⡠⠈⠀⠈⠳⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⣿⣿⠋⠁⢰
+EOF
+    printf "%b" "${N}"
+    echo
+    read -r -p "Premi Enter per tornare al pit wall..." _
+}
+
+konami_feed() {
+    local token="$1"
+    local expected="${KONAMI_CODE[$KONAMI_POS]}"
+
+    if [ "$token" = "$expected" ]; then
+        KONAMI_POS=$((KONAMI_POS + 1))
+        if [ "$KONAMI_POS" -eq "${#KONAMI_CODE[@]}" ]; then
+            KONAMI_POS=0
+            menu_easter_egg
+        fi
+    elif [ "$token" = "${KONAMI_CODE[0]}" ]; then
+        KONAMI_POS=1
+    else
+        KONAMI_POS=0
+    fi
+}
+
+menu_draw() {
+    local selected="$1"
+    clear 2>/dev/null || true
+    menu_header
+    echo -e "${D}Freccia su/giu per muoverti, Enter per selezionare, q o Esc per uscire.${N}"
+    echo
+
+    local i
+    for i in "${!MENU_LABELS[@]}"; do
+        if [ "$i" -eq "$selected" ]; then
+            echo -e " ${INV}${B}  ${MENU_LABELS[$i]}  ${N}"
+        else
+            echo -e "   ${MENU_LABELS[$i]}"
+        fi
+    done
+
+    echo
+    echo -e "${K}────────────────────────────────────────────────────────────────────────${N}"
+    echo -e "${Y}Scelta:${N} ${MENU_DESCRIPTIONS[$selected]}"
+}
+
+menu_run_action() {
+    local action="$1"
+    clear 2>/dev/null || true
+    case "$action" in
+        status)
+            cmd_status
+            menu_pause
+            ;;
+        logs-bc)
+            cmd_logs bc 80
+            menu_pause
+            ;;
+        logs-bc-enriched)
+            cmd_logs bc-enriched 80
+            menu_pause
+            ;;
+        logs-rl)
+            cmd_logs rl 80
+            menu_pause
+            ;;
+        logs-time-attack)
+            cmd_logs time-attack 80
+            menu_pause
+            ;;
+        collect-controller)
+            cmd_collect --device controller
+            ;;
+        collect-keyboard)
+            cmd_collect --device keyboard
+            ;;
+        bc)
+            menu_prompt_args "bc"
+            cmd_bc "${MENU_ARGS[@]}"
+            menu_pause
+            ;;
+        bc-enriched)
+            menu_prompt_args "bc-enriched"
+            cmd_bc_enriched "${MENU_ARGS[@]}"
+            menu_pause
+            ;;
+        rl)
+            menu_prompt_args "rl"
+            cmd_rl "${MENU_ARGS[@]}"
+            menu_pause
+            ;;
+        time-attack)
+            menu_prompt_args "time-attack"
+            cmd_time_attack "${MENU_ARGS[@]}"
+            menu_pause
+            ;;
+        test)
+            menu_prompt_args "test"
+            cmd_test "${MENU_ARGS[@]}"
+            ;;
+        stop-all)
+            cmd_stop
+            menu_pause
+            ;;
+        stop-bc)
+            cmd_stop bc
+            menu_pause
+            ;;
+        stop-bc-enriched)
+            cmd_stop bc-enriched
+            menu_pause
+            ;;
+        stop-rl)
+            cmd_stop rl
+            menu_pause
+            ;;
+        stop-time-attack)
+            cmd_stop time-attack
+            menu_pause
+            ;;
+        help)
+            usage
+            menu_pause
+            ;;
+        exit)
+            return 1
+            ;;
+    esac
+}
+
+cmd_menu() {
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        usage
+        return 0
+    fi
+
+    MENU_LABELS=(
+        "[Dashboard] Stato pipeline"
+        "[Log] Time attack"
+        "[Log] BC arricchita"
+        "[Log] RL"
+        "[Log] BC"
+        "[Dati] Raccolta con controller"
+        "[Dati] Raccolta con tastiera"
+        "[Train] Behavioral Cloning"
+        "[Train] BC arricchita"
+        "[Train] TD3+BC"
+        "[Race] Time attack"
+        "[Eval] Test deterministico"
+        "[Stop] Tutti i task"
+        "[Stop] BC"
+        "[Stop] BC arricchita"
+        "[Stop] RL"
+        "[Stop] Time attack"
+        "[Info] Help"
+        "[Exit] Esci"
+    )
+    MENU_ACTIONS=(
+        "status"
+        "logs-time-attack"
+        "logs-bc-enriched"
+        "logs-rl"
+        "logs-bc"
+        "collect-controller"
+        "collect-keyboard"
+        "bc"
+        "bc-enriched"
+        "rl"
+        "time-attack"
+        "test"
+        "stop-all"
+        "stop-bc"
+        "stop-bc-enriched"
+        "stop-rl"
+        "stop-time-attack"
+        "help"
+        "exit"
+    )
+    MENU_DESCRIPTIONS=(
+        "Mostra processi, dataset, checkpoint e ultime righe dei log."
+        "Apre le ultime 80 righe del log time-attack."
+        "Apre le ultime 80 righe del training BC su umano + auto-laps."
+        "Apre le ultime 80 righe del training TD3+BC."
+        "Apre le ultime 80 righe del training BC base."
+        "Avvia la raccolta dati in foreground usando il controller."
+        "Avvia la raccolta dati in foreground usando la tastiera."
+        "Avvia il training BC in background."
+        "Avvia il training BC arricchita in background."
+        "Avvia TD3+BC con harvest dei giri in background."
+        "Avvia la fase time-attack in background."
+        "Avvia il test deterministico in foreground."
+        "Invia SIGINT pulito a tutti i task gestiti."
+        "Ferma solo il training BC."
+        "Ferma solo il training BC arricchita."
+        "Ferma solo il training TD3+BC."
+        "Ferma solo il time-attack."
+        "Mostra la guida testuale dei comandi."
+        "Chiude il menu."
+    )
+
+    KONAMI_CODE=(UP UP DOWN DOWN LEFT RIGHT LEFT RIGHT B A)
+    KONAMI_POS=0
+
+    local selected=0
+    local key=""
+    while true; do
+        menu_draw "$selected"
+        IFS= read -rsn1 key || break
+        case "$key" in
+            q|Q)
+                break
+                ;;
+            "")
+                konami_feed OTHER
+                menu_run_action "${MENU_ACTIONS[$selected]}" || break
+                ;;
+            $'\x1b')
+                IFS= read -rsn2 -t 0.1 key || break
+                case "$key" in
+                    "[A")
+                        konami_feed UP
+                        if [ "$selected" -le 0 ]; then
+                            selected=$((${#MENU_LABELS[@]} - 1))
+                        else
+                            selected=$((selected - 1))
+                        fi
+                        ;;
+                    "[B")
+                        konami_feed DOWN
+                        selected=$(((selected + 1) % ${#MENU_LABELS[@]}))
+                        ;;
+                    "[D")
+                        konami_feed LEFT
+                        ;;
+                    "[C")
+                        konami_feed RIGHT
+                        ;;
+                    *)
+                        konami_feed OTHER
+                        ;;
+                esac
+                ;;
+            b|B)
+                konami_feed B
+                ;;
+            a|A)
+                konami_feed A
+                ;;
+            *)
+                konami_feed OTHER
+                ;;
+        esac
+    done
+    clear 2>/dev/null || true
+}
 
 # --- dispatch --------------------------------------------------------------
-cmd="${1:-help}"; shift || true
+cmd="${1:-menu}"; shift || true
 case "$cmd" in
+    menu)         cmd_menu ;;
     collect)      cmd_collect "$@" ;;
     bc)           cmd_bc "$@" ;;
     bc-enriched)  cmd_bc_enriched "$@" ;;
