@@ -769,6 +769,11 @@ def train():
                 # Cronometraggio del miglior giro VALIDO completato in questa valutazione deterministica.
                 eval_prev_last_lap = float(np.array(eval_ob.get('lastLapTime', 0.0)).flat[0])
                 eval_start_dist = float(np.array(eval_ob.get('distFromStart', 0.0)).flat[0])
+                # Stato per lo stop GEOMETRICO di fine giro: posizione sul tracciato e cronometro del giro
+                # allo step precedente, per rilevare il riattraversamento del traguardo a prescindere dal
+                # sensore lastLapTime (che lagga ~1 tick).
+                eval_prev_track_pos_m = eval_start_dist
+                eval_prev_cur_lap = float(np.array(eval_ob.get('curLapTime', 0.0)).flat[0])
 
                 agent.actor.eval()
                 while eval_step < args.max_steps:
@@ -794,6 +799,26 @@ def train():
                     current_eval_track_pos_m = float(np.array(eval_ob.get('distFromStart', 0.0)).flat[0])
                     current_eval_dist = _track_progress_from_start(eval_start_dist, current_eval_track_pos_m)
                     eval_dist = max(eval_dist, current_eval_dist)
+                    eval_cur_lap = float(np.array(eval_ob.get('curLapTime', 0.0)).flat[0])
+
+                    # Stop GEOMETRICO di fine giro: indipendente dal sensore lastLapTime (che si aggiorna con
+                    # ~1 tick di ritardo, e il clamp della distanza maschererebbe uno sforamento nel 2° giro).
+                    # Se l'auto ha coperto >=90% del tracciato e poi il distFromStart "salta indietro" oltre
+                    # mezza pista (riattraversamento del traguardo), il giro è completo: ci si ferma SUBITO,
+                    # niente 2° giro. Tempo del giro dal sensore se aggiornato, altrimenti dal cronometro del
+                    # giro all'ultimo step prima del wrap.
+                    crossed_finish = (current_eval_track_pos_m + TRACK_LENGTH_M * 0.5 < eval_prev_track_pos_m)
+                    if eval_dist >= TRACK_LENGTH_M * 0.9 and crossed_finish and not eval_info.get('crash', False):
+                        eval_lap_completed = True
+                        eval_dist = TRACK_LENGTH_M
+                        eval_sensor_lap = float(np.array(eval_ob.get('lastLapTime', 0.0)).flat[0])
+                        if eval_sensor_lap > 0.0 and abs(eval_sensor_lap - eval_prev_last_lap) > 0.01:
+                            eval_lap_time = eval_sensor_lap
+                        elif eval_prev_cur_lap > 0.0:
+                            eval_lap_time = eval_prev_cur_lap
+                        break
+                    eval_prev_track_pos_m = current_eval_track_pos_m
+                    eval_prev_cur_lap = eval_cur_lap
 
                     # Arresto anticipato della valutazione al completamento del primo giro valido.
                     eval_last_lap = float(np.array(eval_ob.get('lastLapTime', 0.0)).flat[0])
