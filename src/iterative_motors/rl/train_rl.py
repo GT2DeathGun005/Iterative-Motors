@@ -246,9 +246,15 @@ def train():
     parser.add_argument('--bc_alpha', type=float, default=2.5,
                         help="Coefficiente alpha del TD3+BC: piu' alto = piu' peso al RL rispetto alla BC "
                              "(default: 2.5 come nel paper; 3.5-5.0 per spingere oltre l'esperto)")
+    parser.add_argument('--trust_region', type=float, default=0.0,
+                        help="Peso FISSO della trust region verso le azioni del buffer sui campioni "
+                             "non-expert (0 = off; ~0.3 ancora l'Actor al supporto dati e cura il "
+                             "collasso della policy quando l'Actor torna attivo)")
     args = parser.parse_args()
     if args.actor_freeze_episodes < 0:
         parser.error("--actor-freeze-episodes deve essere >= 0")
+    if args.trust_region < 0:
+        parser.error("--trust_region deve essere >= 0")
     actor_freeze_episodes = args.actor_freeze_episodes
     auto_refine_enabled = not args.no_auto_refine
 
@@ -268,6 +274,10 @@ def train():
     # Inizializzazione Agent
     agent = TD3BCAgent()
     agent.bc_alpha = args.bc_alpha
+    agent.trust_region_weight = args.trust_region
+    if args.trust_region > 0.0:
+        print(f"Trust region attiva: peso {args.trust_region} verso le azioni del buffer sui campioni "
+              f"non-expert (ancora l'Actor al supporto dati, stabilizza la policy deterministica).")
 
     # Nota: i pesi BC pre-addestrati vengono caricati solo al fresh-start (blocco successivo); in caso di resume, sono ripristinati dal checkpoint.
     checkpoint_path = 'train_set/checkpoints/td3_checkpoint.pth'
@@ -486,6 +496,24 @@ def train():
         print(f"[TIME-ATTACK] Fase attiva: bc_alpha={agent.bc_alpha}, noise_floor={noise_floor}. "
               f"L'agente ottimizza il tempo sul giro battendo il proprio record.")
 
+    # Override manuale del rumore esplorativo (IM_EXPL_NOISE): fissa expl_noise a un valore costante,
+    # scavalcando sia l'annealing sia il floor. Serve per la fase di STABILIZZAZIONE: forzare un rumore
+    # basso su una policy gia' a convergenza (es. resume a episodi bassi) restando in td3 standard, senza
+    # passare per il time-attack che alzerebbe anche bc_alpha indebolendo l'ancora BC. <=0 o assente => off.
+    expl_noise_override = None
+    _noise_override_env = os.environ.get('IM_EXPL_NOISE')
+    if _noise_override_env is not None:
+        try:
+            _v = float(_noise_override_env)
+            if _v > 0:
+                expl_noise_override = _v
+                print(f"[STABILIZZAZIONE] IM_EXPL_NOISE attivo: expl_noise fisso a {_v} "
+                      f"(annealing e floor scavalcati).")
+            else:
+                print(f"IM_EXPL_NOISE={_noise_override_env} <= 0: override ignorato.")
+        except ValueError:
+            print(f"IM_EXPL_NOISE='{_noise_override_env}' non numerico: override ignorato.")
+
     # Lap recorder: raccoglie i giri completi e puliti guidati dall'agente in esplorazione
     # e li salva in train_set/laps_auto/ per arricchire il dataset della BC (flywheel dati).
     # Soglia tempo configurabile via IM_RECORD_MAX_LAP_TIME (default 80s); disattivabile con IM_RECORD_LAPS=0.
@@ -507,7 +535,9 @@ def train():
         # rumore da warmup su una policy matura, che la butta fuori alla prima curva veloce. Si va
         # quindi diritti al floor (micro-variazioni attorno alla linea ottima), che è proprio lo scopo
         # della fase di rifinitura dei tempi.
-        if time_attack:
+        if expl_noise_override is not None:
+            agent.expl_noise = expl_noise_override
+        elif time_attack:
             agent.expl_noise = noise_floor
         else:
             agent.expl_noise = max(

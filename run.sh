@@ -261,7 +261,10 @@ cmd_collect()     { split_env_args "$@"; log "Raccolta giri umani (foreground)�
 cmd_test()        { split_env_args "$@"; log "Valutazione deterministica (foreground)…"; exec env "${CMD_ENV[@]}" "$PYTHON" -m iterative_motors.eval.test_agent "${CMD_ARGS[@]}"; }
 cmd_bc()          { split_env_args "$@"; start_bg bc          env "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.bc.train_bc "${CMD_ARGS[@]}"; }
 cmd_bc_enriched() { split_env_args "$@"; start_bg bc-enriched env "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.bc.train_bc --auto_laps "$LAPS_AUTO_DIR" "${CMD_ARGS[@]}"; }
-cmd_td3()         { split_env_args "$@"; start_bg td3         env IM_WRAPPER_LOG_ONLY=1 IM_RECORD_LAPS=1 "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.rl.train_rl "${CMD_ARGS[@]}"; }
+# Default di STABILIZZAZIONE per il td3: trust region 0.3 (ancora l'Actor al supporto dati) e rumore
+# esplorativo fisso 0.04. Entrambi PRIMA di CMD_ENV/CMD_ARGS, così un IM_EXPL_NOISE=... o --trust_region ...
+# passato dall'utente (env e argparse: vince l'ultimo) li sovrascrive.
+cmd_td3()         { split_env_args "$@"; start_bg td3         env IM_WRAPPER_LOG_ONLY=1 IM_RECORD_LAPS=1 IM_EXPL_NOISE=0.04 "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.rl.train_rl --trust_region 0.3 "${CMD_ARGS[@]}"; }
 cmd_rl()          { cmd_td3 "$@"; }
 cmd_time_attack() { split_env_args "$@"; start_bg time-attack env IM_WRAPPER_LOG_ONLY=1 IM_TIME_ATTACK=1 IM_RECORD_LAPS=1 "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.rl.train_rl "${CMD_ARGS[@]}"; }
 
@@ -343,6 +346,8 @@ menu_prompt_args() {
                 "Rollback al best deterministico"
                 "Refinement subito"
                 "Disattiva auto-refine"
+                "Disattiva trust region"
+                "Override: rumore esplorativo 0.02"
                 "Non registrare giri auto"
                 "Override: registra solo giri auto <= 75s"
                 "GUI visibile"
@@ -355,6 +360,8 @@ menu_prompt_args() {
                 "--rollback"
                 "--refine"
                 "--no-auto-refine"
+                "--trust_region 0"
+                "IM_EXPL_NOISE=0.02"
                 "IM_RECORD_LAPS=0"
                 "IM_RECORD_MAX_LAP_TIME=75.0"
                 "SHOW_GUI=1"
@@ -363,7 +370,7 @@ menu_prompt_args() {
             if [ "$label" = "time-attack" ]; then
                 default_note="Default time-attack: episodes=1000, max_steps=5000, seed=42, auto-refine attivo, registra giri auto <=80s, noise floor/time-attack attivi, headless salvo SHOW_GUI=1."
             else
-                default_note="Default TD3: episodes=1000, max_steps=5000, seed=42, auto-refine attivo, no rollback/refine immediato, registra giri auto <=80s, headless salvo SHOW_GUI=1."
+                default_note="Default TD3: episodes=1000, max_steps=5000, seed=42, trust_region=0.3 + IM_EXPL_NOISE=0.04 (stabilizzazione Actor/Critic), auto-refine attivo, no rollback/refine immediato, registra giri auto <=80s, headless salvo SHOW_GUI=1."
             fi
             ;;
         test)

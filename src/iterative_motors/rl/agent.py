@@ -50,6 +50,9 @@ class TD3BCAgent:
         self.policy_freq = 2  # Frequenza aggiornamento Actor vs Critic (Delayed Policy Update)
         self.expl_noise = _EXPL_NOISE_START  # std rumore esplorativo, annealata dal training loop
         self.bc_alpha = 2.5  # alpha TD3+BC: piu' alto = piu' peso al RL rispetto alla BC
+        # Peso della trust region verso le azioni del buffer sui campioni non-expert (0 = off).
+        # Impostato dal training loop via --trust_region; cura il collasso dell'Actor post-attivazione.
+        self.trust_region_weight = 0.0
 
         # Stato del curriculum/refinement (impostato dal training loop; default robusti).
         self.refine_mode = False
@@ -194,13 +197,28 @@ class TD3BCAgent:
             mutual_exclusion_penalty = (det_accel * det_brake).mean()
             bc_penalty = bc_penalty + (mutual_exclusion_penalty * 0.1)
 
+            # Trust region (peso FISSO, non si scioglie con l'ancora dinamica né col refine): ancora
+            # l'Actor alle azioni effettivamente presenti nel buffer sui campioni NON-expert (75% del
+            # batch). Senza, su quel 75% l'unica forza è max Q, che spinge l'Actor su azioni fuori
+            # distribuzione dove il Critic sovrastima Q → la policy deterministica collassa appena
+            # l'Actor è attivo. Vincolarlo al supporto dati lo stabilizza (era il TRUST_REGION_WEIGHT
+            # della lineage che consolidava a eval identiche, perso nel refactor).
+            trust_region_penalty = torch.tensor(0.0, device=self.device)
+            if getattr(self, 'trust_region_weight', 0.0) > 0.0:
+                non_expert_indices = torch.where(expert_mask_flat <= 0.5)[0]
+                if len(non_expert_indices) > 0:
+                    trust_region_penalty = F.mse_loss(
+                        pi[non_expert_indices], action_b[non_expert_indices])
+
             # Normalizzazione λ del TD3+BC (Fujimoto & Gu, 2021)
             Q_abs_mean = q1_pi.abs().mean().detach().clamp(min=1e-5)
             dynamic_alpha = self.bc_alpha / Q_abs_mean
 
             bc_weight = self.refine_bc_weight if getattr(self, 'refine_mode', False) else 1.0
 
-            total_actor_loss = dynamic_alpha * actor_loss_td3 + (bc_weight * bc_penalty)
+            total_actor_loss = (dynamic_alpha * actor_loss_td3
+                                + (bc_weight * bc_penalty)
+                                + (self.trust_region_weight * trust_region_penalty))
 
             self.actor_optimizer.zero_grad()
             total_actor_loss.backward()
