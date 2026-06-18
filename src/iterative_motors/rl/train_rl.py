@@ -499,13 +499,21 @@ def train():
     print("Avvio training TD3+BC...")
 
     for episode in range(start_episode, args.episodes):
-        # Annealing lineare del rumore esplorativo: da EXPL_NOISE_START al floor (EXPL_NOISE_END,
-        # oppure TIME_ATTACK_NOISE_FLOOR in time-attack) in EXPL_NOISE_ANNEAL_EPISODES episodi.
-        # A regime servono micro-variazioni di traiettoria, non sbandate a velocità di gara.
-        agent.expl_noise = max(
-            noise_floor,
-            EXPL_NOISE_START - (EXPL_NOISE_START - noise_floor) * episode / EXPL_NOISE_ANNEAL_EPISODES
-        )
+        # Annealing lineare del rumore esplorativo: da EXPL_NOISE_START al floor (EXPL_NOISE_END)
+        # in EXPL_NOISE_ANNEAL_EPISODES episodi. A regime servono micro-variazioni di traiettoria,
+        # non sbandate a velocità di gara.
+        # In time-attack la policy ha già raggiunto la convergenza (chiude il giro): l'annealing — agganciato al
+        # numero ASSOLUTO di episodio — imporrebbe ancora ~0.065 a episodi bassi dopo un resume, cioè
+        # rumore da warmup su una policy matura, che la butta fuori alla prima curva veloce. Si va
+        # quindi diritti al floor (micro-variazioni attorno alla linea ottima), che è proprio lo scopo
+        # della fase di rifinitura dei tempi.
+        if time_attack:
+            agent.expl_noise = noise_floor
+        else:
+            agent.expl_noise = max(
+                noise_floor,
+                EXPL_NOISE_START - (EXPL_NOISE_START - noise_floor) * episode / EXPL_NOISE_ANNEAL_EPISODES
+            )
 
         # Gestione dello scongelamento dell'Actor dopo la fase di stabilizzazione post-rollback
         if agent.actor_frozen and episode >= start_episode + actor_freeze_episodes:
