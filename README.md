@@ -20,7 +20,9 @@ Per i dettagli tecnici completi vedi **[ARCHITECTURE.md](ARCHITECTURE.md)**.
   perturbazione angolare ampliata (~10°).
 - Fine-tuning TD3+BC: Actor con warm-start da BC, Twin Critic, campionamento ibrido expert/online/elite.
 - **Flywheel dati**: la TD3 registra i propri giri puliti (`laps_auto/`) per riaddestrare una BC più forte.
-- **Time-attack** con bonus di record personale: l'agente cerca di battere i propri tempi.
+- **Reward a due regimi**: stabilizzazione (penalità di corridoio + completamento piatto → chiudere quasi
+  ogni giro) e time-attack (bonus tempo + **reward telemetrica a settori** → limare i decimi battendo i
+  propri split, fino al giro ideale teorico).
 - Cambio marcia deterministico separato dalla rete; checkpoint atomici con backup e resume robusto.
 - Valutazione deterministica con auto-detect del miglior checkpoint.
 - **Orchestratore unico `run.sh`** per l'intera pipeline, con cruscotto di stato.
@@ -94,12 +96,17 @@ Produce `train_set/checkpoints/bc_policy.pth` e `state_norm.npz` (background; se
 ./run.sh td3 --episodes 2500
 ```
 
-Il launcher `td3` applica i **default di stabilizzazione**: trust region `--trust_region 0.15` (ancora
+Il launcher `td3` applica i **default di stabilizzazione**: trust region `--trust_region 0.3` (ancora
 l'Actor al supporto dati sui campioni non-expert, anti-collasso della policy) e `IM_EXPL_NOISE=0.04`
 (rumore esplorativo fisso, scavalca l'annealing). Entrambi sovrascrivibili (es. `--trust_region 0`,
 `IM_EXPL_NOISE=0.02`). Per **seminare l'elite** coi giri auto-registrati e rompere la starvation della
 self-imitation: `--reseed_elite_max_lap_time 74.5` (esiste comunque un'auto-semina di sicurezza quando
 l'elite carica affamato). A regime l'elite si auto-alimenta catturando i giri completati in eval.
+
+In questa fase la reward privilegia il **completamento robusto**: penalità di corridoio (margine dal
+bordo, `IM_MARGIN_PENALTY`) e bonus di completamento *piatto* (niente pressione sul tempo, riservata al
+time-attack). Tieni `--capture_eval_elite` **spento**: self-imitare la linea-rasoio dell'eval sovra-affila
+la policy, l'opposto di quello che serve per stabilizzare (vedi §7 di ARCHITECTURE.md).
 
 Durante il training l'agente registra automaticamente i propri giri completi e puliti in
 `train_set/laps_auto/` (disattivabile con `IM_RECORD_LAPS=0`). Stop pulito: `./run.sh stop td3`
@@ -114,6 +121,12 @@ Durante il training l'agente registra automaticamente i propri giri completi e p
 # Fase time-attack: l'agente ottimizza il tempo battendo il proprio record
 ./run.sh time-attack --episodes 4000
 ```
+
+In time-attack si riattiva la pressione sul tempo (bonus tempo + record personale) e si aggiunge la
+**reward telemetrica a settori** (`rl/sector_timer.py`): l'agente è premiato per battere i propri split
+di settore, e a fine giro il log mostra dove perde tempo (`S07(+0.22s) ...`) e il **giro ideale teorico**
+(somma dei migliori parziali). I best-settore sono persistiti in `checkpoints/td3_sector_best.json` e
+sopravvivono ai restart; tarabili con `IM_TA_SECTORS`, `IM_TA_SECTOR_K`, `IM_TA_SECTOR_CAP`.
 
 Per adottare la BC arricchita in una nuova lineage TD3: copia i nuovi `bc_policy.pth` +
 `state_norm.npz` da `enriched/` in `train_set/checkpoints/`, azzera i checkpoint TD3 (i record

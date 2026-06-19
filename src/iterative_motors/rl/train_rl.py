@@ -69,11 +69,19 @@ ARCHITETTURA E LOGICA DEL SISTEMA
        viene interrotto prematuramente e viene applicata una sanzione di stacco `-base_penalty - (extra_penalty * eccesso)`.
      - Penalità di Stallo e Spin: Se la vettura rimane ferma per più di 10 secondi o compie un testacoda (coseno dell'angolo 
        rispetto al tracciato negativo, `cos(angle) < 0`), l'episodio termina con una penalità fissa di collisione.
-     - Bonus di Fine Giro (aggiunto in TD3+BC): `+50.0` se il traguardo viene tagliato regolarmente con successo,
-       più un bonus proporzionale al tempo (`+10.0` per ogni secondo sotto il riferimento di 80s) che premia
-       direttamente i giri veloci: la sola reward di progresso produce un ritorno per giro quasi costante.
+     - Bonus di Fine Giro (aggiunto in TD3+BC): `+50.0` se il traguardo viene tagliato regolarmente con successo.
+       Il bonus proporzionale al tempo (`+10.0` per ogni secondo sotto gli 80s) e il bonus di record personale
+       sono attivi SOLO in time-attack: in stabilizzazione il completamento è premiato in modo piatto, così un
+       giro lento ma pulito vale quanto uno veloce ma rischioso e la policy impara prima a chiudere il giro.
      - Malus Giro Incompleto (aggiunto in TD3+BC): `-25.0` se l'episodio termina prematuramente per sbandata o crash,
        scoraggiando la guida imprudente a favore del completamento del circuito.
+     - Penalità di Corridoio (STABILIZZAZIONE): penalità quadratica per-step che scatta già a `|trackPos| > 0.80`,
+       cioè PRIMA di uscire dalla superficie di guida, per insegnare un margine di sicurezza dal bordo. Piena in
+       stabilizzazione (giri completi affidabili), ridotta in time-attack (serve usare tutta la pista). Vedi
+       `reward.margin_penalty`.
+     - Reward Telemetrica a Settori (TIME-ATTACK): la pista è divisa in settori; alla chiusura di ognuno si premia
+       (o penalizza) l'agente in base a quanto batte il proprio miglior tempo-settore. Segnale denso che indica
+       DOVE guadagnare tempo, con log del "giro ideale teorico" (somma dei migliori parziali). Vedi `sector_timer`.
 """
 
 import os
@@ -112,8 +120,11 @@ from iterative_motors.rl.reward import (
     LAP_TIME_BONUS_REF_S, LAP_TIME_BONUS_PER_S, EVAL_SCORE_T_REF_S, EVAL_SCORE_SANITY_LIMIT,
     _is_plausible_eval_dist, _is_plausible_eval_score, _eval_score, _track_progress_from_start,
     personal_best_bonus, TIME_ATTACK_BC_ALPHA, TIME_ATTACK_NOISE_FLOOR, TIME_ATTACK_ENTRY_S,
+    margin_penalty, MARGIN_PENALTY_COEF,
+    TA_SECTORS_DEFAULT, TA_SECTOR_REWARD_K, TA_SECTOR_REWARD_CAP,
 )
 from iterative_motors.rl.agent import TD3BCAgent
+from iterative_motors.rl.sector_timer import SectorTimer
 
 
 # Relaunch completo di TORCS (kill + riavvio + macro di autostart) solo ogni N episodi:
@@ -256,6 +267,11 @@ def train():
                              "starvation dell'elite dando alla self-imitation giri completi da imitare; "
                              "i semi lenti invecchiano ed escono man mano che la policy cattura giri "
                              "più veloci. Passalo SOLO al primo lancio di semina (poi è nel checkpoint).")
+    parser.add_argument('--capture_eval_elite', action='store_true',
+                        help="Cattura nell'elite i giri COMPLETI dell'eval deterministica (la linea "
+                             "pulita/veloce). Default OFF: in fase di stabilizzazione self-imitare la "
+                             "linea-rasoio sovra-affila la policy e destabilizza l'esplorazione; tienila "
+                             "spenta finché l'esplorazione non è stabile, riattivala nella limatura.")
     args = parser.parse_args()
     if args.actor_freeze_episodes < 0:
         parser.error("--actor-freeze-episodes deve essere >= 0")
@@ -553,6 +569,34 @@ def train():
         enabled=(os.environ.get('IM_RECORD_LAPS', '1') != '0'),
     )
 
+    # ── Penalità di corridoio (STABILIZZAZIONE) ───────────────────────────────
+    # Spinge la policy a tenersi lontano dal bordo PRIMA di uscire → giri completi affidabili.
+    # Piena in stabilizzazione; ridotta al 25% in time-attack (lì serve usare tutta la pista per
+    # limare i tempi). Sovrascrivibile via IM_MARGIN_PENALTY (0 = disattiva del tutto).
+    margin_coef_default = MARGIN_PENALTY_COEF * (0.25 if time_attack else 1.0)
+    try:
+        margin_coef = float(os.environ.get('IM_MARGIN_PENALTY', margin_coef_default))
+    except ValueError:
+        margin_coef = margin_coef_default
+    if margin_coef > 0.0:
+        print(f"[STABILIZZAZIONE] Penalità di corridoio attiva: coef={margin_coef:.1f} "
+              f"(margine dal bordo per completare i giri).")
+
+    # ── Telemetria a settori (TIME-ATTACK) ────────────────────────────────────
+    # Solo in time-attack: premia il battere i propri split di settore e logga dove si perde tempo.
+    sector_timer = None
+    if time_attack:
+        sector_timer = SectorTimer(
+            TRACK_LENGTH_M,
+            n_sectors=int(os.environ.get('IM_TA_SECTORS', str(TA_SECTORS_DEFAULT))),
+            sidecar_path='train_set/checkpoints/td3_sector_best.json',
+            reward_k=float(os.environ.get('IM_TA_SECTOR_K', str(TA_SECTOR_REWARD_K))),
+            reward_cap=float(os.environ.get('IM_TA_SECTOR_CAP', str(TA_SECTOR_REWARD_CAP))),
+            log=_control_log,
+        )
+        print(f"[TIME-ATTACK] Reward a settori attiva: {sector_timer.n} settori, "
+              f"k={sector_timer.reward_k}, cap={sector_timer.reward_cap}.")
+
     print("Avvio training TD3+BC...")
 
     for episode in range(start_episode, args.episodes):
@@ -595,6 +639,8 @@ def train():
 
         # Lap recorder: nuovo giro, e tracciamento dell'osservazione grezza pre-step.
         lap_recorder.start_episode()
+        if sector_timer is not None:
+            sector_timer.start_lap(float(np.array(ob.get('distFromStart', 0.0)).flat[0]))
         cur_ob = ob
         # Etichetta di fase (curriculum): time-attack se attiva, altrimenti warmup (Critic
         # non ancora caldo) oppure online. Usata per i metadati del recorder e i log.
@@ -658,6 +704,15 @@ def train():
             torcs_lap_time = float(np.array(next_ob.get('curLapTime', 0.0)).flat[0])
             max_dist = max(max_dist, current_dist)
 
+            # Shaping per-step sulle transizioni ONLINE (la guida effettiva dell'agente):
+            #  - corridoio: margine dal bordo (stabilizzazione → giri completi affidabili);
+            #  - settori: premio per aver battuto i propri split (solo time-attack).
+            if margin_coef > 0.0:
+                reward += margin_penalty(
+                    float(np.array(next_ob.get('trackPos', 0.0)).flat[0]), coef=margin_coef)
+            if sector_timer is not None:
+                reward += sector_timer.update(current_track_pos_m, torcs_lap_time)
+
             lap_completed = bool(info.get('lap_completed', False))
             if not lap_completed:
                 lap_completed = last_lap_time > 0.0 and abs(last_lap_time - prev_last_lap) > 0.01 and step > 500
@@ -667,14 +722,18 @@ def train():
                 done, termination_reason = True, "SUCCESS"
                 completed_lap_time = last_lap_time
                 max_dist = max(max_dist, TRACK_LENGTH_M)
-                # Bonus fisso di completamento + bonus proporzionale al tempo: la reward di progresso
-                # da sola produce un ritorno per giro quasi costante (la distanza è fissa), quindi
-                # senza questo termine un giro da 70s e uno da 85s sarebbero premiati quasi uguale.
-                reward += LAP_SUCCESS_BONUS + LAP_TIME_BONUS_PER_S * max(0.0, LAP_TIME_BONUS_REF_S - last_lap_time)
+                # STABILIZZAZIONE: il completamento è premiato in modo PIATTO (solo LAP_SUCCESS_BONUS),
+                # così un giro lento ma pulito vale quanto un giro veloce ma rischioso → la policy
+                # impara prima a chiudere il giro. La pressione sul tempo (bonus proporzionale e
+                # record personale) è riservata al TIME-ATTACK, dove serve limare i decimi.
+                reward += LAP_SUCCESS_BONUS
+                if time_attack:
+                    reward += LAP_TIME_BONUS_PER_S * max(0.0, LAP_TIME_BONUS_REF_S - last_lap_time)
                 if last_lap_time < best_lap_time:
-                    # Bonus di RECORD PERSONALE: premia il battere il proprio miglior tempo
-                    # (time-attack), oltre al bonus di completamento. Calcolato sul best PRECEDENTE.
-                    reward += personal_best_bonus(best_lap_time, last_lap_time)
+                    # Bonus di RECORD PERSONALE: solo in time-attack (calcolato sul best PRECEDENTE);
+                    # in stabilizzazione si registra comunque il best lap, ma senza premio sul tempo.
+                    if time_attack:
+                        reward += personal_best_bonus(best_lap_time, last_lap_time)
                     best_lap_time = last_lap_time
                     new_record = True
                     safe_save(agent.actor.state_dict(), 'train_set/checkpoints/td3_expl_best_lap.pth')
@@ -736,6 +795,14 @@ def train():
                                             episode=episode, global_step=global_step)
                 else:
                     lap_recorder.discard()
+
+                # Time-attack: chiudi il giro a settori (logga dove perde tempo + giro ideale) se
+                # completato, altrimenti scarta il parziale conservando i best-settore già migliorati.
+                if sector_timer is not None:
+                    if termination_reason == "SUCCESS":
+                        sector_timer.finish_lap(completed_lap_time)
+                    else:
+                        sector_timer.discard_lap()
                 break
 
         # Rilevamento del tempo sul giro fornito dai sensori di TORCS.
@@ -872,7 +939,9 @@ def train():
                 # expert=1.0, come le iniezioni online. È la fonte di giri VELOCI per la self-imitation, che i
                 # giri auto-registrati (più lenti) non danno; man mano che la policy migliora, queste catture
                 # rimpiazzano in FIFO i semi lenti.
-                if eval_lap_completed and len(eval_transitions) > 0:
+                # Gated da --capture_eval_elite (default OFF): in stabilizzazione self-imitare la linea-rasoio
+                # dell'eval sovra-affila la policy e destabilizza l'esplorazione; riattivala nella limatura.
+                if args.capture_eval_elite and eval_lap_completed and len(eval_transitions) > 0:
                     for (s, a, r, ns, m) in eval_transitions:
                         elite_memory.push(s, a, r, ns, m, expert=1.0)
                     print(f"  [ELITE CAPTURE] Giro eval completo nell'elite: "

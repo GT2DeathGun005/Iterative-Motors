@@ -348,6 +348,8 @@ menu_prompt_args() {
                 "Disattiva auto-refine"
                 "Disattiva trust region"
                 "Override: rumore esplorativo 0.02"
+                "Penalità di corridoio off"
+                "Corridoio forte (stabilizzazione)"
                 "Non registrare giri auto"
                 "Override: registra solo giri auto <= 75s"
                 "GUI visibile"
@@ -362,15 +364,17 @@ menu_prompt_args() {
                 "--no-auto-refine"
                 "--trust_region 0"
                 "IM_EXPL_NOISE=0.02"
+                "IM_MARGIN_PENALTY=0"
+                "IM_MARGIN_PENALTY=20"
                 "IM_RECORD_LAPS=0"
                 "IM_RECORD_MAX_LAP_TIME=75.0"
                 "SHOW_GUI=1"
             )
             example="--episodes 2500 SHOW_GUI=1"
             if [ "$label" = "time-attack" ]; then
-                default_note="Default time-attack: episodes=1000, max_steps=5000, seed=42, auto-refine attivo, registra giri auto <=80s, noise floor/time-attack attivi, headless salvo SHOW_GUI=1."
+                default_note="Default time-attack: episodes=1000, max_steps=5000, seed=42, auto-refine attivo, registra giri auto <=80s, noise floor/time-attack attivi, pressione tempo + reward a settori (IM_TA_SECTORS/_K/_CAP), corridoio ridotto, headless salvo SHOW_GUI=1."
             else
-                default_note="Default TD3: episodes=1000, max_steps=5000, seed=42, trust_region=0.3 + IM_EXPL_NOISE=0.04 (stabilizzazione Actor/Critic), auto-refine attivo, no rollback/refine immediato, registra giri auto <=80s, headless salvo SHOW_GUI=1."
+                default_note="Default TD3 (stabilizzazione): episodes=1000, max_steps=5000, seed=42, trust_region=0.3 + IM_EXPL_NOISE=0.04, penalità di corridoio attiva (IM_MARGIN_PENALTY=12) + completamento piatto (no pressione tempo), auto-refine attivo, no rollback/refine immediato, registra giri auto <=80s, headless salvo SHOW_GUI=1."
             fi
             ;;
         test)

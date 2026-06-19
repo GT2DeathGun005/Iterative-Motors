@@ -60,7 +60,8 @@ AIcar/                                  # cartella root del repo
       train_bc.py     # ENTRYPOINT training BC (BehaviorCloningTrainer + main)
     rl/                                 # Reinforcement Learning TD3+BC
       agent.py        # TD3BCAgent: update RL/BC, save/load_checkpoint robusto
-      reward.py       # bonus/penalità fine giro, score di eval, bonus di record personale
+      reward.py       # bonus/penalità fine giro, penalità di corridoio, score di eval, record personale
+      sector_timer.py # SectorTimer: split times per-settore e reward telemetrica (solo time-attack)
       train_rl.py     # ENTRYPOINT fine-tuning TD3+BC (+ harvest dei giri, time-attack)
     eval/
       test_agent.py   # ENTRYPOINT valutazione deterministica con auto-detect del best
@@ -189,8 +190,9 @@ Il termine anti-zigzag penalizza i cambi di sterzo bruschi, favorendo traiettori
 
 **Terminazioni anticipate** (training): uscita di pista (|trackPos| > 1.25), stallo (progresso < 0.1
 dopo 500 step ≈ 10s), testacoda (cos(angle) < 0), giro completato (cambio di `lastLapTime` dopo lo
-step 500). I bonus/malus terminali (completamento, tempo, giro incompleto, record personale) sono
-aggiunti dal training loop tramite `rl/reward.py`.
+step 500). I bonus/malus terminali (completamento, tempo, giro incompleto, record personale) e lo
+shaping per-step a regime (penalità di corridoio, reward a settori) sono aggiunti dal training loop
+tramite `rl/reward.py` e `rl/sector_timer.py`, con segnali diversi secondo il regime (vedi §7).
 
 **Frequenza di controllo**: il protocollo SCR lavora nominalmente a 50Hz. Il wrapper rilancia
 periodicamente TORCS (kill + autostart) per contrastare un memory leak osservato nei run lunghi.
@@ -254,7 +256,7 @@ dimenticare troppo presto la storia recente), elite **200k**, expert 400k.
 Caratteristiche di stabilità (tutte preservate dal codice originale):
 - **Ancora progressiva**: il buffer expert è permanente (capacità 400k >> dataset) e filtrato sui
   *migliori* giri umani (`--expert_max_lap_time`), così l'ancora BC punta al best umano, non alla media.
-- **Trust region** (`--trust_region`, default 0.15 nel launcher `td3`): MSE a peso FISSO tra azione
+- **Trust region** (`--trust_region`, default 0.3 nel launcher `td3`): MSE a peso FISSO tra azione
   dell'Actor e azione del buffer sui campioni **non-expert** (il 75% dove l'unica forza sarebbe `max Q`,
   che spingerebbe l'Actor fuori dal supporto dati su azioni con Q sovrastimato). Ancora l'Actor al
   supporto dati e cura il collasso della policy deterministica quando l'Actor torna attivo.
@@ -271,6 +273,26 @@ Caratteristiche di stabilità (tutte preservate dal codice originale):
   raffinare l'Actor verso una value function fissa; con rollback su collasso e uscita su breakout.
 - **Warm-up**: l'Actor resta congelato finché il Critic non si stabilizza (15000 step), aggiornandosi
   poi con Delayed Policy Update (ogni 2 step del Critic) e Target Policy Smoothing.
+
+### Reward a due regimi: stabilizzazione → time-attack
+
+La reward di progresso (`1.5·progress`) accumula ~8000 punti per giro: i bonus terminali (~150) sono
+<2% del ritorno, quindi da soli **non** insegnano a *completare* invece di rischiare. Per questo lo
+shaping cambia secondo la fase (gating sulla variabile `time_attack` / `IM_TIME_ATTACK`):
+
+- **STABILIZZAZIONE** (launcher `td3`, default — obiettivo: chiudere *quasi ogni* giro, anche più lento):
+  - **Penalità di corridoio** (`reward.margin_penalty`): penalità quadratica per-step che scatta già a
+    `|trackPos| > 0.80`, cioè *prima* di uscire dalla superficie di guida (la `pos_penalty` dell'ambiente
+    interviene solo oltre 1.0, quando l'auto è già al bordo e una micro-perturbazione la manda in crash).
+    Insegna un **margine di sicurezza**; essendo per-step pesa quanto il progress e, generalizzando sullo
+    stato sensoriale, trasferisce la lezione a tutta la pista. Coefficiente via `IM_MARGIN_PENALTY`.
+  - **Completamento piatto**: il bonus proporzionale al tempo e il bonus di record personale sono
+    **disattivati**; resta solo `LAP_SUCCESS_BONUS`. Un giro lento ma pulito vale quanto uno veloce ma
+    rischioso → la policy impara prima a chiudere il giro.
+  - Applicato alle sole transizioni **online** (la guida effettiva dell'agente), non all'expert/elite.
+- **TIME-ATTACK** (launcher `time-attack`, `IM_TIME_ATTACK=1` — obiettivo: limare i decimi, vedi §9):
+  bonus tempo + record personale riattivati, penalità di corridoio ridotta al 25% (serve usare tutta la
+  pista) e **reward telemetrica a settori** (`rl/sector_timer.py`) che premia il battere i propri split.
 
 ---
 
@@ -294,15 +316,35 @@ che unisce umano+auto e **ricalcola** `state_norm.npz` sull'unione.
 
 ## 9. Time-attack e record personale
 
-In `rl/reward.py`:
-- **Bonus di record personale** (sempre attivo): quando l'agente stabilisce un nuovo miglior tempo,
-  riceve `+30 + 15·(secondi guadagnati)` oltre al bonus di completamento. È l'incentivo diretto a
-  limare i tempi anche quando la distanza è ormai saturata a fine giro.
-- **Fase TIME-ATTACK** (`IM_TIME_ATTACK=1`): da attivare *dopo* aver raccolto abbastanza giri e
-  ri-addestrato la BC. Riduce l'ancoraggio alla BC (`bc_alpha` → 4.0, più peso al RL) e porta il rumore
-  esplorativo **diritto al floor 0.02**, senza annealing: su una policy già a convergenza l'annealing —
-  agganciato al numero *assoluto* di episodio — imporrebbe ancora ~0.065 dopo un resume a episodi bassi,
-  distruggendo la traiettoria alla prima curva veloce.
+La fase time-attack si attiva **dopo** che la policy è stabile (chiude quasi ogni giro, §7) e mira a
+limare i decimi fino al limite della pista. Si abilita con `IM_TIME_ATTACK=1` (launcher `time-attack`).
+
+**Pressione sul tempo** (in `rl/reward.py`, attiva *solo* in time-attack):
+- **Bonus proporzionale al tempo**: `+10` per ogni secondo sotto gli 80s di riferimento.
+- **Bonus di record personale**: quando l'agente stabilisce un nuovo miglior tempo riceve
+  `+30 + 15·(secondi guadagnati)` oltre al bonus di completamento. Incentivo diretto a limare i tempi
+  quando la distanza è ormai saturata a fine giro. In stabilizzazione entrambi sono spenti (§7).
+
+**Reward telemetrica a settori** (`rl/sector_timer.py`, classe `SectorTimer`): la pista è divisa in N
+settori contigui sulla `distFromStart` (default 18). Per ogni settore si tiene il **miglior tempo mai
+percorso** (best split), persistito nel sidecar `td3_sector_best.json` così sopravvive ai restart. Alla
+chiusura di ogni settore si premia (o penalizza) l'agente in base a quanto batte il proprio record di
+quel settore (`reward_k·Δt`, clampato a `±reward_cap`): un segnale **denso** che indica *dove* guadagnare
+tempo, con buona assegnazione del credito. Nel regime time-attack i miglioramenti sono dell'ordine dei
+decimi, quindi il segnale resta nella regione lineare e gentile.
+
+- I best-settore si aggiornano **in tempo reale** alla chiusura di ogni settore (anche da giri diversi),
+  così il **giro ideale teorico** = somma dei migliori parziali è la linea ottima assemblata pezzo per
+  pezzo: inseguirla avvicina l'agente al limite della pista.
+- A fine giro completato, il log mostra il breakdown: tempo del giro, giro ideale, gap, e i settori dove
+  si **perde più tempo** (`S07(+0.22s) ...`) — telemetria utile a capire dove intervenire.
+- Tarabile via env: `IM_TA_SECTORS` (numero settori), `IM_TA_SECTOR_K`, `IM_TA_SECTOR_CAP`.
+
+**Altri parametri della fase**:
+- Riduce l'ancoraggio alla BC (`bc_alpha` → 4.0, più peso al RL) e porta il rumore esplorativo **diritto
+  al floor 0.02**, senza annealing: su una policy già a convergenza l'annealing — agganciato al numero
+  *assoluto* di episodio — imporrebbe ancora ~0.065 dopo un resume a episodi bassi, distruggendo la
+  traiettoria alla prima curva veloce.
 - **Override del rumore** (`IM_EXPL_NOISE=<v>`): fissa `expl_noise` a un valore costante scavalcando
   annealing e floor. Serve a forzare un rumore basso su una policy matura restando in `td3` standard
   (default 0.04 nel launcher) senza passare per il time-attack, che alzerebbe anche `bc_alpha`.
@@ -331,6 +373,7 @@ File principali in `train_set/checkpoints/`:
 | `td3_det_best_lap.pth` | miglior giro valido deterministico (candidato submission) |
 | `td3_det_best_dist.pth` | miglior score deterministico assoluto |
 | `td3_expl_best_lap/dist.pth` | migliori risultati trovati in esplorazione |
+| `td3_sector_best.json` | migliori tempi per-settore (time-attack); definisce il "giro ideale" |
 
 ---
 
@@ -363,7 +406,12 @@ gli entrypoint di training intercettano per salvare un checkpoint completo prima
 |---|---|---|---|
 | env | `IM_RECORD_LAPS` | 1 | abilita il lap recorder durante il training |
 | env | `IM_RECORD_MAX_LAP_TIME` | 80.0 | soglia tempo (s) per salvare un giro auto |
-| env | `IM_TIME_ATTACK` | 0 | attiva la fase time-attack |
+| env | `IM_TIME_ATTACK` | 0 | attiva la fase time-attack (pressione tempo + reward a settori) |
+| env | `IM_MARGIN_PENALTY` | 12.0 / 3.0 | coef. penalità di corridoio (stabilizz. / time-attack; 0 = off) |
+| env | `IM_TA_SECTORS` | 18 | numero di settori per la reward telemetrica (time-attack) |
+| env | `IM_TA_SECTOR_K` | 30.0 | scala del premio per secondo guadagnato sul record di settore |
+| env | `IM_TA_SECTOR_CAP` | 8.0 | clamp del premio/penalità per settore |
+| env | `IM_EXPL_NOISE` | 0.04 (td3) | override del rumore esplorativo (scavalca annealing/floor) |
 | env | `TORCS_KILL_ALL` | 1 | kill globale di TORCS (workaround memory leak) |
 | env | `SHOW_GUI` | 0 | mostra la finestra TORCS invece di Xvfb headless |
 | rl | `--episodes` | 1000 | episodio finale (deve superare quello di resume) |

@@ -32,6 +32,35 @@ TIME_ATTACK_BC_ALPHA = 4.0
 TIME_ATTACK_NOISE_FLOOR = 0.02
 TIME_ATTACK_ENTRY_S = 70.5       # soglia indicativa di "guida appresa" per promuovere a time-attack
 
+# ── Stabilizzazione: penalità di corridoio (margine dal bordo pista) ───────
+# La pos_penalty di gym_torcs scatta solo a |trackPos| > 1.0, cioè quando l'auto è GIÀ
+# fuori dalla superficie di guida: a quel punto una micro-perturbazione la manda oltre 1.25
+# (crash). Questa penalità anticipa il segnale, scoraggiando di avvicinarsi al bordo già da
+# |trackPos| > MARGIN_PENALTY_START. Insegna un corridoio di sicurezza → giri completi
+# affidabili (anche se più lenti). In time-attack si riduce (serve usare tutta la pista).
+MARGIN_PENALTY_START = 0.80      # |trackPos| oltre cui inizia la penalità di corridoio
+MARGIN_PENALTY_COEF = 12.0       # coefficiente quadratico (a |trackPos|=1.0 → ~-0.75/step)
+
+# ── Time-attack: reward telemetrica a settori (split times) ────────────────
+# Default per la SectorTimer: numero di settori e scala del premio per aver battuto il
+# proprio miglior tempo-settore. Sovrascrivibili da env (IM_TA_SECTORS/_K/_CAP).
+TA_SECTORS_DEFAULT = 18
+TA_SECTOR_REWARD_K = 30.0        # punti per secondo guadagnato sul record di settore
+TA_SECTOR_REWARD_CAP = 8.0       # clamp del premio/penalità per settore (≈0.27s)
+
+
+def margin_penalty(track_pos, coef=MARGIN_PENALTY_COEF, start=MARGIN_PENALTY_START):
+    """Penalità quadratica di corridoio: scoraggia l'avvicinarsi al bordo PRIMA di uscire.
+
+    Nulla se ``|track_pos| <= start``; cresce come ``-coef*(|track_pos|-start)^2`` verso il
+    bordo. Applicata per-step alle sole transizioni online (la guida rischiosa dell'agente),
+    spinge la policy a tenere un margine di sicurezza e a completare il giro in modo ripetibile.
+    """
+    tp = abs(float(track_pos))
+    if tp <= start:
+        return 0.0
+    return -float(coef) * (tp - start) ** 2
+
 
 def personal_best_bonus(prev_best_s, lap_time_s):
     """Bonus per un nuovo record personale: fisso + proporzionale ai secondi guadagnati.
