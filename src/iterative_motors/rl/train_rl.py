@@ -250,6 +250,12 @@ def train():
                         help="Peso FISSO della trust region verso le azioni del buffer sui campioni "
                              "non-expert (0 = off; ~0.3 ancora l'Actor al supporto dati e cura il "
                              "collasso della policy quando l'Actor torna attivo)")
+    parser.add_argument('--reseed_elite_max_lap_time', type=float, default=0.0,
+                        help="Semina UNA TANTUM il buffer elite con i giri auto-registrati "
+                             "(train_set/laps_auto) con lap_time <= soglia (0 = off). Rompe la "
+                             "starvation dell'elite dando alla self-imitation giri completi da imitare; "
+                             "i semi lenti invecchiano ed escono man mano che la policy cattura giri "
+                             "più veloci. Passalo SOLO al primo lancio di semina (poi è nel checkpoint).")
     args = parser.parse_args()
     if args.actor_freeze_episodes < 0:
         parser.error("--actor-freeze-episodes deve essere >= 0")
@@ -262,10 +268,14 @@ def train():
 
     env = TorcsEnv(early_termination=True)
 
-    # Buffer ONLINE (FIFO) per l'esperienza dell'agente. 1M transizioni:
-    # con ~700 step/episodio copre ~1400 episodi senza evizione precoce.
-    memory = ReplayBuffer(1000000)
-    elite_memory = ReplayBuffer(20000)
+    # Buffer ONLINE (FIFO) per l'esperienza dell'agente. 2M transizioni: orizzonte raddoppiato per
+    # trattenere più storia recente prima dell'evizione (richiesta utente: "non dimenticare il vecchio").
+    # Le proporzioni del batch restano 25/15/60: la capienza decide solo quanto orizzonte tiene l'online.
+    memory = ReplayBuffer(2000000)
+    # Buffer ELITE (self-imitation): capienza aumentata 20k→200k per ospitare una collezione VARIA di
+    # giri buoni — semina iniziale (--reseed_elite_max_lap_time) + catture dei giri completi (eval e
+    # online) — senza che la FIFO evicchi troppo presto. ~110 giri interi di respiro.
+    elite_memory = ReplayBuffer(200000)
 
     # Buffer EXPERT SEPARATO e PERMANENTE (dati umani): capacità > dataset così non viene
     # MAI svuotato dalla FIFO. Risolve la perdita dell'ancora BC e la rende presente in ogni batch.
@@ -287,6 +297,25 @@ def train():
     # Il filtro sul lap_time tiene solo i giri migliori del pilota: l'ancora deve puntare al suo best, non alla sua media.
     expert_lap_filter = args.expert_max_lap_time if args.expert_max_lap_time > 0 else None
     expert_memory.load_expert_data('train_set/laps', max_samples=350000, max_lap_time=expert_lap_filter)
+
+    # Semina dell'elite dai giri auto-registrati (train_set/laps_auto) per la self-imitation. Due trigger:
+    #  - ESPLICITO: --reseed_elite_max_lap_time S (semina coi giri <= S);
+    #  - AUTOMATICO (rete di sicurezza): se dopo il caricamento l'elite è AFFAMATO (< floor) — perché
+    #    starved o perché un salvataggio precedente era quasi vuoto — si semina da solo con una soglia di
+    #    default. Così la self-imitation non resta MAI a secco tra i restart, e le catture dei giri veloci
+    #    (eval/online) col tempo invecchiano ed espellono in FIFO i semi più lenti.
+    ELITE_STARVATION_FLOOR = 8000
+    DEFAULT_RESEED_LAP_TIME = 74.5
+    elite_loaded = len(elite_memory)
+    print(f"  [ELITE] {elite_loaded} transizioni caricate dal checkpoint.")
+    seed_cut = args.reseed_elite_max_lap_time
+    if seed_cut <= 0.0 and elite_loaded < ELITE_STARVATION_FLOOR:
+        seed_cut = DEFAULT_RESEED_LAP_TIME
+        print(f"  [ELITE] affamato (<{ELITE_STARVATION_FLOOR}): auto-semina di sicurezza dai giri auto <= {seed_cut}s.")
+    if seed_cut > 0.0:
+        n_before = len(elite_memory)
+        elite_memory.load_expert_data(LAPS_AUTO_DIR, max_samples=150000, max_lap_time=seed_cut)
+        print(f"  [ELITE SEED] {n_before} -> {len(elite_memory)} transizioni (giri auto <= {seed_cut:.1f}s).")
 
     agent.actor_frozen = False
 
@@ -774,10 +803,12 @@ def train():
                 # sensore lastLapTime (che lagga ~1 tick).
                 eval_prev_track_pos_m = eval_start_dist
                 eval_prev_cur_lap = float(np.array(eval_ob.get('curLapTime', 0.0)).flat[0])
+                eval_transitions = []  # transizioni del giro, per la cattura nell'elite se completato
 
                 agent.actor.eval()
                 while eval_step < args.max_steps:
                     eval_step += 1
+                    prev_eval_stacked = eval_stacked  # stato corrente PRIMA dello step (per la transizione)
                     with torch.no_grad():
                         eval_action = agent.select_action(eval_stacked, evaluate=True)
                     eval_env = np.zeros(4)
@@ -800,6 +831,8 @@ def train():
                     current_eval_dist = _track_progress_from_start(eval_start_dist, current_eval_track_pos_m)
                     eval_dist = max(eval_dist, current_eval_dist)
                     eval_cur_lap = float(np.array(eval_ob.get('curLapTime', 0.0)).flat[0])
+                    # Registra la transizione (per l'eventuale cattura nell'elite a giro completato)
+                    eval_transitions.append((prev_eval_stacked, eval_action.copy(), eval_r, eval_stacked, 1.0))
 
                     # Stop GEOMETRICO di fine giro: indipendente dal sensore lastLapTime (che si aggiorna con
                     # ~1 tick di ritardo, e il clamp della distanza maschererebbe uno sforamento nel 2° giro).
@@ -833,6 +866,17 @@ def train():
 
                     if eval_info.get('crash', False) or eval_done: break
                 agent.actor.train()
+
+                # Cattura del giro completo dell'eval nell'elite (self-imitation): se il giro è stato chiuso
+                # pulito, le sue transizioni deterministiche (la "linea pulita") entrano nell'elite marcate
+                # expert=1.0, come le iniezioni online. È la fonte di giri VELOCI per la self-imitation, che i
+                # giri auto-registrati (più lenti) non danno; man mano che la policy migliora, queste catture
+                # rimpiazzano in FIFO i semi lenti.
+                if eval_lap_completed and len(eval_transitions) > 0:
+                    for (s, a, r, ns, m) in eval_transitions:
+                        elite_memory.push(s, a, r, ns, m, expert=1.0)
+                    print(f"  [ELITE CAPTURE] Giro eval completo nell'elite: "
+                          f"+{len(eval_transitions)} transizioni (totale {len(elite_memory)}).")
 
                 if not _is_plausible_eval_dist(eval_dist):
                     _rlog(

@@ -248,13 +248,25 @@ traiettorie diverse da quelle umane senza essere penalizzato.
 
 **Campionamento ibrido a tre vie** (per ogni batch): 25% **expert** (umano), 15% **elite** (migliori
 run autonome), 60% **online** (esplorazione corrente). Se online/elite hanno pochi dati, la quota è
-compensata dall'expert (sempre disponibile).
+compensata dall'expert (sempre disponibile). Capacità: online **2M** (orizzonte ampio per non
+dimenticare troppo presto la storia recente), elite **200k**, expert 400k.
 
 Caratteristiche di stabilità (tutte preservate dal codice originale):
 - **Ancora progressiva**: il buffer expert è permanente (capacità 400k >> dataset) e filtrato sui
   *migliori* giri umani (`--expert_max_lap_time`), così l'ancora BC punta al best umano, non alla media.
-- **Elite gate**: un episodio entra nel buffer elite solo se la distanza percorsa supera il 70% del
-  record corrente; gli ultimi 50 step prima di un crash sono esclusi dall'imitazione (anti causal-confusion).
+- **Trust region** (`--trust_region`, default 0.15 nel launcher `td3`): MSE a peso FISSO tra azione
+  dell'Actor e azione del buffer sui campioni **non-expert** (il 75% dove l'unica forza sarebbe `max Q`,
+  che spingerebbe l'Actor fuori dal supporto dati su azioni con Q sovrastimato). Ancora l'Actor al
+  supporto dati e cura il collasso della policy deterministica quando l'Actor torna attivo.
+- **Ciclo dell'elite** (self-imitation, alimentato da tre fonti, così non resta mai affamato):
+  - *gate online*: un episodio entra nell'elite se la distanza supera il 70% del record corrente; gli
+    ultimi 50 step prima di un crash sono esclusi dall'imitazione (anti causal-confusion);
+  - *cattura eval*: ogni giro **completato** in valutazione deterministica (rilevato con stop geometrico
+    al riattraversamento del traguardo, indipendente dal lag del sensore `lastLapTime`) entra nell'elite —
+    è la fonte di giri *veloci* (la "linea pulita") che il recorder, fermo sui giri d'esplorazione più lenti, non dà;
+  - *semina* (`--reseed_elite_max_lap_time S`, + auto-semina di sicurezza se l'elite carica affamato):
+    inietta i giri auto-registrati ≤ S come bootstrap di **consistenza** quando la policy ne completa pochi.
+    I semi (più lenti) invecchiano ed escono in FIFO man mano che le catture veloci li rimpiazzano.
 - **Refinement FSM**: su plateau della valutazione, riduce il peso della BC e congela il Critic per
   raffinare l'Actor verso una value function fissa; con rollback su collasso e uscita su breakout.
 - **Warm-up**: l'Actor resta congelato finché il Critic non si stabilizza (15000 step), aggiornandosi
@@ -287,8 +299,13 @@ In `rl/reward.py`:
   riceve `+30 + 15·(secondi guadagnati)` oltre al bonus di completamento. È l'incentivo diretto a
   limare i tempi anche quando la distanza è ormai saturata a fine giro.
 - **Fase TIME-ATTACK** (`IM_TIME_ATTACK=1`): da attivare *dopo* aver raccolto abbastanza giri e
-  ri-addestrato la BC. Riduce l'ancoraggio alla BC (`bc_alpha` → 4.0, più peso al RL) e abbassa il
-  floor del rumore esplorativo (0.04 → 0.02) per la micro-ottimizzazione della traiettoria.
+  ri-addestrato la BC. Riduce l'ancoraggio alla BC (`bc_alpha` → 4.0, più peso al RL) e porta il rumore
+  esplorativo **diritto al floor 0.02**, senza annealing: su una policy già a convergenza l'annealing —
+  agganciato al numero *assoluto* di episodio — imporrebbe ancora ~0.065 dopo un resume a episodi bassi,
+  distruggendo la traiettoria alla prima curva veloce.
+- **Override del rumore** (`IM_EXPL_NOISE=<v>`): fissa `expl_noise` a un valore costante scavalcando
+  annealing e floor. Serve a forzare un rumore basso su una policy matura restando in `td3` standard
+  (default 0.04 nel launcher) senza passare per il time-attack, che alzerebbe anche `bc_alpha`.
 
 ---
 

@@ -94,6 +94,13 @@ Produce `train_set/checkpoints/bc_policy.pth` e `state_norm.npz` (background; se
 ./run.sh td3 --episodes 2500
 ```
 
+Il launcher `td3` applica i **default di stabilizzazione**: trust region `--trust_region 0.15` (ancora
+l'Actor al supporto dati sui campioni non-expert, anti-collasso della policy) e `IM_EXPL_NOISE=0.04`
+(rumore esplorativo fisso, scavalca l'annealing). Entrambi sovrascrivibili (es. `--trust_region 0`,
+`IM_EXPL_NOISE=0.02`). Per **seminare l'elite** coi giri auto-registrati e rompere la starvation della
+self-imitation: `--reseed_elite_max_lap_time 74.5` (esiste comunque un'auto-semina di sicurezza quando
+l'elite carica affamato). A regime l'elite si auto-alimenta catturando i giri completati in eval.
+
 Durante il training l'agente registra automaticamente i propri giri completi e puliti in
 `train_set/laps_auto/` (disattivabile con `IM_RECORD_LAPS=0`). Stop pulito: `./run.sh stop td3`
 (salva il checkpoint prima di uscire).
