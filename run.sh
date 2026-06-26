@@ -262,9 +262,12 @@ cmd_test()        { split_env_args "$@"; log "Valutazione deterministica (foregr
 cmd_bc()          { split_env_args "$@"; start_bg bc          env "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.bc.train_bc "${CMD_ARGS[@]}"; }
 cmd_bc_enriched() { split_env_args "$@"; start_bg bc-enriched env "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.bc.train_bc --auto_laps "$LAPS_AUTO_DIR" "${CMD_ARGS[@]}"; }
 # Default di STABILIZZAZIONE per il td3: trust region 0.3 (ancora l'Actor al supporto dati) e rumore
-# esplorativo fisso 0.04. Entrambi PRIMA di CMD_ENV/CMD_ARGS, così un IM_EXPL_NOISE=... o --trust_region ...
-# passato dall'utente (env e argparse: vince l'ultimo) li sovrascrive.
-cmd_td3()         { split_env_args "$@"; start_bg td3         env IM_WRAPPER_LOG_ONLY=1 IM_RECORD_LAPS=1 IM_EXPL_NOISE=0.04 "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.rl.train_rl --trust_region 0.3 "${CMD_ARGS[@]}"; }
+# esplorativo fisso 0.04. NESSUN filtro sui TEMPI: in stabilizzazione conta solo COMPLETARE il giro,
+# non la velocità, quindi si caricano TUTTI i giri umani (--expert_max_lap_time 0), si semina l'elite
+# con TUTTI i giri auto (--reseed_elite_max_lap_time 999) e si registra ogni giro pulito a prescindere
+# dal tempo (IM_RECORD_MAX_LAP_TIME=999). I filtri-velocità restano nel time-attack (cmd_time_attack).
+# Tutto PRIMA di CMD_ENV/CMD_ARGS, così un override passato a mano (env e argparse: vince l'ultimo) prevale.
+cmd_td3()         { split_env_args "$@"; start_bg td3         env IM_WRAPPER_LOG_ONLY=1 IM_RECORD_LAPS=1 IM_RECORD_MAX_LAP_TIME=999 IM_EXPL_NOISE=0.04 "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.rl.train_rl --trust_region 0.3 --expert_max_lap_time 0 --reseed_elite_max_lap_time 999 "${CMD_ARGS[@]}"; }
 cmd_rl()          { cmd_td3 "$@"; }
 cmd_time_attack() { split_env_args "$@"; start_bg time-attack env IM_WRAPPER_LOG_ONLY=1 IM_TIME_ATTACK=1 IM_RECORD_LAPS=1 "${CMD_ENV[@]}" "$PYTHON" -u -m iterative_motors.rl.train_rl "${CMD_ARGS[@]}"; }
 
@@ -374,7 +377,7 @@ menu_prompt_args() {
             if [ "$label" = "time-attack" ]; then
                 default_note="Default time-attack: episodes=1000, max_steps=5000, seed=42, auto-refine attivo, registra giri auto <=80s, noise floor/time-attack attivi, pressione tempo + reward a settori (IM_TA_SECTORS/_K/_CAP), corridoio ridotto, headless salvo SHOW_GUI=1."
             else
-                default_note="Default TD3 (stabilizzazione): episodes=1000, max_steps=5000, seed=42, trust_region=0.3 + IM_EXPL_NOISE=0.04, penalità di corridoio attiva (IM_MARGIN_PENALTY=12) + completamento piatto (no pressione tempo), auto-refine attivo, no rollback/refine immediato, registra giri auto <=80s, headless salvo SHOW_GUI=1."
+                default_note="Default TD3 (stabilizzazione): episodes=1000, max_steps=5000, seed=42, trust_region=0.3 + IM_EXPL_NOISE=0.04, penalità di corridoio attiva (IM_MARGIN_PENALTY=12) + completamento piatto (no pressione tempo), NESSUN filtro sui tempi (carica tutti i giri umani+auto, registra ogni giro pulito), auto-refine attivo, headless salvo SHOW_GUI=1."
             fi
             ;;
         test)
