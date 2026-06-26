@@ -254,8 +254,10 @@ compensata dall'expert (sempre disponibile). Capacità: online **2M** (orizzonte
 dimenticare troppo presto la storia recente), elite **200k**, expert 400k.
 
 Caratteristiche di stabilità (tutte preservate dal codice originale):
-- **Ancora progressiva**: il buffer expert è permanente (capacità 400k >> dataset) e filtrato sui
-  *migliori* giri umani (`--expert_max_lap_time`), così l'ancora BC punta al best umano, non alla media.
+- **Ancora progressiva**: il buffer expert è permanente (capacità 400k >> dataset). Il filtro
+  `--expert_max_lap_time` è *dipendente dalla fase*: in **time-attack** tiene solo i *migliori* giri
+  umani (≤71s) così l'ancora BC punta al best umano; in **stabilizzazione** (launcher `td3`) è
+  disattivato (`0`) per caricare TUTTI i giri umani — lì conta completare, non la velocità (vedi §7).
 - **Trust region** (`--trust_region`, default 0.3 nel launcher `td3`): MSE a peso FISSO tra azione
   dell'Actor e azione del buffer sui campioni **non-expert** (il 75% dove l'unica forza sarebbe `max Q`,
   che spingerebbe l'Actor fuori dal supporto dati su azioni con Q sovrastimato). Ancora l'Actor al
@@ -304,7 +306,8 @@ brake, gear]`). A fine episodio salva il giro in `train_set/laps_auto/lap_auto_N
 
 - il giro è stato **completato** (SUCCESS, non crash/incompleto);
 - è **pulito** (`max|trackPos| ≤ on_track_limit`, default 1.0 = mai fuori pista);
-- è abbastanza **veloce** (`lap_time ≤` soglia, default 80s, `IM_RECORD_MAX_LAP_TIME`);
+- rientra nella soglia di tempo `IM_RECORD_MAX_LAP_TIME` (default 80s; il launcher `td3` la alza a
+  `999` = nessun filtro-tempo in stabilizzazione, così si raccoglie ogni giro pulito anche se lento);
 - ha lunghezza minima e nessun valore NaN/Inf.
 
 Il formato HDF5 è **identico** a quello dei giri umani (dataset `states`/`actions`/`dist_from_start`
@@ -405,7 +408,7 @@ gli entrypoint di training intercettano per salvare un checkpoint completo prima
 | Dove | Nome | Default | Significato |
 |---|---|---|---|
 | env | `IM_RECORD_LAPS` | 1 | abilita il lap recorder durante il training |
-| env | `IM_RECORD_MAX_LAP_TIME` | 80.0 | soglia tempo (s) per salvare un giro auto |
+| env | `IM_RECORD_MAX_LAP_TIME` | 80.0 | soglia tempo (s) per salvare un giro auto (il launcher `td3` la alza a 999 = nessun filtro) |
 | env | `IM_TIME_ATTACK` | 0 | attiva la fase time-attack (pressione tempo + reward a settori) |
 | env | `IM_MARGIN_PENALTY` | 12.0 / 3.0 | coef. penalità di corridoio (stabilizz. / time-attack; 0 = off) |
 | env | `IM_TA_SECTORS` | 18 | numero di settori per la reward telemetrica (time-attack) |
@@ -415,8 +418,9 @@ gli entrypoint di training intercettano per salvare un checkpoint completo prima
 | env | `TORCS_KILL_ALL` | 1 | kill globale di TORCS (workaround memory leak) |
 | env | `SHOW_GUI` | 0 | mostra la finestra TORCS invece di Xvfb headless |
 | rl | `--episodes` | 1000 | episodio finale (deve superare quello di resume) |
-| rl | `--bc_alpha` | 2.5 | bilanciamento RL/BC |
-| rl | `--expert_max_lap_time` | 71.0 | filtro qualità dell'ancora BC |
+| rl | `--bc_alpha` | 2.5 | bilanciamento RL/BC (il time-attack lo alza a 4.0) |
+| rl | `--expert_max_lap_time` | 71.0 | filtro qualità dell'ancora BC; `≤0` = off. Il launcher `td3` lo mette a 0 (carica tutti i giri umani) |
+| rl | `--reseed_elite_max_lap_time` | 0 | semina elite coi giri auto ≤ soglia (0 = off); il launcher `td3` lo mette a 999 = tutti |
 | bc | `--auto_laps DIR` | — | directory dei giri auto per l'arricchimento |
 | bc | `--epochs / --batch_size / --lr` | 300 / 256 / 3e-4 | iperparametri di training |
 

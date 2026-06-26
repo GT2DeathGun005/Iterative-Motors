@@ -99,12 +99,15 @@ Produce `train_set/checkpoints/bc_policy.pth` e `state_norm.npz` (background; se
 Il launcher `td3` applica i **default di stabilizzazione**: trust region `--trust_region 0.3` (ancora
 l'Actor al supporto dati sui campioni non-expert, anti-collasso della policy) e `IM_EXPL_NOISE=0.04`
 (rumore esplorativo fisso, scavalca l'annealing). Entrambi sovrascrivibili (es. `--trust_region 0`,
-`IM_EXPL_NOISE=0.02`). Per **seminare l'elite** coi giri auto-registrati e rompere la starvation della
-self-imitation: `--reseed_elite_max_lap_time 74.5` (esiste comunque un'auto-semina di sicurezza quando
-l'elite carica affamato). A regime l'elite si auto-alimenta catturando i giri completati in eval.
+`IM_EXPL_NOISE=0.02`).
 
-In questa fase la reward privilegia il **completamento robusto**: penalità di corridoio (margine dal
-bordo, `IM_MARGIN_PENALTY`) e bonus di completamento *piatto* (niente pressione sul tempo, riservata al
+**Nessun filtro sui tempi** in questa fase: conta solo *completare* il giro, non la velocità. Il
+launcher carica quindi TUTTI i giri umani (`--expert_max_lap_time 0`), semina l'elite con TUTTI i giri
+auto (`--reseed_elite_max_lap_time 999`) e registra ogni giro pulito a prescindere dal tempo
+(`IM_RECORD_MAX_LAP_TIME=999`). I filtri-velocità tornano automaticamente nel time-attack.
+
+La reward privilegia il **completamento robusto**: penalità di corridoio (margine dal bordo,
+`IM_MARGIN_PENALTY`) e bonus di completamento *piatto* (niente pressione sul tempo, riservata al
 time-attack). Tieni `--capture_eval_elite` **spento**: self-imitare la linea-rasoio dell'eval sovra-affila
 la policy, l'opposto di quello che serve per stabilizzare (vedi §7 di ARCHITECTURE.md).
 

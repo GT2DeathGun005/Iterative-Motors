@@ -534,7 +534,8 @@ def train():
     # ── Fase TIME-ATTACK (opt-in via IM_TIME_ATTACK=1) ────────────────────────
     # Da attivare DOPO aver raccolto abbastanza giri completi e riaddestrato la BC: riduce
     # l'ancoraggio alla BC (alpha più alto) e abbassa il floor del rumore esplorativo per
-    # limare i tempi. Il bonus di record personale è invece sempre attivo (vedi blocco SUCCESS).
+    # limare i tempi. La pressione sul tempo (bonus proporzionale + record personale) è applicata
+    # SOLO in time-attack (vedi blocco SUCCESS); in stabilizzazione il completamento è piatto.
     noise_floor = TIME_ATTACK_NOISE_FLOOR if time_attack else EXPL_NOISE_END
     if time_attack:
         agent.bc_alpha = TIME_ATTACK_BC_ALPHA
