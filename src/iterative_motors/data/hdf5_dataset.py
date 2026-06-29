@@ -1,8 +1,8 @@
-"""Dataset HDF5 per la Behavioral Cloning, con frame stacking temporale.
+"""HDF5 dataset for Behavioral Cloning, with temporal frame stacking.
 
-Carica i giri umani (``lap_[0-9]*.h5``, esclusi i segmenti ``lap_seg_*``) e, in modo
-opzionale, i giri auto-raccolti dalla TD3 (``extra_dirs``, es. ``train_set/laps_auto``)
-per il riaddestramento arricchito della BC.
+Loads the human laps (``lap_[0-9]*.h5``, excluding the ``lap_seg_*`` segments) and, optionally,
+the laps self-recorded by the TD3 agent (``extra_dirs``, e.g. ``train_set/laps_auto``) for the
+enriched BC retraining.
 """
 
 import os
@@ -17,19 +17,19 @@ from ..common.constants import FRAME_STRIDE_K
 
 
 class TorcsHDF5Dataset(Dataset):
-    """Dataset PyTorch su un singolo file HDF5 di un giro, con frame stacking temporale.
+    """PyTorch dataset over a single lap HDF5 file, with temporal frame stacking.
 
-    Caratteristiche:
-      - Frame stacking di 3 frame distanziati di ``FRAME_STRIDE_K`` (=6, cioè 0.12s a 50Hz):
-        ``__getitem__`` restituisce la concatenazione degli stati ai tempi (t-12, t-6, t), portando
-        lo stato da 29D a 87D. Questo rende il modello consapevole della dinamica della vettura
-        (velocità e accelerazione implicite), aiutandolo a prevedere la traiettoria futura.
-      - Sanity check all'inizializzazione: verifica la presenza dei dataset ``states`` e ``actions``
-        e l'assenza di valori NaN/Inf. È deliberato: dati non validi nel training provocherebbero
-        instabilità o collasso della policy, quindi è meglio fallire subito con un errore chiaro.
+    Features:
+      - Frame stacking of 3 frames spaced ``FRAME_STRIDE_K`` apart (=6, i.e. 0.12s at 50Hz):
+        ``__getitem__`` returns the concatenation of the states at times (t-12, t-6, t), bringing
+        the state from 29D to 87D. This makes the model aware of the car dynamics (implicit speed
+        and acceleration), helping it predict the future trajectory.
+      - Sanity check at initialization: verifies the presence of the ``states`` and ``actions``
+        datasets and the absence of NaN/Inf values. It is deliberate: invalid data in training would
+        cause instability or policy collapse, so it is better to fail immediately with a clear error.
 
-    Gli stati su disco sono grezzi (raw-scaled, NON z-scored): la normalizzazione viene applicata a
-    valle dal trainer dopo l'eventuale data augmentation.
+    The states on disk are raw (raw-scaled, NOT z-scored): normalization is applied downstream by
+    the trainer after any data augmentation.
     """
 
     def __init__(self, file_path: str):
@@ -77,14 +77,14 @@ class TorcsHDF5Dataset(Dataset):
 
 
 def load_dataset(path: str, extra_dirs=None):
-    """Carica i giri completi da ``path`` (e da ``extra_dirs``) in un unico dataset concatenato.
+    """Loads the complete laps from ``path`` (and from ``extra_dirs``) into a single concatenated dataset.
 
-    - ``path``: directory dei giri umani (glob ``lap_[0-9]*.h5``, esclude i segmenti) o un
-      singolo file ``.h5``.
-    - ``extra_dirs``: lista opzionale di directory aggiuntive (es. ``train_set/laps_auto``)
-      da cui caricare i giri ``lap_*.h5`` per l'arricchimento del dataset BC.
+    - ``path``: directory of the human laps (glob ``lap_[0-9]*.h5``, excludes the segments) or a
+      single ``.h5`` file.
+    - ``extra_dirs``: optional list of additional directories (e.g. ``train_set/laps_auto``) from
+      which to load the ``lap_*.h5`` laps for BC dataset enrichment.
 
-    Ritorna (dataset, num_campioni_totali).
+    Returns (dataset, total_num_samples).
     """
     if os.path.isdir(path):
         h5_files = sorted(glob.glob(os.path.join(path, "**/lap_[0-9]*.h5"), recursive=True))
@@ -93,7 +93,7 @@ def load_dataset(path: str, extra_dirs=None):
                 f"Nessun file lap_[0-9]*.h5 (giro intero) trovato in {path} o nelle sue sottocartelle"
             )
 
-        # Giri aggiuntivi auto-raccolti (es. laps_auto/lap_auto_*.h5 e lap_*.h5).
+        # Additional self-recorded laps (e.g. laps_auto/lap_auto_*.h5 and lap_*.h5).
         for extra in (extra_dirs or []):
             if extra and os.path.isdir(extra):
                 extra_files = sorted(glob.glob(os.path.join(extra, "**/lap_*.h5"), recursive=True))

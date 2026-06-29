@@ -1,16 +1,16 @@
-"""Rappresentazione dello stato: flatten dei sensori, normalizzazione, frame stacking.
+"""State representation: sensor flattening, normalization, frame stacking.
 
-Confine z-score (importante): gli HDF5 dei giri contengono stati **raw-scaled, NON
-normalizzati**. Per questo lo stato ha due forme:
+z-score boundary (important): the lap HDF5 files contain **raw-scaled, NOT normalized** states.
+For this reason the state has two forms:
 
-  - ``flatten_state_raw(obs)``  -> vettore 29D grezzo (track/200, speed/50 già fatti dal
-    wrapper; qui in più wheelSpinVel/100 e rpm/10000). È la forma scritta su disco dai
-    giri umani (data_collection) e dal lap recorder.
-  - ``flatten_state_norm(obs)`` -> ``apply_state_norm(flatten_state_raw(obs))``, la forma
-    z-scored data in pasto alla rete durante RL/eval.
+  - ``flatten_state_raw(obs)``  -> raw 29D vector (track/200, speed/50 already done by the
+    wrapper; here additionally wheelSpinVel/100 and rpm/10000). It is the form written to disk by
+    the human laps (data_collection) and by the lap recorder.
+  - ``flatten_state_norm(obs)`` -> ``apply_state_norm(flatten_state_raw(obs))``, the z-scored form
+    fed to the network during RL/eval.
 
-Le statistiche (mean/std) vivono in ``state_norm.npz`` e sono caricate all'import;
-``reload_state_norm()`` permette di ricaricarle dopo un ricalcolo (Step enrichment).
+The statistics (mean/std) live in ``state_norm.npz`` and are loaded at import;
+``reload_state_norm()`` allows reloading them after a recompute (enrichment step).
 """
 
 from collections import deque
@@ -19,13 +19,13 @@ import numpy as np
 
 from .constants import STATE_NORM_PATH, STATE_DIM, STACK_LEN, FRAME_STRIDE_K
 
-# Statistiche di normalizzazione caricate a livello di modulo (mean-0/std-1).
+# Normalization statistics loaded at module level (mean-0/std-1).
 _STATE_MEAN = None
 _STATE_STD = None
 
 
 def load_state_norm(path=STATE_NORM_PATH):
-    """Legge (mean, std) da ``state_norm.npz``; ritorna (None, None) se assente."""
+    """Reads (mean, std) from ``state_norm.npz``; returns (None, None) if absent."""
     import os
     if os.path.exists(path):
         d = np.load(path)
@@ -34,29 +34,29 @@ def load_state_norm(path=STATE_NORM_PATH):
 
 
 def reload_state_norm(path=STATE_NORM_PATH):
-    """Ricarica le statistiche dal disco aggiornando lo stato del modulo."""
+    """Reloads the statistics from disk, updating the module state."""
     global _STATE_MEAN, _STATE_STD
     _STATE_MEAN, _STATE_STD = load_state_norm(path)
     return _STATE_MEAN, _STATE_STD
 
 
 def save_state_norm(mean, std, path=STATE_NORM_PATH):
-    """Salva le statistiche di normalizzazione e aggiorna lo stato del modulo."""
+    """Saves the normalization statistics and updates the module state."""
     import os
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     np.savez(path, mean=np.asarray(mean, dtype=np.float32), std=np.asarray(std, dtype=np.float32))
     reload_state_norm(path)
 
 
-# Caricamento all'import (coerente col comportamento storico dei monoliti).
+# Load at import (consistent with the historical behaviour of the monoliths).
 reload_state_norm()
 
 
 def apply_state_norm(s):
-    """Standardizza un vettore di stato grezzo: ``(s - mean) / (std + 1e-3)``.
+    """Standardizes a raw state vector: ``(s - mean) / (std + 1e-3)``.
 
-    Se le statistiche non sono caricate restituisce il vettore invariato (no-op).
-    L'epsilon 1e-3 evita divisioni per zero su sensori statici.
+    If the statistics are not loaded it returns the vector unchanged (no-op).
+    The 1e-3 epsilon avoids divisions by zero on static sensors.
     """
     if _STATE_MEAN is None:
         return s
@@ -64,11 +64,11 @@ def apply_state_norm(s):
 
 
 def flatten_state_raw(state_dict: dict) -> np.ndarray:
-    """Appiattisce il dizionario di osservazione TORCS nel vettore 29D **grezzo**.
+    """Flattens the TORCS observation dictionary into the **raw** 29D vector.
 
-    Ordine: [angle(1), track(19), trackPos(1), speedX(1), speedY(1), speedZ(1),
-             wheelSpinVel(4)/100, rpm(1)/10000]. distFromStart NON fa parte dello
-            stato (la policy deve guidare dai soli sensori).
+    Order: [angle(1), track(19), trackPos(1), speedX(1), speedY(1), speedZ(1),
+            wheelSpinVel(4)/100, rpm(1)/10000]. distFromStart is NOT part of the
+            state (the policy must drive from the sensors only).
     """
     def _scalar(key: str, default: float = 0.0) -> float:
         val = state_dict.get(key, default)
@@ -107,15 +107,15 @@ def flatten_state_raw(state_dict: dict) -> np.ndarray:
 
 
 def flatten_state_norm(state_dict: dict) -> np.ndarray:
-    """Vettore 29D normalizzato (z-score) per l'inferenza della rete."""
+    """Normalized (z-score) 29D vector for network inference."""
     return apply_state_norm(flatten_state_raw(state_dict))
 
 
 class FrameStacker:
-    """Buffer scorrevole che impila 3 frame distanziati nel tempo (t-12, t-6, t).
+    """Sliding buffer that stacks 3 time-spaced frames (t-12, t-6, t).
 
-    Riproduce ``deque([f]*STACK_LEN, maxlen=STACK_LEN)`` con concatenazione degli
-    indici 0, FRAME_STRIDE_K, 2*FRAME_STRIDE_K.
+    Reproduces ``deque([f]*STACK_LEN, maxlen=STACK_LEN)`` with concatenation of indices
+    0, FRAME_STRIDE_K, 2*FRAME_STRIDE_K.
     """
 
     def __init__(self, init_frame: np.ndarray):

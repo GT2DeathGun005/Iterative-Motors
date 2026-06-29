@@ -1,12 +1,12 @@
-"""Registratore dei giri guidati dalla TD3 in esplorazione, per arricchire il dataset BC.
+"""Recorder of the laps driven by the TD3 agent during exploration, to enrich the BC dataset.
 
-Cattura, per ogni step, lo stato grezzo 29D (``flatten_state_raw``, NON normalizzato come
-gli HDF5 umani) e l'azione *realmente eseguita* su TORCS (``torcs_action`` =
-[steer, accel applicato, brake, gear algoritmico]). A fine giro, se il giro è completo,
-pulito (mai oltre ``on_track_limit`` di trackPos) e abbastanza veloce, scrive un file HDF5
-nello stesso formato di ``data_collection`` dentro ``train_set/laps_auto/``.
+For each step it captures the raw 29D state (``flatten_state_raw``, NOT normalized like the human
+HDF5 files) and the action *actually executed* on TORCS (``torcs_action`` =
+[steer, applied accel, brake, algorithmic gear]). At the end of a lap, if the lap is complete,
+clean (never beyond ``on_track_limit`` of trackPos) and fast enough, it writes an HDF5 file in the
+same format as ``data_collection`` into ``train_set/laps_auto/``.
 
-Così i giri buoni dell'agente rientrano nel riaddestramento della BC (flywheel dati).
+This way the agent's good laps feed back into the BC retraining (data flywheel).
 """
 
 import os
@@ -30,7 +30,7 @@ def _scalar(obs, key, default=0.0):
 
 
 class LapRecorder:
-    """Accumula i giri dell'agente e ne salva solo quelli completi/puliti/veloci in HDF5."""
+    """Accumulates the agent's laps and saves only the complete/clean/fast ones to HDF5."""
 
     def __init__(self, out_dir, max_lap_time=80.0, on_track_limit=1.0, min_steps=500, enabled=True):
         self.out_dir = out_dir
@@ -50,11 +50,11 @@ class LapRecorder:
         self._max_abs_tp = 0.0
 
     def start_episode(self):
-        """Azzera il buffer del giro corrente (da chiamare a ogni reset dell'ambiente)."""
+        """Clears the current-lap buffer (to be called at every environment reset)."""
         self._reset()
 
     def record_step(self, raw_obs, executed_action):
-        """Registra uno step: stato grezzo (pre-step) + azione 4D eseguita su TORCS."""
+        """Records a step: raw state (pre-step) + 4D action executed on TORCS."""
         if not self.enabled:
             return
         self._states.append(flatten_state_raw(raw_obs))
@@ -63,11 +63,11 @@ class LapRecorder:
         self._max_abs_tp = max(self._max_abs_tp, abs(_scalar(raw_obs, 'trackPos')))
 
     def discard(self):
-        """Scarta il giro corrente (episodio non completato o sporco)."""
+        """Discards the current lap (episode not completed or dirty)."""
         self._reset()
 
     def set_gate(self, max_lap_time=None, on_track_limit=None):
-        """Aggiorna dinamicamente la soglia di qualità (es. stringere col PB in time-attack)."""
+        """Dynamically updates the quality threshold (e.g. tighten with the PB in time-attack)."""
         if max_lap_time is not None:
             self.max_lap_time = float(max_lap_time)
         if on_track_limit is not None:
@@ -76,13 +76,13 @@ class LapRecorder:
     def _next_path(self):
         existing = glob.glob(os.path.join(self.out_dir, "lap_auto_*.h5"))
         idx = len(existing) + 1
-        # Evita collisioni se la numerazione è frammentata.
+        # Avoid collisions if the numbering is fragmented.
         while os.path.exists(os.path.join(self.out_dir, f"lap_auto_{idx:04d}.h5")):
             idx += 1
         return os.path.join(self.out_dir, f"lap_auto_{idx:04d}.h5")
 
     def finish_lap(self, lap_time, phase="online", episode=-1, global_step=-1):
-        """Valuta il quality gate e, se passato, salva il giro in HDF5. Ritorna True se salvato."""
+        """Evaluates the quality gate and, if passed, saves the lap to HDF5. Returns True if saved."""
         if not self.enabled:
             self._reset()
             return False

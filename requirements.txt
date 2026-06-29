@@ -1,0 +1,19 @@
+# Iterative Motors — Python dependencies (tested versions, Python 3.13)
+#
+# Install:
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# GPU note: torch is pinned to the base version. For CUDA, install the matching build
+# from the official PyTorch index, e.g.:
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+#
+# System dependencies (NOT installable via pip — see README):
+#   TORCS with the SCR server patch, xvfb (headless rendering), xte (xautomation, autostart)
+#   On Debian/Ubuntu:  sudo apt install torcs xvfb xautomation
+
+numpy==2.3.5
+torch==2.5.1
+h5py==3.16.0
+pygame==2.6.1
+gym==0.26.2

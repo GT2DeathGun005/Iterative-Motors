@@ -1,10 +1,10 @@
-"""Replay buffer per il training off-policy TD3+BC e caricamento dei dati esperti.
+"""Replay buffer for off-policy TD3+BC training and loading of expert data.
 
-Memorizza transizioni (stato 87D stacked, azione 3D, reward, next_state, done) con un
-flag ``expert`` parallelo che marca i campioni umani (=1.0) vs autonomi (=0.0), usato
-per applicare la BC Penalty solo sui campioni esperti. ``load_expert_data`` legge gli
-HDF5 (umani e/o auto-raccolti), normalizza, applica lo stacking temporale e ricalcola
-il reward con la stessa formula di gym_torcs.
+Stores transitions (87D stacked state, 3D action, reward, next_state, done) with a parallel
+``expert`` flag marking the human samples (=1.0) vs autonomous ones (=0.0), used to apply the
+BC Penalty only to expert samples. ``load_expert_data`` reads the HDF5 files (human and/or
+self-recorded), normalizes, applies temporal stacking and recomputes the reward with the same
+formula as gym_torcs.
 """
 
 import os
@@ -17,17 +17,17 @@ from ..common.constants import FRAME_STRIDE_K
 
 
 class ReplayBuffer:
-    """Buffer di memorizzazione delle transizioni per l'addestramento off-policy.
+    """Transition-storage buffer for off-policy training.
 
-    Memorizza le esperienze come tuple ``(stato, azione, reward, stato_successivo, done)`` in una
-    coda circolare FIFO: superata la capacità, il campione più vecchio viene scartato. In parallelo
-    mantiene una maschera ``expert`` che marca ogni transizione come proveniente dal pilota umano
-    (``1.0``) o raccolta in autonomia dall'agente (``0.0``). Questo marcatore è fondamentale perché
-    la BC penalty del TD3+BC viene calcolata ESCLUSIVAMENTE sui campioni esperti, lasciando l'agente
-    libero di esplorare traiettorie diverse da quelle umane senza essere penalizzato.
+    Stores experiences as ``(state, action, reward, next_state, done)`` tuples in a FIFO circular
+    queue: once capacity is exceeded, the oldest sample is dropped. In parallel it keeps an
+    ``expert`` mask marking each transition as coming from the human driver (``1.0``) or collected
+    autonomously by the agent (``0.0``). This marker is essential because the TD3+BC BC penalty is
+    computed EXCLUSIVELY on expert samples, leaving the agent free to explore trajectories different
+    from the human ones without being penalized.
 
-    Il progetto usa tre istanze distinte di questo buffer (campionamento ibrido a tre vie):
-    expert (dati umani, permanente), elite (migliori run autonome) e online (esplorazione corrente).
+    The project uses three distinct instances of this buffer (three-way hybrid sampling):
+    expert (human data, permanent), elite (best autonomous runs) and online (current exploration).
     """
 
     def __init__(self, capacity: int):
@@ -35,12 +35,12 @@ class ReplayBuffer:
         self.expert_masks = deque(maxlen=capacity)
 
     def push(self, state, action, reward, next_state, done, expert=0.0):
-        """Inserisce una transizione; oltre la capacità rimuove la più vecchia (FIFO)."""
+        """Inserts a transition; beyond capacity removes the oldest (FIFO)."""
         self.buffer.append((state, action, reward, next_state, done))
         self.expert_masks.append(expert)
 
     def sample(self, batch_size: int):
-        """Estrae un batch casuale: (state, action, reward, next_state, done, expert_mask)."""
+        """Draws a random batch: (state, action, reward, next_state, done, expert_mask)."""
         indices = np.random.choice(len(self.buffer), batch_size, replace=False)
         batch = [self.buffer[i] for i in indices]
         expert_masks_batch = [self.expert_masks[i] for i in indices]
@@ -48,7 +48,7 @@ class ReplayBuffer:
         return state, action, reward, next_state, done, np.array(expert_masks_batch, dtype=np.float32)
 
     def save(self, filepath: str):
-        """Salva il buffer su .npz compresso per resume/riavvio del training."""
+        """Saves the buffer to a compressed .npz for training resume/restart."""
         if len(self.buffer) == 0:
             return
         states, actions, rewards, next_states, dones = zip(*self.buffer)
@@ -61,15 +61,15 @@ class ReplayBuffer:
             expert_masks=np.array(list(self.expert_masks), dtype=np.float32))
 
     def load_expert_data(self, h5_dir_or_file, max_samples: int = None, max_lap_time: float = None):
-        """Carica i giri HDF5 (umani/auto), normalizza, fa stacking e ricalcola il reward.
+        """Loads the HDF5 laps (human/auto), normalizes, stacks and recomputes the reward.
 
-        - ``max_lap_time``: scarta i file con attributo ``lap_time`` oltre la soglia (alza
-          l'ancora BC verso i giri migliori, non la media).
-        - Stacking temporale t-12, t-6, t (stride ``FRAME_STRIDE_K``) per gli stati 87D.
-        - Azione esperto accel/freno mappata da [0,1] (Sigmoid) a [-1,1] (Tanh).
-        - Reward ricalcolato con la formula di gym_torcs; campioni marcati expert=1.0.
+        - ``max_lap_time``: discards files with a ``lap_time`` attribute above the threshold (raises
+          the BC anchor toward the best laps, not the average).
+        - Temporal stacking t-12, t-6, t (stride ``FRAME_STRIDE_K``) for the 87D states.
+        - Expert throttle/brake action mapped from [0,1] (Sigmoid) to [-1,1] (Tanh).
+        - Reward recomputed with the gym_torcs formula; samples marked expert=1.0.
 
-        Accetta una directory (carica ricorsivamente ``lap_*.h5``) o un singolo file.
+        Accepts a directory (loads ``lap_*.h5`` recursively) or a single file.
         """
         import glob
         import h5py
@@ -137,7 +137,7 @@ class ReplayBuffer:
         print(f"  [EXPERT INJECTION] Caricati {loaded} campioni esperti nel Replay Buffer.{filtro_msg}")
 
     def load(self, filepath: str):
-        """Carica le transizioni da un .npz nel buffer in memoria."""
+        """Loads transitions from a .npz into the in-memory buffer."""
         if not os.path.exists(filepath):
             return
         with np.load(filepath) as data:

@@ -1,9 +1,9 @@
-"""Agente TD3+BC: Actor + Twin Critic, update ibrida RL/BC, checkpoint con resume robusto.
+"""TD3+BC agent: Actor + Twin Critic, hybrid RL/BC update, checkpoint with robust resume.
 
-Implementa Twin Critic, Delayed Policy Update, Target Policy Smoothing e Polyak averaging
-(Fujimoto et al. 2018) con la BC Penalty mascherata sui soli campioni esperti e la
-normalizzazione λ del TD3+BC (Fujimoto & Gu 2021). Gli attributi ``refine_mode``,
-``actor_frozen`` e ``refine_bc_weight`` sono controllati dal training loop (curriculum/refinement).
+Implements Twin Critic, Delayed Policy Update, Target Policy Smoothing and Polyak averaging
+(Fujimoto et al. 2018) with the BC Penalty masked on expert samples only and the TD3+BC λ
+normalization (Fujimoto & Gu 2021). The ``refine_mode``, ``actor_frozen`` and ``refine_bc_weight``
+attributes are controlled by the training loop (curriculum/refinement).
 """
 
 import os
@@ -20,105 +20,105 @@ from ..common.constants import TRACK_LENGTH_M
 from ..common.checkpoint import safe_save, safe_save_npz, safe_read_float, _checkpoint_candidates
 from .reward import _is_plausible_eval_dist, _is_plausible_eval_score
 
-# Rumore esplorativo iniziale (annealato dal training loop da 0.10 a 0.04).
+# Initial exploration noise (annealed by the training loop from 0.10 to 0.04).
 _EXPL_NOISE_START = 0.10
 
 
 class TD3BCAgent:
-    """Agente TD3+BC: coordina i modelli neurali e l'intero ciclo di ottimizzazione.
+    """TD3+BC agent: coordinates the neural models and the whole optimization cycle.
 
-    Implementa il TD3 (Fujimoto et al. 2018) con il vincolo di Behavioral Cloning del TD3+BC
-    (Fujimoto & Gu 2021). Gestisce l'interazione tra Actor e Twin Critic attraverso i passaggi:
+    Implements TD3 (Fujimoto et al. 2018) with the Behavioral Cloning constraint of TD3+BC
+    (Fujimoto & Gu 2021). It manages the interaction between Actor and Twin Critic through the steps:
 
-      - Selezione delle azioni, con o senza rumore esplorativo gaussiano (``select_action``).
-      - Ottimizzazione del Critic minimizzando l'errore di differenza temporale (TD error), cioè
-        la discrepanza tra la stima Q corrente e il target di Bellman calcolato con le reti target.
-      - Ottimizzazione dell'Actor minimizzando la loss ibrida ``-λ·Q(s,π(s)) + BC_penalty``, dove
-        la BC penalty è applicata SOLO ai campioni esperti (mascheramento rigoroso).
-      - Stabilizzazione tramite Polyak averaging (soft update delle reti target con tasso τ).
-      - Gestione degli stati speciali del curriculum: warm-up del Critic, congelamento temporaneo
-        dell'Actor dopo un rollback, e modalità di refinement (vincolo BC ridotto, Critic fermo).
+      - Action selection, with or without Gaussian exploration noise (``select_action``).
+      - Critic optimization by minimizing the temporal-difference error (TD error), i.e. the
+        discrepancy between the current Q estimate and the Bellman target computed with the target nets.
+      - Actor optimization by minimizing the hybrid loss ``-λ·Q(s,π(s)) + BC_penalty``, where the
+        BC penalty is applied ONLY to expert samples (strict masking).
+      - Stabilization via Polyak averaging (soft update of the target nets with rate τ).
+      - Handling of the special curriculum states: Critic warm-up, temporary Actor freeze after a
+        rollback, and refinement mode (reduced BC constraint, Critic stopped).
 
-    Gli attributi ``refine_mode``, ``actor_frozen`` e ``refine_bc_weight`` sono pilotati dal
-    training loop (refinement/curriculum); qui hanno default robusti.
+    The ``refine_mode``, ``actor_frozen`` and ``refine_bc_weight`` attributes are driven by the
+    training loop (refinement/curriculum); here they have robust defaults.
     """
 
     def __init__(self, device="cuda"):
         self.device = torch.device(device)
-        self.gamma = 0.99   # Fattore di sconto temporale per il calcolo del valore Q futuro
-        self.tau = 0.005    # Parametro per l'aggiornamento soft Polyak delle reti target
-        self.policy_freq = 2  # Frequenza aggiornamento Actor vs Critic (Delayed Policy Update)
-        self.expl_noise = _EXPL_NOISE_START  # std rumore esplorativo, annealata dal training loop
-        self.bc_alpha = 2.5  # alpha TD3+BC: piu' alto = piu' peso al RL rispetto alla BC
-        # Peso della trust region verso le azioni del buffer sui campioni non-expert (0 = off).
-        # Impostato dal training loop via --trust_region; cura il collasso dell'Actor post-attivazione.
+        self.gamma = 0.99   # Temporal discount factor for computing the future Q value
+        self.tau = 0.005    # Parameter for the Polyak soft update of the target nets
+        self.policy_freq = 2  # Actor-vs-Critic update frequency (Delayed Policy Update)
+        self.expl_noise = _EXPL_NOISE_START  # exploration noise std, annealed by the training loop
+        self.bc_alpha = 2.5  # TD3+BC alpha: higher = more weight to RL relative to BC
+        # Trust-region weight toward the buffer actions on non-expert samples (0 = off).
+        # Set by the training loop via --trust_region; cures Actor collapse after re-activation.
         self.trust_region_weight = 0.0
 
-        # Stato del curriculum/refinement (impostato dal training loop; default robusti).
+        # Curriculum/refinement state (set by the training loop; robust defaults).
         self.refine_mode = False
         self.actor_frozen = False
         self.refine_bc_weight = 0.3
 
-        # Inizializzazione Actor (online e target)
+        # Actor initialization (online and target)
         self.actor = Actor().to(self.device)
         self.actor_target = Actor().to(self.device)
         self.actor_target.load_state_dict(self.actor.state_dict())
 
-        # Inizializzazione Critic (online e target)
+        # Critic initialization (online and target)
         self.critic = Critic().to(self.device)
         self.critic_target = Critic().to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        # Ottimizzatori Adam
+        # Adam optimizers
         actor_params = [p for p in self.actor.parameters() if p.requires_grad]
         self.actor_optimizer = optim.Adam(actor_params, lr=3e-4)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
 
     def select_action(self, state, evaluate=False):
-        """Azione continua 3D per lo stato corrente (deterministica se evaluate=True)."""
+        """Continuous 3D action for the current state (deterministic if evaluate=True)."""
         state_t = torch.FloatTensor(state).to(self.device).unsqueeze(0)
         with torch.no_grad():
             cont_action = self.actor.sample(state_t, evaluate=evaluate, noise_std=self.expl_noise)
         return cont_action.cpu().numpy()[0]
 
     def update(self, online_memory, elite_memory, expert_memory, batch_size, global_step):
-        """Esegue un singolo passo di addestramento del Critic ed (eventualmente) dell'Actor.
+        """Performs a single training step of the Critic and (possibly) the Actor.
 
-        Passaggi:
+        Steps:
 
-          1. Campiona un batch ibrido a 3 vie: 25% esperti (pilota umano), 15% elite (migliori run
-             autonome) e 60% online (esplorazione corrente). Se online o elite contengono pochi
-             dati, la quota mancante è compensata con campioni esperti (sempre disponibili).
-          2. Riscala la ricompensa (``reward_scale = 0.02``) per mantenere i valori Q in un range
-             numericamente stabile.
-          3. Aggiorna il Critic (Twin Q):
-             - calcola l'azione del prossimo stato con Target Policy Smoothing (rumore clippato);
-             - estrae Q1_target(s', a') e Q2_target(s', a') dalle reti target;
-             - prende il MINIMO tra le due (anti-sovrastima) e forma il target di Bellman
+          1. Samples a three-way hybrid batch: 25% expert (human driver), 15% elite (best autonomous
+             runs) and 60% online (current exploration). If online or elite have little data, the
+             missing quota is compensated with expert samples (always available).
+          2. Rescales the reward (``reward_scale = 0.02``) to keep the Q values in a numerically
+             stable range.
+          3. Updates the Critic (Twin Q):
+             - computes the next-state action with Target Policy Smoothing (clipped noise);
+             - extracts Q1_target(s', a') and Q2_target(s', a') from the target nets;
+             - takes the MINIMUM of the two (anti-overestimation) and forms the Bellman target
                ``r + γ·mask·min(Q1, Q2)``;
-             - minimizza l'MSE delle stime correnti rispetto al target (con gradient clipping).
-             In modalità refinement questo aggiornamento è DISATTIVATO: l'Actor si raffina verso una
-             value function fissa.
-          4. Aggiorna l'Actor (Delayed Policy Update, ogni ``policy_freq`` step) solo dopo il warm-up
-             di 15000 step e se non è congelato:
-             - componente RL: massimizza Q1(s, π(s));
-             - BC penalty: MSE tra azione predetta e azione esperta, calcolata SOLO sui campioni
-               con ``expert_mask > 0.5``, più una penalità di mutua esclusione gas/freno;
-             - coefficiente dinamico ``λ = bc_alpha / mean(|Q(s, π(s))|)`` che mantiene confrontabili
-               la scala del termine RL e di quello BC (Fujimoto & Gu 2021);
-             - loss totale ``λ·(-Q) + bc_weight·BC_penalty`` (``bc_weight`` ridotto in refinement).
-          5. Soft update (Polyak, τ) delle reti target ogni ``policy_freq`` step, A PRESCINDERE da
-             warm-up e congelamento (come nel TD3 originale): tenerlo legato all'update dell'Actor
-             lasciava i target del Critic fermi per decine di migliaia di step, facendo divergere
-             stime correnti e target.
+             - minimizes the MSE of the current estimates against the target (with gradient clipping).
+             In refinement mode this update is DISABLED: the Actor refines toward a fixed value
+             function.
+          4. Updates the Actor (Delayed Policy Update, every ``policy_freq`` steps) only after the
+             15000-step warm-up and if it is not frozen:
+             - RL component: maximizes Q1(s, π(s));
+             - BC penalty: MSE between predicted action and expert action, computed ONLY on samples
+               with ``expert_mask > 0.5``, plus a throttle/brake mutual-exclusion penalty;
+             - dynamic coefficient ``λ = bc_alpha / mean(|Q(s, π(s))|)`` that keeps the scale of the
+               RL term and the BC term comparable (Fujimoto & Gu 2021);
+             - total loss ``λ·(-Q) + bc_weight·BC_penalty`` (``bc_weight`` reduced in refinement).
+          5. Soft update (Polyak, τ) of the target nets every ``policy_freq`` steps, REGARDLESS of
+             warm-up and freeze (as in the original TD3): keeping it tied to the Actor update left the
+             Critic targets stuck for tens of thousands of steps, making current estimates and targets
+             diverge.
 
-        Ritorna ``(critic_loss, actor_loss, 0.0)``; ``actor_loss`` è 0 se l'Actor non è stato aggiornato.
+        Returns ``(critic_loss, actor_loss, 0.0)``; ``actor_loss`` is 0 if the Actor was not updated.
         """
-        # Hybrid Sampling a 3 vie: Expert + Online + Elite
+        # Three-way Hybrid Sampling: Expert + Online + Elite
         b_expert = int(batch_size * 0.25)
         b_elite = min(int(batch_size * 0.15), len(elite_memory.buffer))
         b_online = min(batch_size - b_expert - b_elite, len(online_memory.buffer))
-        b_expert = batch_size - b_online - b_elite  # il resto dall'expert (sempre disponibile)
+        b_expert = batch_size - b_online - b_elite  # the rest from expert (always available)
 
         parts = [expert_memory.sample(b_expert)]
 
@@ -134,7 +134,7 @@ class TD3BCAgent:
         mask_b = np.concatenate([p[4] for p in parts], axis=0)
         expert_mask_b = np.concatenate([p[5] for p in parts], axis=0)
 
-        # Riscalatura della ricompensa per mantenere la magnitudo del Critic in un range sano
+        # Reward rescaling to keep the Critic magnitude in a healthy range
         reward_scale = 0.02
         reward_b = reward_b * reward_scale
 
@@ -145,7 +145,7 @@ class TD3BCAgent:
         mask_b = torch.FloatTensor(mask_b).to(self.device).unsqueeze(1)
         expert_mask_b = torch.FloatTensor(expert_mask_b).to(self.device).unsqueeze(1)
 
-        # Aggiornamento del Critic (Bellman con Twin Q-Network)
+        # Critic update (Bellman with Twin Q-Network)
         with torch.no_grad():
             noise = (torch.randn_like(action_b) * 0.2).clamp(-0.5, 0.5)  # Target Policy Smoothing
             next_action = self.actor_target(next_state_b)
@@ -158,7 +158,7 @@ class TD3BCAgent:
         q1, q2 = self.critic(state_b, action_b)
         critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
 
-        # In refinement l'aggiornamento del Critic è disattivato (value function fissa, vincolo BC ridotto).
+        # In refinement the Critic update is disabled (fixed value function, reduced BC constraint).
         if not getattr(self, 'refine_mode', False):
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
@@ -167,14 +167,14 @@ class TD3BCAgent:
 
         actor_loss_val = 0.0
 
-        # Delayed Policy Update (ogni 2 step del Critic) dopo il warm-up di 15000 step.
+        # Delayed Policy Update (every 2 Critic steps) after the 15000-step warm-up.
         if global_step >= 15000 and global_step % self.policy_freq == 0 and not getattr(self, 'actor_frozen', False):
             pi = self.actor(state_b)
             q1_pi, _ = self.critic(state_b, pi)
 
-            actor_loss_td3 = -q1_pi.mean()  # Componente RL: massimizza Q1(s, pi(s))
+            actor_loss_td3 = -q1_pi.mean()  # RL component: maximizes Q1(s, pi(s))
 
-            # BC Penalty (mascheramento rigoroso: solo sotto-batch Expert)
+            # BC Penalty (strict masking: Expert sub-batch only)
             det_steer = pi[:, 0]
             det_accel = (pi[:, 1] + 1.0) / 2.0
             det_brake = (pi[:, 2] + 1.0) / 2.0
@@ -193,16 +193,17 @@ class TD3BCAgent:
             else:
                 bc_penalty = torch.tensor(0.0, device=self.device)
 
-            # Penalità per evitare acceleratore e freno premuti insieme
+            # Penalty to avoid throttle and brake pressed together
             mutual_exclusion_penalty = (det_accel * det_brake).mean()
             bc_penalty = bc_penalty + (mutual_exclusion_penalty * 0.1)
 
-            # Trust region (peso FISSO, non si scioglie con l'ancora dinamica né col refine): ancora
-            # l'Actor alle azioni effettivamente presenti nel buffer sui campioni NON-expert (75% del
-            # batch). Senza, su quel 75% l'unica forza è max Q, che spinge l'Actor su azioni fuori
-            # distribuzione dove il Critic sovrastima Q → la policy deterministica collassa appena
-            # l'Actor è attivo. Vincolarlo al supporto dati lo stabilizza (era il TRUST_REGION_WEIGHT
-            # della lineage che consolidava a eval identiche, perso nel refactor).
+            # Trust region (FIXED weight, it does not melt with the dynamic anchor nor with refine):
+            # it anchors the Actor to the actions actually present in the buffer on NON-expert samples
+            # (75% of the batch). Without it, on that 75% the only force is max Q, which pushes the
+            # Actor onto out-of-distribution actions where the Critic overestimates Q → the
+            # deterministic policy collapses as soon as the Actor is active. Anchoring it to the data
+            # support stabilizes it (it was the lineage's TRUST_REGION_WEIGHT that consolidated to
+            # identical evals, lost in the refactor).
             trust_region_penalty = torch.tensor(0.0, device=self.device)
             if getattr(self, 'trust_region_weight', 0.0) > 0.0:
                 non_expert_indices = torch.where(expert_mask_flat <= 0.5)[0]
@@ -210,7 +211,7 @@ class TD3BCAgent:
                     trust_region_penalty = F.mse_loss(
                         pi[non_expert_indices], action_b[non_expert_indices])
 
-            # Normalizzazione λ del TD3+BC (Fujimoto & Gu, 2021)
+            # TD3+BC λ normalization (Fujimoto & Gu, 2021)
             Q_abs_mean = q1_pi.abs().mean().detach().clamp(min=1e-5)
             dynamic_alpha = self.bc_alpha / Q_abs_mean
 
@@ -226,7 +227,7 @@ class TD3BCAgent:
             self.actor_optimizer.step()
             actor_loss_val = total_actor_loss.item()
 
-        # Soft Update (Polyak Averaging, τ) ogni policy_freq step, a prescindere da warm-up/freeze.
+        # Soft Update (Polyak Averaging, τ) every policy_freq steps, regardless of warm-up/freeze.
         if global_step % self.policy_freq == 0:
             for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
@@ -237,18 +238,18 @@ class TD3BCAgent:
 
     def save_checkpoint(self, filepath, episode, global_step, memory, elite_memory=None,
                         best_lap_time=float('inf'), best_eval_dist=0.0, best_distance=0.0):
-        """Salva in modo atomico lo stato completo dell'agente e dei replay buffer.
+        """Saves the full agent and replay-buffer state atomically.
 
-        Per garantire l'integrità ed evitare disallineamenti in caso di arresto improvviso:
-          1. crea la cartella ``buffers/`` accanto al checkpoint;
-          2. salva i Replay Buffer (online ed elite) in ``.npz`` PRIMA dei pesi, perché sono
-             l'operazione di I/O più onerosa;
-          3. costruisce il dizionario con pesi di Actor/Critic, reti target, ottimizzatori,
-             episodio, global_step e metriche di record;
-          4. lo salva in ``.pth`` con ``safe_save`` (scrittura temporanea, fsync, rotazione backup).
+        To guarantee integrity and avoid misalignments in case of a sudden stop:
+          1. creates the ``buffers/`` folder next to the checkpoint;
+          2. saves the Replay Buffers (online and elite) to ``.npz`` BEFORE the weights, since they
+             are the most expensive I/O operation;
+          3. builds the dictionary with Actor/Critic weights, target nets, optimizers, episode,
+             global_step and record metrics;
+          4. saves it to ``.pth`` with ``safe_save`` (temporary write, fsync, backup rotation).
 
-        Se l'interruzione avviene a metà, l'assenza del ``.pth`` aggiornato segnala al resume che i
-        buffer nuovi non sono allineati, così verranno ignorati a favore dei backup coerenti.
+        If the interruption happens midway, the absence of the updated ``.pth`` signals to resume that
+        the new buffers are not aligned, so they will be ignored in favor of the consistent backups.
         """
         checkpoint = {
             'checkpoint_version': 2,
@@ -275,23 +276,23 @@ class TD3BCAgent:
         safe_save(checkpoint, filepath)
 
     def load_checkpoint(self, filepath, memory, elite_memory=None):
-        """Ripristina lo stato dell'agente e dei buffer da un checkpoint, in modo robusto (resume).
+        """Restores the agent and buffer state from a checkpoint, robustly (resume).
 
-        Gestione del ripristino:
-          1. scansiona i candidati (incluso ``backups/``) per trovare un ``.pth`` leggibile;
-          2. se il file contiene lo stato completo di training, ripristina pesi, reti target,
-             ottimizzatori e variabili di avanzamento (episodio, global_step, record);
-          3. valida i record memorizzati: se ``best_eval_dist`` (uno score) o ``best_distance``
-             risultano implausibili, li recupera dai sidecar testuali (``td3_det_best_dist.txt``);
-          4. se il file contiene SOLO i pesi dell'Actor (es. un checkpoint estratto per il test),
-             esegue un warm-start dei soli parametri di guida azzerando ottimizzatori e buffer;
-          5. carica i Replay Buffer forzando la coerenza temporale: non carica buffer con timestamp
-             successivo a quello del ``.pth`` (indicherebbe un salvataggio successivo interrotto),
-             ricadendo sui backup allineati; in mancanza, recupero d'emergenza dal più recente.
+        Restore handling:
+          1. scans the candidates (including ``backups/``) to find a readable ``.pth``;
+          2. if the file contains the full training state, restores weights, target nets, optimizers
+             and progress variables (episode, global_step, records);
+          3. validates the stored records: if ``best_eval_dist`` (a score) or ``best_distance`` are
+             implausible, recovers them from the text sidecars (``td3_det_best_dist.txt``);
+          4. if the file contains ONLY the Actor weights (e.g. a checkpoint extracted for testing),
+             performs a warm-start of the driving parameters only, zeroing optimizers and buffers;
+          5. loads the Replay Buffers forcing temporal consistency: it does not load buffers with a
+             timestamp later than the ``.pth`` (which would indicate a later interrupted save),
+             falling back to the aligned backups; failing that, an emergency recovery from the newest.
 
-        Se non trova alcun checkpoint, prova a recuperare l'ultimo episodio dal log di training.
+        If it finds no checkpoint, it tries to recover the last episode from the training log.
 
-        Ritorna ``(episode, global_step, best_lap_time, best_eval_dist, best_distance)``.
+        Returns ``(episode, global_step, best_lap_time, best_eval_dist, best_distance)``.
         """
         buffer_dir = os.path.join(os.path.dirname(filepath), 'buffers')
         base_name = os.path.basename(filepath).replace('.pth', '')
@@ -299,7 +300,7 @@ class TD3BCAgent:
         elite_buffer_path = os.path.join(buffer_dir, f"{base_name}_elite_buffer.npz")
 
         def _load_buffer_aligned(buffer_obj, path, label, loaded_checkpoint_path=None):
-            """Carica il buffer più recente non successivo al checkpoint .pth (anti-disallineamento)."""
+            """Loads the most recent buffer not later than the .pth checkpoint (anti-misalignment)."""
             if buffer_obj is None:
                 return False
             max_mtime = None
@@ -323,7 +324,7 @@ class TD3BCAgent:
                 except Exception as e:
                     print(f"Impossibile caricare {label} da {candidate}: {e}")
 
-            # Recupero di emergenza: nessun backup allineato integro -> usa il più nuovo disponibile
+            # Emergency recovery: no intact aligned backup -> use the newest available
             for candidate in skipped_newer:
                 try:
                     buffer_obj.load(candidate)
@@ -356,7 +357,7 @@ class TD3BCAgent:
                     best_lap_time = checkpoint.get('best_lap_time', float('inf'))
                     best_eval_dist = checkpoint.get('best_eval_dist', 0.0)
                     best_distance = checkpoint.get('best_distance', 0.0)
-                    # best_eval_dist è uno SCORE (distanza o equivalente-tempo): soglia degli score.
+                    # best_eval_dist is a SCORE (distance or time-equivalent): score threshold.
                     if not _is_plausible_eval_score(best_eval_dist):
                         det_best_dist_txt = 'train_set/checkpoints/td3_det_best_dist.txt'
                         sidecar_best_eval_dist = safe_read_float(det_best_dist_txt, 0.0)
@@ -373,7 +374,7 @@ class TD3BCAgent:
                         print(f"Checkpoint principale non usato: recupero da backup {candidate}")
                     print(f"Checkpoint caricato: ripresa dall'Episodio {episode}")
                 else:
-                    # File di soli pesi dell'actor (es. td3_expl_best_dist.pth).
+                    # Actor-weights-only file (e.g. td3_expl_best_dist.pth).
                     print(f"{candidate} contiene solo pesi dell'Actor. Inizializzazione degli altri componenti.")
                     self.actor.load_state_dict(checkpoint, strict=False)
                     self.actor_target.load_state_dict(self.actor.state_dict())

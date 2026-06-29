@@ -1,9 +1,9 @@
-"""Salvataggio/caricamento checkpoint atomico e resistente alle interruzioni.
+"""Atomic, interruption-resistant checkpoint save/load.
 
-Protocollo: scrittura su file temporaneo -> fsync -> rotazione backup (.bak/.prev)
--> os.replace atomico -> fsync della directory. I backup vengono raccolti in
-``train_set/checkpoints/backups/`` per tenere pulito l'albero dei file. Logica
-spostata verbatim dai monoliti per preservare l'"archivio intoccabile".
+Protocol: write to a temporary file -> fsync -> backup rotation (.bak/.prev)
+-> atomic os.replace -> directory fsync. Backups are collected in
+``train_set/checkpoints/backups/`` to keep the file tree clean. Logic moved
+verbatim from the monoliths to preserve the "untouchable archive".
 """
 
 import os
@@ -15,13 +15,13 @@ from .constants import CHECKPOINT_ROOT, CHECKPOINT_BACKUP_ROOT
 
 
 def _fsync_file(path):
-    """Forza la scrittura fisica su disco del file (evita file a 0 byte su crash)."""
+    """Forces the physical write of the file to disk (avoids 0-byte files on crash)."""
     with open(path, 'rb') as f:
         os.fsync(f.fileno())
 
 
 def _fsync_dir(path):
-    """Sincronizza i metadati della directory (persistenza di os.replace)."""
+    """Syncs the directory metadata (persistence of os.replace)."""
     dir_fd = os.open(path or '.', os.O_DIRECTORY)
     try:
         os.fsync(dir_fd)
@@ -30,7 +30,7 @@ def _fsync_dir(path):
 
 
 def _backup_paths(filepath):
-    """Percorsi (.bak, .prev) per il backup, in ``checkpoints/backups/`` se applicabile."""
+    """Paths (.bak, .prev) for the backup, under ``checkpoints/backups/`` if applicable."""
     abs_filepath = os.path.abspath(filepath)
     backup_base = None
     try:
@@ -48,7 +48,7 @@ def _backup_paths(filepath):
 
 
 def _rotate_backup(filepath):
-    """Ruota i backup: .bak -> .prev e copia il file corrente in .bak."""
+    """Rotates the backups: .bak -> .prev and copies the current file to .bak."""
     if not os.path.exists(filepath):
         return
     backup_path, previous_path = _backup_paths(filepath)
@@ -66,7 +66,7 @@ def _rotate_backup(filepath):
 
 
 def _checkpoint_candidates(filepath):
-    """Lista ordinata di candidati (primario + backup) per il caricamento robusto."""
+    """Ordered list of candidates (primary + backups) for robust loading."""
     backup_path, previous_path = _backup_paths(filepath)
     candidates = [filepath, backup_path, previous_path, filepath + ".bak", filepath + ".prev"]
     unique_candidates = []
@@ -80,17 +80,17 @@ def _checkpoint_candidates(filepath):
 
 
 def safe_save(obj, filepath, keep_backup=True):
-    """Salva un oggetto PyTorch in modo atomico e resistente alle interruzioni di corrente.
+    """Saves a PyTorch object atomically and resistant to power interruptions.
 
-    Protocollo:
-      1. salva l'oggetto su un percorso temporaneo (estensione ``.tmp``);
-      2. esegue ``fsync`` per forzarne la persistenza fisica sul disco;
-      3. ruota i backup esistenti (``.bak`` -> ``.prev``, copia corrente -> ``.bak``);
-      4. rinomina atomicamente il temporaneo nel percorso finale con ``os.replace``;
-      5. sincronizza i metadati della directory.
+    Protocol:
+      1. save the object to a temporary path (``.tmp`` extension);
+      2. ``fsync`` to force its physical persistence to disk;
+      3. rotate the existing backups (``.bak`` -> ``.prev``, current copy -> ``.bak``);
+      4. atomically rename the temporary to the final path with ``os.replace``;
+      5. sync the directory metadata.
 
-    In caso di crash a metà operazione il file finale resta intatto (quello vecchio) o, al più,
-    recuperabile dai backup: non si ottiene mai un checkpoint corrotto a 0 byte.
+    In case of a mid-operation crash the final file stays intact (the old one) or, at most,
+    recoverable from the backups: a corrupted 0-byte checkpoint is never produced.
     """
     directory = os.path.dirname(filepath) or '.'
     os.makedirs(directory, exist_ok=True)
@@ -104,7 +104,7 @@ def safe_save(obj, filepath, keep_backup=True):
 
 
 def safe_write_text(filepath, text, keep_backup=True):
-    """Scrive testo (sidecar di record) con lo stesso protocollo atomico."""
+    """Writes text (record sidecar) with the same atomic protocol."""
     directory = os.path.dirname(filepath) or '.'
     os.makedirs(directory, exist_ok=True)
     temp_filepath = filepath + ".tmp"
@@ -119,7 +119,7 @@ def safe_write_text(filepath, text, keep_backup=True):
 
 
 def safe_read_float(filepath, default):
-    """Legge un float da un sidecar testuale, con fallback sui backup (.bak/.prev)."""
+    """Reads a float from a text sidecar, with fallback on the backups (.bak/.prev)."""
     for candidate in _checkpoint_candidates(filepath):
         if not os.path.exists(candidate):
             continue
@@ -132,11 +132,11 @@ def safe_read_float(filepath, default):
 
 
 def safe_save_npz(buffer_obj, filepath, keep_backup=True):
-    """Salva un ReplayBuffer (.npz) in modo atomico (usa estensione .tmp.npz)."""
+    """Saves a ReplayBuffer (.npz) atomically (uses the .tmp.npz extension)."""
     if len(buffer_obj.buffer) == 0:
         return
     os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
-    # np.savez_compressed appende '.npz' se assente: il temp termina con '.tmp.npz'.
+    # np.savez_compressed appends '.npz' if absent: the temp ends with '.tmp.npz'.
     temp_filepath = filepath.replace(".npz", "") + ".tmp.npz"
     buffer_obj.save(temp_filepath)
     if os.path.exists(temp_filepath):

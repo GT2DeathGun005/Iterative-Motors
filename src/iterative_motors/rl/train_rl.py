@@ -1,87 +1,87 @@
 """
-Modulo di Fine-Tuning TD3+BC — Twin Delayed DDPG (TD3) integrato con Behavioral Cloning per TORCS.
+TD3+BC Fine-Tuning module — Twin Delayed DDPG (TD3) integrated with Behavioral Cloning for TORCS.
 
-L'algoritmo TD3 è una variante più robusta del noto DDPG (Deep Deterministic Policy Gradient), introdotto
-nel paper "Addressing Function Approximation Error in Actor-Critic Methods" (Fujimoto et al., 2018). 
+The TD3 algorithm is a more robust variant of the well-known DDPG (Deep Deterministic Policy Gradient), introduced
+in the paper "Addressing Function Approximation Error in Actor-Critic Methods" (Fujimoto et al., 2018).
 
-Tale algoritmo ha come caratteristiche principali:
-    - Twin Critic: Introduce rispetto a DDPG due reti indipendenti, Q1 e Q2, il target di bellman viene calcolato come il minimo tra i due, riducendo la probabilità di sovrastima.
-    - Delayed Policy Update: L'aggiornamento delle policy di Critic e Actor non avviene contemporaneamente, l'actor viene aggiornato meno frequentemente rispetto al critic (policy_frequency = 2 step) 
-    - Target Policy Smoothing: Aggiunge rumore clippato all'azione target calcolata per le reti target del Critic
-      per prevenire l'overfitting su picchi stretti della Q-function.
+This algorithm has as its main features:
+    - Twin Critic: Compared to DDPG it introduces two independent networks, Q1 and Q2; the Bellman target is computed as the minimum of the two, reducing the probability of overestimation.
+    - Delayed Policy Update: The Critic and Actor policy updates do not happen simultaneously; the actor is updated less frequently than the critic (policy_frequency = 2 steps)
+    - Target Policy Smoothing: Adds clipped noise to the target action computed for the Critic's target networks
+      to prevent overfitting on narrow peaks of the Q-function.
 
-Questo modulo implementa l'algoritmo TD3+BC (Fujimoto & Gu, 2021), un'architettura offline-to-online
-cioè il modello viene prima pre addestrato con dati raccolti ma senza interagire con l'ambiente, dopodiché viene inserito nel simulatore TORCS
-ibrida ideata per addestrare un agente di guida autonoma sul simulatore TORCS. Lo scopo principale
-è ereditare la conoscenza iniziale appresa per imitazione da un pilota umano (Behavioral Cloning - BC)
-e raffinarla tramite apprendimento per rinforzo (Reinforcement Learning - RL) senza incorrere
-nella degradazione della policy o nel collasso dei gradienti causati da stime del valore (Q-values) errate all'avvio.
+This module implements the TD3+BC algorithm (Fujimoto & Gu, 2021), an offline-to-online architecture
+i.e. the model is first pre-trained on collected data without interacting with the environment, then it is inserted into the TORCS simulator
+a hybrid architecture designed to train an autonomous-driving agent on the TORCS simulator. The main purpose
+is to inherit the initial knowledge learned by imitation from a human driver (Behavioral Cloning - BC)
+and refine it via Reinforcement Learning (RL) without incurring
+policy degradation or gradient collapse caused by erroneous value estimates (Q-values) at startup.
 
-ARCHITETTURA E LOGICA DEL SISTEMA
+SYSTEM ARCHITECTURE AND LOGIC
 
-1. Struttura dei Modelli:
-   - Actor (Agente di Guida): Eredita il backbone e la testa continua del modello BC pre-addestrato
-     (Warm-Start). Durante il training RL, l'intera rete dell'Actor viene aggiornata per ottimizzare
-     le traiettorie. I comandi continui generati controllano sterzo, acceleratore e freno, mentre
-     il cambio marcia è governato dal modulo esterno 'gearing.py'.
-   - Critic (Twin Q-Networks): Due reti identiche e indipendenti, addestrate da zero. Esse
-     ricevono in input lo stato 87D dell'ambiente e l'azione 3D scelta, stimando il valore Q atteso.
+1. Model structure:
+   - Actor (Driving Agent): Inherits the backbone and the continuous head of the pre-trained BC model
+     (Warm-Start). During RL training, the entire Actor network is updated to optimize
+     the trajectories. The generated continuous commands control steering, throttle and brake, while
+     the gear change is governed by the external module 'gearing.py'.
+   - Critic (Twin Q-Networks): Two identical and independent networks, trained from scratch. They
+     receive as input the 87D environment state and the chosen 3D action, estimating the expected Q value.
 
-2. Funzione di Perdita (Loss) dell'Actor TD3+BC (Tali formule sono state prese dal paper Fujimoto & Gu (2021)):
-   La loss dell'Actor è definita come:
-       Loss = -lambda * Q(s, pi(s)) + BC_Penalty    
-   Dove:
-     - Q(s, pi(s)) è il valore Q stimato dal Critic Q1.
-     - BC_Penalty è l'errore quadratico medio (MSE) tra l'azione predetta e l'azione dell'esperto umano.
-     - lambda è un coefficiente di bilanciamento calcolato dinamicamente ad ogni batch come:
-       lambda = alpha / mean(|Q(s, pi(s))|), con alpha = 2.5. Questo garantisce che la componente di
-       rinforzo (RL) mantenga la stessa scala del termine di imitazione (BC), rendendo il gradiente stabile
-       rispetto a forti variazioni delle magnitudini dei Q-values.
+2. TD3+BC Actor Loss function (these formulas were taken from the Fujimoto & Gu (2021) paper):
+   The Actor loss is defined as:
+       Loss = -lambda * Q(s, pi(s)) + BC_Penalty
+   Where:
+     - Q(s, pi(s)) is the Q value estimated by the Critic Q1.
+     - BC_Penalty is the mean squared error (MSE) between the predicted action and the human expert's action.
+     - lambda is a balancing coefficient computed dynamically at each batch as:
+       lambda = alpha / mean(|Q(s, pi(s))|), with alpha = 2.5. This ensures that the reinforcement (RL)
+       component keeps the same scale as the imitation (BC) term, making the gradient stable
+       against strong variations in the magnitude of the Q-values.
 
-3. Mascheramento Rigoroso della BC Penalty (Expert Masking):
-   La BC Penalty viene calcolata ed applicata esclusivamente sulla quota di campioni del batch che provengono
-   dal dataset esperto (contrassegnati da expert_mask = 1.0). Questo permette al modello di non essere
-   penalizzato se prova traiettorie differenti da quelle del pilota umano (esperto) durante la guida online.
+3. Strict BC Penalty masking (Expert Masking):
+   The BC Penalty is computed and applied exclusively on the share of batch samples that come
+   from the expert dataset (marked with expert_mask = 1.0). This allows the model not to be
+   penalized if it tries trajectories different from those of the human driver (expert) during online driving.
 
-4. Campionamento Ibrido a Tre Vie (Three-Way Replay Buffer):
-   I batch di addestramento sono composti combinando tre sorgenti di esperienza distinte per massimizzare
-   sia la fedeltà all'esperto sia la capacità di recupero dagli errori:
-     - 25% Dataset Umano (Expert): Buffer permanente, previene il distacco dalla BC e la degenerazione ad un RL puro.
-     - 15% Migliori Run (Elite): Riproduce transizioni provenienti dai tentativi autonomi migliori, incoraggiando l'auto-imitazione(Self-Imitation).
-     - 60% Esplorazione Online: Permette all'agente di imparare a gestire stati sporchi fuori traiettoria.
+4. Three-Way Hybrid Sampling (Three-Way Replay Buffer):
+   The training batches are composed by combining three distinct experience sources to maximize
+   both fidelity to the expert and the ability to recover from errors:
+     - 25% Human Dataset (Expert): Permanent buffer, prevents the detachment from the BC and the degeneration into pure RL.
+     - 15% Best Runs (Elite): Replays transitions from the best autonomous attempts, encouraging Self-Imitation.
+     - 60% Online Exploration: Allows the agent to learn to handle dirty, off-trajectory states.
 
-    Tali percentuali sono state scelte empiricamente.
+    These percentages were chosen empirically.
 
-5. Funzione di Ricompensa e Gestione delle Penalità:
-   Il codice della reward è contenuto all'interno del file gym_torcs.py, in questo file è richiamata e vengono sommati eventuali malus o bonus.
-   
-   Ad ogni passo di simulazione (step), l'ambiente calcola una ricompensa multi-obiettivo per guidare l'ottimizzazione dell'agente:
-     - Progresso Longitudinale (Velocità): Calcolato come `(progress * 1.5)`. Premia la proiezione della velocità 
-       lungo l'asse centrale del tracciato, penalizzando derive trasversali. Il fattore di scala `1.5` incentiva 
-       la ricerca di velocità massime nei rettilinei.
-     - Penalità di Posizione Stradale: `-2.0 * (max(0.0, |trackPos| - 1.0) ^ 2)`. Una penalità quadratica applicata 
-       esclusivamente quando l'auto esce dai bordi dell'asfalto (`|trackPos| > 1.0`). Se l'auto è all'interno 
-       delle linee stradali, questo termine è nullo (`0.0`), agendo così come una barriera virtuale morbida.
-     - Penalità di Cambio Direzione (Anti-oscillazione): `-0.05 * |steer_change|`. Penalizza le variazioni brusche 
-       dello sterzo tra due istanti temporali adiacenti. Evita il comportamento di zigzag nei rettilinei 
-       e costringe l'Actor ad apprendere traiettorie di guida fluide.
-     - Penalità di Uscita Pista (Off-Track Crash): Se `|trackPos| > 1.25` (taglio curva o urto barriere), l'episodio 
-       viene interrotto prematuramente e viene applicata una sanzione di stacco `-base_penalty - (extra_penalty * eccesso)`.
-     - Penalità di Stallo e Spin: Se la vettura rimane ferma per più di 10 secondi o compie un testacoda (coseno dell'angolo 
-       rispetto al tracciato negativo, `cos(angle) < 0`), l'episodio termina con una penalità fissa di collisione.
-     - Bonus di Fine Giro (aggiunto in TD3+BC): `+50.0` se il traguardo viene tagliato regolarmente con successo.
-       Il bonus proporzionale al tempo (`+10.0` per ogni secondo sotto gli 80s) e il bonus di record personale
-       sono attivi SOLO in time-attack: in stabilizzazione il completamento è premiato in modo piatto, così un
-       giro lento ma pulito vale quanto uno veloce ma rischioso e la policy impara prima a chiudere il giro.
-     - Malus Giro Incompleto (aggiunto in TD3+BC): `-25.0` se l'episodio termina prematuramente per sbandata o crash,
-       scoraggiando la guida imprudente a favore del completamento del circuito.
-     - Penalità di Corridoio (STABILIZZAZIONE): penalità quadratica per-step che scatta già a `|trackPos| > 0.80`,
-       cioè PRIMA di uscire dalla superficie di guida, per insegnare un margine di sicurezza dal bordo. Piena in
-       stabilizzazione (giri completi affidabili), ridotta in time-attack (serve usare tutta la pista). Vedi
+5. Reward function and penalty handling:
+   The reward code is contained inside the gym_torcs.py file; in this file it is invoked and any maluses or bonuses are added.
+
+   At each simulation step, the environment computes a multi-objective reward to guide the agent's optimization:
+     - Longitudinal Progress (Speed): Computed as `(progress * 1.5)`. Rewards the projection of the speed
+       along the central axis of the track, penalizing transverse drifts. The scale factor `1.5` encourages
+       the search for maximum speeds on the straights.
+     - Road Position Penalty: `-2.0 * (max(0.0, |trackPos| - 1.0) ^ 2)`. A quadratic penalty applied
+       exclusively when the car leaves the asphalt edges (`|trackPos| > 1.0`). If the car is inside
+       the road lines, this term is zero (`0.0`), thus acting as a soft virtual barrier.
+     - Direction Change Penalty (Anti-oscillation): `-0.05 * |steer_change|`. Penalizes abrupt changes
+       in steering between two adjacent time instants. Avoids the zigzag behaviour on the straights
+       and forces the Actor to learn smooth driving trajectories.
+     - Off-Track Crash Penalty: If `|trackPos| > 1.25` (corner cut or barrier hit), the episode
+       is interrupted prematurely and a cutoff penalty `-base_penalty - (extra_penalty * excess)` is applied.
+     - Stall and Spin Penalty: If the car remains still for more than 10 seconds or spins (cosine of the angle
+       relative to the track negative, `cos(angle) < 0`), the episode ends with a fixed collision penalty.
+     - Lap-End Bonus (added in TD3+BC): `+50.0` if the finish line is crossed regularly and successfully.
+       The time-proportional bonus (`+10.0` for every second below 80s) and the personal-record bonus
+       are active ONLY in time-attack: in stabilization the completion is rewarded flatly, so a
+       slow but clean lap is worth as much as a fast but risky one and the policy first learns to finish the lap.
+     - Incomplete-Lap Malus (added in TD3+BC): `-25.0` if the episode ends prematurely due to a slide or crash,
+       discouraging reckless driving in favour of completing the circuit.
+     - Corridor Penalty (STABILIZATION): per-step quadratic penalty that kicks in already at `|trackPos| > 0.80`,
+       i.e. BEFORE leaving the driving surface, to teach a safety margin from the edge. Full in
+       stabilization (reliable complete laps), reduced in time-attack (the full track width is needed). See
        `reward.margin_penalty`.
-     - Reward Telemetrica a Settori (TIME-ATTACK): la pista è divisa in settori; alla chiusura di ognuno si premia
-       (o penalizza) l'agente in base a quanto batte il proprio miglior tempo-settore. Segnale denso che indica
-       DOVE guadagnare tempo, con log del "giro ideale teorico" (somma dei migliori parziali). Vedi `sector_timer`.
+     - Per-Sector Telemetry Reward (TIME-ATTACK): the track is divided into sectors; at the close of each one the
+       agent is rewarded (or penalized) based on how much it beats its own best sector time. A dense signal that indicates
+       WHERE to gain time, with a log of the "theoretical ideal lap" (sum of the best splits). See `sector_timer`.
 """
 
 import os
@@ -105,7 +105,7 @@ if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 from iterative_motors.env.gym_torcs import TorcsEnv
 from iterative_motors.env import snakeoil3_gym as snakeoil3
-from iterative_motors.env.gearing import compute_gear  # cambio marcia algoritmico
+from iterative_motors.env.gearing import compute_gear  # algorithmic gear shifting
 from iterative_motors.common.constants import TRACK_LENGTH_M, LAPS_AUTO_DIR, SESSION_LOGS_DIR
 from iterative_motors.common.checkpoint import (
     safe_save, safe_write_text, safe_read_float, safe_save_npz,
@@ -127,18 +127,18 @@ from iterative_motors.rl.agent import TD3BCAgent
 from iterative_motors.rl.sector_timer import SectorTimer
 
 
-# Relaunch completo di TORCS (kill + riavvio + macro di autostart) solo ogni N episodi:
-# costa ~6 secondi reali contro il reset soft (meta-restart in-place) quasi istantaneo.
-# Il relaunch periodico mantiene la pulizia dello stato del simulatore (memory leak,
-# socket sporchi) senza pagarne il costo a ogni episodio. L'offset 2 lo tiene lontano
-# dalle eval (episodi ≡ 4 mod 5), che fanno già relaunch completi per conto loro.
-# Se la connessione col server cade, gym_torcs forza comunque il relaunch da solo.
+# Full TORCS relaunch (kill + restart + autostart macro) only every N episodes:
+# it costs ~6 real seconds versus the soft reset (in-place meta-restart) that is almost instantaneous.
+# The periodic relaunch keeps the simulator state clean (memory leak,
+# dirty sockets) without paying its cost every episode. The offset 2 keeps it away
+# from the evals (episodes ≡ 4 mod 5), which already do full relaunches on their own.
+# If the connection with the server drops, gym_torcs forces the relaunch by itself anyway.
 RELAUNCH_EVERY_EPISODES = 5
 RELAUNCH_EPISODE_OFFSET = 2
 
-# Annealing del rumore esplorativo: a inizio training serve esplorazione ampia (0.10),
-# ma a regime un disturbo cosi' grande sullo sterzo causa crash sistematici in curva veloce;
-# per limare gli ultimi decimi servono micro-variazioni di traiettoria (0.04).
+# Exploration-noise annealing: at the start of training wide exploration is needed (0.10),
+# but at steady state such a large disturbance on the steering causes systematic crashes in fast corners;
+# to shave the last tenths micro-variations of the trajectory are needed (0.04).
 EXPL_NOISE_START = 0.10
 EXPL_NOISE_END = 0.04
 EXPL_NOISE_ANNEAL_EPISODES = 1500
@@ -147,18 +147,18 @@ EXPL_NOISE_ANNEAL_EPISODES = 1500
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  Determinismo
+#  Determinism
 # ──────────────────────────────────────────────────────────────────────
 def set_seed(seed=42):
     """
-    Imposta i seed di generazione casuale per garantire la riproducibilità degli esperimenti.
-    
-    Configura i generatori casuali per:
-      - Libreria standard python (random)
+    Sets the random-generation seeds to guarantee experiment reproducibility.
+
+    Configures the random generators for:
+      - Python standard library (random)
       - NumPy (np.random)
-      - PyTorch CPU e CUDA (torch.manual_seed, torch.cuda.manual_seed)
-      - Configurazione backend cuDNN in modalità deterministica
-      - Variabile d'ambiente PYTHONHASHSEED
+      - PyTorch CPU and CUDA (torch.manual_seed, torch.cuda.manual_seed)
+      - cuDNN backend configuration in deterministic mode
+      - PYTHONHASHSEED environment variable
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -175,29 +175,29 @@ def set_seed(seed=42):
 
 def load_recent_evals_from_log(log_path, max_len=8):
     """
-    Analizza il file di log del training per estrarre gli ultimi score di valutazione registrati
-    (campo 'Score' nel formato corrente; ricade sulla distanza 'Dist' per le righe storiche).
-    
-    Questo serve a popolare la finestra di memoria per l'Auto-Refinement all'avvio dell'agente (Resume),
-    evitando che lo stato del plateau venga perso o resettato quando si riavvia il processo di training.
-    
-    Argomenti:
-        log_path: Percorso del file di testo td3_training.log.
-        max_len: Lunghezza massima della finestra temporale (default: 8 valutazioni).
-        
-    Ritorna:
-        Una lista contenente le ultime max_len distanze valide estratte.
+    Parses the training log file to extract the last recorded evaluation scores
+    ('Score' field in the current format; falls back to the 'Dist' distance for historical lines).
+
+    This serves to populate the memory window for the Auto-Refinement at agent startup (Resume),
+    preventing the plateau state from being lost or reset when the training process is restarted.
+
+    Arguments:
+        log_path: Path of the td3_training.log text file.
+        max_len: Maximum length of the temporal window (default: 8 evaluations).
+
+    Returns:
+        A list containing the last max_len valid distances extracted.
     """
     evals = []
     if os.path.exists(log_path):
         try:
             with open(log_path, 'r', encoding='utf-8') as f:
                 for line in f:
-                    # Filtra solo le righe che contengono tag di valutazione deterministica [EVAL]
+                    # Filters only the lines containing the deterministic-evaluation tag [EVAL]
                     if '[EVAL]' in line and 'Result' in line:
                         try:
-                            # Preferisce il campo Score (formato nuovo: distanza o equivalente-tempo);
-                            # le righe storiche senza Score ricadono sulla sola distanza.
+                            # Prefers the Score field (new format: distance or time-equivalent);
+                            # historical lines without Score fall back to the distance only.
                             match = re.search(r'\bScore\s+([0-9]+(?:\.[0-9]+)?)m', line)
                             if match:
                                 eval_score = float(match.group(1))
@@ -207,7 +207,7 @@ def load_recent_evals_from_log(log_path, max_len=8):
                             match = re.search(r'\b(?:Dist|Distanza)\s+([0-9]+(?:\.[0-9]+)?)m', line)
                             if match:
                                 eval_dist = float(match.group(1))
-                                # Valida il dato con il filtro di plausibilità fisica monogiro
+                                # Validates the value with the single-lap physical plausibility filter
                                 if _is_plausible_eval_dist(eval_dist):
                                     evals.append(eval_dist)
                         except Exception:
@@ -218,24 +218,24 @@ def load_recent_evals_from_log(log_path, max_len=8):
 
 def train():
     """
-    Funzione principale che coordina il ciclo di addestramento online dell'agente TD3+BC su TORCS.
-    
-    Flusso di Esecuzione:
-      1. Parsing degli argomenti da riga di comando (configurazione di rollback, pretrain del critic,
-         congelamento dell'actor e impostazioni di refinement).
-      2. Inizializzazione dell'ambiente di simulazione TorcsEnv e dei tre replay buffer
+    Main function that coordinates the online training loop of the TD3+BC agent on TORCS.
+
+    Execution flow:
+      1. Parsing of the command-line arguments (rollback configuration, critic pretrain,
+         actor freezing and refinement settings).
+      2. Initialization of the TorcsEnv simulation environment and the three replay buffers
          (Online, Elite, Expert).
-      3. Ripristino (Resume) dello stato dell'agente da checkpoint tramite `load_checkpoint`.
-      4. Caricamento permanente in memoria del dataset di transizioni esperte umane.
-      5. Ciclo principale di simulazione degli episodi:
-         - Gestione del frame stacking temporale degli stati sensoriali.
-         - Interazione con TORCS per ricavare stato successivo, calcolo delle marce (gearing.py) e reward.
-         - Aggiornamento dei pesi dell'agente ad ogni step di simulazione.
-         - Memorizzazione e riempimento differenziato dei replay buffer.
-      6. Valutazione deterministica periodica dell'agente (ogni 5 episodi) con tracciamento
-         dei record assoluti e salvataggio dei pesi d'azione deterministici ottimali per la submission.
-      7. Macchina a stati finiti per l'Auto-Refinement (attivazione/disattivazione della refinement,
-         riduzione del peso BC, gestione dei rollback e prevenzione del timeout su plateau).
+      3. Restore (Resume) of the agent state from a checkpoint via `load_checkpoint`.
+      4. Permanent in-memory loading of the human expert transition dataset.
+      5. Main episode simulation loop:
+         - Handling of the temporal frame stacking of the sensor states.
+         - Interaction with TORCS to obtain the next state, gear computation (gearing.py) and reward.
+         - Update of the agent weights at every simulation step.
+         - Differentiated storage and filling of the replay buffers.
+      6. Periodic deterministic evaluation of the agent (every 5 episodes) with tracking
+         of the absolute records and saving of the optimal deterministic action weights for the submission.
+      7. Finite state machine for the Auto-Refinement (activation/deactivation of the refinement,
+         BC weight reduction, rollback handling and plateau timeout prevention).
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('--bc_weights', type=str, default='train_set/checkpoints/bc_policy.pth')
@@ -284,20 +284,20 @@ def train():
 
     env = TorcsEnv(early_termination=True)
 
-    # Buffer ONLINE (FIFO) per l'esperienza dell'agente. 2M transizioni: orizzonte raddoppiato per
-    # trattenere più storia recente prima dell'evizione (richiesta utente: "non dimenticare il vecchio").
-    # Le proporzioni del batch restano 25/15/60: la capienza decide solo quanto orizzonte tiene l'online.
+    # ONLINE buffer (FIFO) for the agent's experience. 2M transitions: doubled horizon to
+    # retain more recent history before eviction (user request: "do not forget the old").
+    # The batch proportions stay 25/15/60: the capacity only decides how much horizon the online keeps.
     memory = ReplayBuffer(2000000)
-    # Buffer ELITE (self-imitation): capienza aumentata 20k→200k per ospitare una collezione VARIA di
-    # giri buoni — semina iniziale (--reseed_elite_max_lap_time) + catture dei giri completi (eval e
-    # online) — senza che la FIFO evicchi troppo presto. ~110 giri interi di respiro.
+    # ELITE buffer (self-imitation): capacity increased 20k→200k to host a VARIED collection of
+    # good laps — initial seeding (--reseed_elite_max_lap_time) + captures of the complete laps (eval and
+    # online) — without the FIFO evicting too soon. ~110 whole laps of breathing room.
     elite_memory = ReplayBuffer(200000)
 
-    # Buffer EXPERT SEPARATO e PERMANENTE (dati umani): capacità > dataset così non viene
-    # MAI svuotato dalla FIFO. Risolve la perdita dell'ancora BC e la rende presente in ogni batch.
+    # SEPARATE and PERMANENT EXPERT buffer (human data): capacity > dataset so it is
+    # NEVER emptied by the FIFO. Fixes the loss of the BC anchor and makes it present in every batch.
     expert_memory = ReplayBuffer(400000)
 
-    # Inizializzazione Agent
+    # Agent initialization
     agent = TD3BCAgent()
     agent.bc_alpha = args.bc_alpha
     agent.trust_region_weight = args.trust_region
@@ -309,17 +309,17 @@ def train():
     checkpoint_path = 'train_set/checkpoints/td3_checkpoint.pth'
     start_episode, global_step, best_lap_time, best_eval_dist, best_distance = agent.load_checkpoint(checkpoint_path, memory, elite_memory)
 
-    # Carica i dati dell'esperto nel buffer permanente sia all'avvio che al riavvio, garantendo l'ancora BC.
-    # Il filtro sul lap_time tiene solo i giri migliori del pilota: l'ancora deve puntare al suo best, non alla sua media.
+    # Loads the expert data into the permanent buffer both at startup and at restart, guaranteeing the BC anchor.
+    # The lap_time filter keeps only the driver's best laps: the anchor must point at their best, not their average.
     expert_lap_filter = args.expert_max_lap_time if args.expert_max_lap_time > 0 else None
     expert_memory.load_expert_data('train_set/laps', max_samples=350000, max_lap_time=expert_lap_filter)
 
-    # Semina dell'elite dai giri auto-registrati (train_set/laps_auto) per la self-imitation. Due trigger:
-    #  - ESPLICITO: --reseed_elite_max_lap_time S (semina coi giri <= S);
-    #  - AUTOMATICO (rete di sicurezza): se dopo il caricamento l'elite è AFFAMATO (< floor) — perché
-    #    starved o perché un salvataggio precedente era quasi vuoto — si semina da solo con una soglia di
-    #    default. Così la self-imitation non resta MAI a secco tra i restart, e le catture dei giri veloci
-    #    (eval/online) col tempo invecchiano ed espellono in FIFO i semi più lenti.
+    # Seeding of the elite from the self-recorded laps (train_set/laps_auto) for the self-imitation. Two triggers:
+    #  - EXPLICIT: --reseed_elite_max_lap_time S (seeds with the laps <= S);
+    #  - AUTOMATIC (safety net): if after loading the elite is STARVED (< floor) — because
+    #    starved or because a previous save was almost empty — it seeds by itself with a
+    #    default threshold. This way the self-imitation NEVER runs dry between restarts, and the captures of
+    #    the fast laps (eval/online) over time age out and evict in FIFO the slower seeds.
     ELITE_STARVATION_FLOOR = 8000
     DEFAULT_RESEED_LAP_TIME = 74.5
     elite_loaded = len(elite_memory)
@@ -335,47 +335,47 @@ def train():
 
     agent.actor_frozen = False
 
-    # Configurazione dell'Auto-Refinement (Beeson & Montana, 2022).
-    # Rileva situazioni di stallo (plateau) dei risultati e ottimizza la policy
-    # disattivando l'aggiornamento del Critic e riducendo il vincolo BC.
-    # Può essere disattivata tramite il flag --no-auto-refine.
-    REFINE_BC_WEIGHT = 0.3                 # Peso ridotto per la penalità BC durante il refinement.
-    REFINE_MAX_ATTEMPTS = 3                # Numero massimo di tentativi di refinement prima di forzare il training standard.
-    REFINE_COLLAPSE_FRAC = 0.6             # Soglia di crollo (60% del valore recente) per innescare un rollback preventivo.
-    REFINE_WINDOW = 8                      # Numero di valutazioni storiche considerate per la finestra mobile.
-    REFINE_PLATEAU_EVALS = 4               # Numero di valutazioni consecutive senza incremento necessarie per decretare un plateau.
-    REFINE_MIN_EP = 200                    # Episodio minimo richiesto per poter attivare l'auto-refinement.
-    REFINE_IMPROVE_FRAC = 1.02             # Incremento minimo (+2%) per considerare una valutazione come miglioramento significativo.
-    REFINE_BREAKOUT_FRAC = 1.10            # Coefficiente di superamento del plateau (+10%) per considerare un tentativo come "breakout".
-    REFINE_NEW_PLATEAU_FRAC = 1.10         # Soglia (+10%) per stabilire un nuovo plateau e resettare i tentativi.
-    REFINE_GOOD_EVALS_TO_CONSOLIDATE = 3  # Valutazioni positive consecutive richieste per consolidare e riattivare il Critic.
-    REFINE_NEAR_BEST_MARGIN = 5.0          # Margine di vicinanza al record storico (in metri) per indurre il consolidamento immediato.
-    BEST_DIST_EPS = 1.0                    # Tolleranza metrica per ignorare oscillazioni minori nei log delle distanze record.
+    # Auto-Refinement configuration (Beeson & Montana, 2022).
+    # Detects stall (plateau) situations of the results and optimizes the policy
+    # by disabling the Critic update and reducing the BC constraint.
+    # It can be disabled via the --no-auto-refine flag.
+    REFINE_BC_WEIGHT = 0.3                 # Reduced weight for the BC penalty during refinement.
+    REFINE_MAX_ATTEMPTS = 3                # Maximum number of refinement attempts before forcing standard training.
+    REFINE_COLLAPSE_FRAC = 0.6             # Collapse threshold (60% of the recent value) to trigger a preventive rollback.
+    REFINE_WINDOW = 8                      # Number of historical evaluations considered for the moving window.
+    REFINE_PLATEAU_EVALS = 4               # Number of consecutive evaluations without increase needed to declare a plateau.
+    REFINE_MIN_EP = 200                    # Minimum episode required to be able to activate the auto-refinement.
+    REFINE_IMPROVE_FRAC = 1.02             # Minimum increase (+2%) to consider an evaluation a significant improvement.
+    REFINE_BREAKOUT_FRAC = 1.10            # Plateau-breakout coefficient (+10%) to consider an attempt a "breakout".
+    REFINE_NEW_PLATEAU_FRAC = 1.10         # Threshold (+10%) to establish a new plateau and reset the attempts.
+    REFINE_GOOD_EVALS_TO_CONSOLIDATE = 3  # Consecutive positive evaluations required to consolidate and reactivate the Critic.
+    REFINE_NEAR_BEST_MARGIN = 5.0          # Closeness margin to the historical record (in meters) to induce immediate consolidation.
+    BEST_DIST_EPS = 1.0                    # Metric tolerance to ignore minor oscillations in the record-distance logs.
 
-    # Soglie per il regime "giro completato": quando il riferimento supera TRACK_LENGTH_M lo score
-    # è in equivalente-tempo (1% di score ≈ 0.7s di giro), quindi le percentuali del regime distanza
-    # sarebbero irraggiungibili: +10% equivarrebbe a chiedere 7 secondi di miglioramento sul giro.
-    REFINE_LAP_IMPROVE_FRAC = 1.004        # +0.4% di score ≈ 0.3s di giro: miglioramento significativo.
-    REFINE_LAP_BREAKOUT_FRAC = 1.01        # +1% di score ≈ 0.7s di giro: breakout dal plateau.
-    REFINE_LAP_NEW_PLATEAU_FRAC = 1.01     # +1% di score: nuovo plateau, reset dei tentativi.
+    # Thresholds for the "completed lap" regime: when the reference exceeds TRACK_LENGTH_M the score
+    # is in time-equivalent (1% of score ≈ 0.7s of lap), so the percentages of the distance regime
+    # would be unreachable: +10% would mean asking for 7 seconds of lap improvement.
+    REFINE_LAP_IMPROVE_FRAC = 1.004        # +0.4% of score ≈ 0.3s of lap: significant improvement.
+    REFINE_LAP_BREAKOUT_FRAC = 1.01        # +1% of score ≈ 0.7s of lap: breakout from the plateau.
+    REFINE_LAP_NEW_PLATEAU_FRAC = 1.01     # +1% of score: new plateau, reset of the attempts.
 
     def _refine_frac(reference, dist_frac, lap_frac):
         """
-        Seleziona la soglia percentuale corretta in base al regime del riferimento:
-        sotto TRACK_LENGTH_M lo score è una distanza (giri incompleti), sopra è in
-        equivalente-tempo (giri completati) e richiede soglie molto più fini.
+        Selects the correct percentage threshold based on the reference regime:
+        below TRACK_LENGTH_M the score is a distance (incomplete laps), above it is in
+        time-equivalent (completed laps) and requires much finer thresholds.
         """
         return lap_frac if reference > TRACK_LENGTH_M else dist_frac
     agent.refine_mode = False
     agent.refine_bc_weight = 1.0
-    recent_eval_window = deque(maxlen=REFINE_WINDOW)  # Coda mobile per le ultime valutazioni.
+    recent_eval_window = deque(maxlen=REFINE_WINDOW)  # Moving queue for the last evaluations.
     time_attack = (os.environ.get('IM_TIME_ATTACK', '0') == '1')
     phase_log_file = os.path.join(
         SESSION_LOGS_DIR,
         'time-attack.log' if time_attack else 'td3_training.log',
     )
 
-    # Popoliamo la finestra leggendo i dati recenti direttamente dal log
+    # We populate the window by reading the recent data directly from the log
     initial_evals = load_recent_evals_from_log(phase_log_file, REFINE_WINDOW)
     for ev in initial_evals:
         recent_eval_window.append(ev)
@@ -386,28 +386,28 @@ def train():
     else:
         print("Auto-refinement automatica: disattivata da --no-auto-refine. --refine manuale resta disponibile.")
 
-    refine_best_mean = 0.0                 # Migliore media mobile della finestra di valutazione registrata (segnale di plateau).
+    refine_best_mean = 0.0                 # Best moving average of the recorded evaluation window (plateau signal).
     if len(recent_eval_window) >= REFINE_WINDOW:
         refine_best_mean = sum(recent_eval_window) / len(recent_eval_window)
 
-    refine_evals_no_improve = 0            # Numero di valutazioni consecutive senza incremento significativo.
-    refine_attempts = 0                    # Numero totale di tentativi di refinement avviati.
-    refine_attempt_plateau_ref = 0.0       # Distanza di riferimento del plateau per il tentativo corrente.
-    refine_attempt_limit_logged = False    # Stato di logging per il limite massimo di tentativi.
-    refine_plateau_level = 0.0             # Livello di plateau memorizzato (0.0 se non ancora stabilito).
-    refine_collapse_count = 0              # Contatore dei crolli prestazionali rilevati.
-    refine_evals_count = 0                 # Numero di valutazioni effettuate durante la fase di refinement.
-    refine_good_eval_count = 0             # Numero di valutazioni positive consecutive post-breakout.
-    refine_breakout_logged = False         # Stato di logging per il primo superamento del plateau.
+    refine_evals_no_improve = 0            # Number of consecutive evaluations without significant increase.
+    refine_attempts = 0                    # Total number of refinement attempts started.
+    refine_attempt_plateau_ref = 0.0       # Reference plateau distance for the current attempt.
+    refine_attempt_limit_logged = False    # Logging state for the maximum attempts limit.
+    refine_plateau_level = 0.0             # Stored plateau level (0.0 if not yet established).
+    refine_collapse_count = 0              # Counter of the detected performance collapses.
+    refine_evals_count = 0                 # Number of evaluations performed during the refinement phase.
+    refine_good_eval_count = 0             # Number of consecutive positive evaluations post-breakout.
+    refine_breakout_logged = False         # Logging state for the first plateau breakout.
 
     if getattr(args, 'refine', False):
-        # Attivazione manuale immediata del refinement (es. se si rileva uno stallo persistente).
+        # Immediate manual activation of the refinement (e.g. if a persistent stall is detected).
         agent.refine_mode = True
         agent.refine_bc_weight = REFINE_BC_WEIGHT
 
-        # Stima del livello di plateau iniziale:
-        # Se la finestra recente contiene dati sufficienti e non si è in fase di rollback,
-        # si calcola la mediana. Altrimenti, si usa il miglior record storico deterministico.
+        # Estimate of the initial plateau level:
+        # If the recent window contains enough data and we are not in a rollback phase,
+        # the median is computed. Otherwise, the best historical deterministic record is used.
         if len(recent_eval_window) >= 4 and not getattr(args, 'rollback', False):
             refine_plateau_level = float(np.median(list(recent_eval_window)))
         else:
@@ -428,21 +428,21 @@ def train():
 
     batch_size = 256
 
-    # Warm-Start: inizializzazione dell'Actor con i pesi BC se si tratta di un nuovo avvio (episodio 0).
+    # Warm-Start: initialization of the Actor with the BC weights if it is a fresh start (episode 0).
     if start_episode == 0:
         agent.actor.load_bc_weights(args.bc_weights)
         agent.actor_target.load_state_dict(agent.actor.state_dict())
     else:
-        # Procedura di rollback per il ripristino di emergenza dei pesi dell'Actor.
-        # Si cerca di ripristinare il modello partendo dalla migliore policy deterministica disponibile,
-        # scendendo in ordine di priorità fino alle policy esplorative se le prime sono assenti.
+        # Rollback procedure for the emergency restore of the Actor weights.
+        # It tries to restore the model starting from the best available deterministic policy,
+        # going down in priority order to the exploratory policies if the first ones are absent.
         if args.rollback:
             rollback_candidates = [
-                'train_set/checkpoints/td3_det_best_lap.pth',      # 1) Giro valido deterministico più veloce.
-                'train_set/checkpoints/td3_det_best_dist.pth',     # 2) Miglior distanza deterministica assoluta.
-                'train_set/checkpoints/td3_det_best_dist_run.pth', # 3) Miglior distanza deterministica del run corrente.
-                'train_set/checkpoints/td3_expl_best_lap.pth',     # 4) Miglior giro esplorativo (con rumore attivo).
-                'train_set/checkpoints/td3_expl_best_dist.pth',    # 5) Miglior distanza esplorativa (con rumore attivo).
+                'train_set/checkpoints/td3_det_best_lap.pth',      # 1) Fastest valid deterministic lap.
+                'train_set/checkpoints/td3_det_best_dist.pth',     # 2) Best absolute deterministic distance.
+                'train_set/checkpoints/td3_det_best_dist_run.pth', # 3) Best deterministic distance of the current run.
+                'train_set/checkpoints/td3_expl_best_lap.pth',     # 4) Best exploratory lap (with noise active).
+                'train_set/checkpoints/td3_expl_best_dist.pth',    # 5) Best exploratory distance (with noise active).
             ]
             best_path = next((p for p in rollback_candidates if os.path.exists(p)), None)
             if best_path:
@@ -453,7 +453,7 @@ def train():
                 agent.actor_optimizer = optim.Adam(
                     [p for p in agent.actor.parameters() if p.requires_grad], lr=3e-4)
                 
-                # Congelamento temporaneo dell'Actor post-rollback per stabilizzare la convergenza del Critic.
+                # Temporary Actor freeze after rollback to stabilize the Critic convergence.
                 if actor_freeze_episodes > 0:
                     agent.actor_frozen = True
                     print(f"Actor congelato per {actor_freeze_episodes} episodi: stabilizzazione post-rollback.")
@@ -461,7 +461,7 @@ def train():
                     agent.actor_frozen = False
                     print("Congelamento Actor post-rollback disattivato (--actor-freeze-episodes 0).")
 
-                # Pre-addestramento offline opzionale del Critic per sintonizzarne i pesi sulle transizioni del buffer.
+                # Optional offline Critic pre-training to tune its weights on the buffer transitions.
                 if getattr(args, 'pretrain_critic', False) and (len(memory) > batch_size or len(expert_memory) > batch_size):
                     print("[EMERGENZA] Pre-addestramento del Critic in corso sui dati offline del Replay Buffer (50,000 passi)...")
                     for pretrain_step in range(50000):
@@ -480,7 +480,7 @@ def train():
 
     def _control_log(message):
         """
-        Stampa un messaggio a terminale e lo scrive contemporaneamente nel file di log.
+        Prints a message to the terminal and writes it simultaneously to the log file.
         """
         print(message)
         with open(log_file, 'a', encoding='utf-8') as f:
@@ -490,12 +490,12 @@ def train():
 
     def _request_stop(signum, frame):
         """
-        Gestore dei segnali SIGINT (Ctrl+C) e SIGTERM per l'uscita pulita ed ordinata.
+        Handler for the SIGINT (Ctrl+C) and SIGTERM signals for a clean and orderly exit.
 
-        Imposta la variabile stop_requested a True. L'episodio corrente NON viene
-        interrotto: prosegue fino al suo esito naturale (giro completato, crash o
-        limite di passi), così i suoi dati restano transizioni valide. Al termine
-        dell'episodio il loop salva il checkpoint completo ed esce senza ripartire.
+        Sets the stop_requested variable to True. The current episode is NOT
+        interrupted: it continues to its natural outcome (lap completed, crash or
+        step limit), so its data remains valid transitions. At the end of the
+        episode the loop saves the full checkpoint and exits without restarting.
         """
         nonlocal stop_requested
         if not stop_requested:
@@ -509,12 +509,12 @@ def train():
 
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
-    # L'attesa del server TORCS in snakeoil controlla questo hook: un Ctrl+C dato mentre
-    # il client è bloccato su "Waiting for server" abortisce l'attesa con uscita pulita,
-    # invece di restare appesi finché il server non compare.
+    # The TORCS server wait in snakeoil checks this hook: a Ctrl+C given while
+    # the client is blocked on "Waiting for server" aborts the wait with a clean exit,
+    # instead of hanging until the server appears.
     snakeoil3.abort_check = lambda: stop_requested
 
-    # Registrazione sul file di log dei parametri di avvio selezionati per tracciare la sessione.
+    # Logging to the log file of the selected startup parameters to trace the session.
     if getattr(args, 'refine', False):
         initial_ref = f"{refine_plateau_level:.0f}m" if refine_plateau_level > 0.0 else "da impostare"
         _control_log(f"AVVIO con --refine: REFINEMENT armata da subito "
@@ -531,21 +531,21 @@ def train():
 
     elite_threshold = 500.0
 
-    # ── Fase TIME-ATTACK (opt-in via IM_TIME_ATTACK=1) ────────────────────────
-    # Da attivare DOPO aver raccolto abbastanza giri completi e riaddestrato la BC: riduce
-    # l'ancoraggio alla BC (alpha più alto) e abbassa il floor del rumore esplorativo per
-    # limare i tempi. La pressione sul tempo (bonus proporzionale + record personale) è applicata
-    # SOLO in time-attack (vedi blocco SUCCESS); in stabilizzazione il completamento è piatto.
+    # ── TIME-ATTACK phase (opt-in via IM_TIME_ATTACK=1) ───────────────────────
+    # To be activated AFTER collecting enough complete laps and retraining the BC: it reduces
+    # the BC anchoring (higher alpha) and lowers the floor of the exploration noise to
+    # shave the times. The time pressure (proportional bonus + personal record) is applied
+    # ONLY in time-attack (see the SUCCESS block); in stabilization the completion is flat.
     noise_floor = TIME_ATTACK_NOISE_FLOOR if time_attack else EXPL_NOISE_END
     if time_attack:
         agent.bc_alpha = TIME_ATTACK_BC_ALPHA
         print(f"[TIME-ATTACK] Fase attiva: bc_alpha={agent.bc_alpha}, noise_floor={noise_floor}. "
               f"L'agente ottimizza il tempo sul giro battendo il proprio record.")
 
-    # Override manuale del rumore esplorativo (IM_EXPL_NOISE): fissa expl_noise a un valore costante,
-    # scavalcando sia l'annealing sia il floor. Serve per la fase di STABILIZZAZIONE: forzare un rumore
-    # basso su una policy gia' a convergenza (es. resume a episodi bassi) restando in td3 standard, senza
-    # passare per il time-attack che alzerebbe anche bc_alpha indebolendo l'ancora BC. <=0 o assente => off.
+    # Manual override of the exploration noise (IM_EXPL_NOISE): fixes expl_noise to a constant value,
+    # bypassing both the annealing and the floor. Useful for the STABILIZATION phase: forcing a low noise
+    # on an already-converged policy (e.g. resume at low episodes) while staying in standard td3, without
+    # going through time-attack which would also raise bc_alpha weakening the BC anchor. <=0 or absent => off.
     expl_noise_override = None
     _noise_override_env = os.environ.get('IM_EXPL_NOISE')
     if _noise_override_env is not None:
@@ -560,9 +560,9 @@ def train():
         except ValueError:
             print(f"IM_EXPL_NOISE='{_noise_override_env}' non numerico: override ignorato.")
 
-    # Lap recorder: raccoglie i giri completi e puliti guidati dall'agente in esplorazione
-    # e li salva in train_set/laps_auto/ per arricchire il dataset della BC (flywheel dati).
-    # Soglia tempo configurabile via IM_RECORD_MAX_LAP_TIME (default 80s); disattivabile con IM_RECORD_LAPS=0.
+    # Lap recorder: collects the complete and clean laps driven by the agent during exploration
+    # and saves them to train_set/laps_auto/ to enrich the BC dataset (data flywheel).
+    # Time threshold configurable via IM_RECORD_MAX_LAP_TIME (default 80s); disable with IM_RECORD_LAPS=0.
     lap_recorder = LapRecorder(
         LAPS_AUTO_DIR,
         max_lap_time=float(os.environ.get('IM_RECORD_MAX_LAP_TIME', '80.0')),
@@ -570,10 +570,10 @@ def train():
         enabled=(os.environ.get('IM_RECORD_LAPS', '1') != '0'),
     )
 
-    # ── Penalità di corridoio (STABILIZZAZIONE) ───────────────────────────────
-    # Spinge la policy a tenersi lontano dal bordo PRIMA di uscire → giri completi affidabili.
-    # Piena in stabilizzazione; ridotta al 25% in time-attack (lì serve usare tutta la pista per
-    # limare i tempi). Sovrascrivibile via IM_MARGIN_PENALTY (0 = disattiva del tutto).
+    # ── Corridor penalty (STABILIZATION) ──────────────────────────────────────
+    # Pushes the policy to keep away from the edge BEFORE leaving it → reliable complete laps.
+    # Full in stabilization; reduced to 25% in time-attack (there the full track width is needed to
+    # shave the times). Overridable via IM_MARGIN_PENALTY (0 = disables it entirely).
     margin_coef_default = MARGIN_PENALTY_COEF * (0.25 if time_attack else 1.0)
     try:
         margin_coef = float(os.environ.get('IM_MARGIN_PENALTY', margin_coef_default))
@@ -583,8 +583,8 @@ def train():
         print(f"[STABILIZZAZIONE] Penalità di corridoio attiva: coef={margin_coef:.1f} "
               f"(margine dal bordo per completare i giri).")
 
-    # ── Telemetria a settori (TIME-ATTACK) ────────────────────────────────────
-    # Solo in time-attack: premia il battere i propri split di settore e logga dove si perde tempo.
+    # ── Per-sector telemetry (TIME-ATTACK) ────────────────────────────────────
+    # Time-attack only: rewards beating one's own sector splits and logs where time is lost.
     sector_timer = None
     if time_attack:
         sector_timer = SectorTimer(
@@ -601,14 +601,14 @@ def train():
     print("Avvio training TD3+BC...")
 
     for episode in range(start_episode, args.episodes):
-        # Annealing lineare del rumore esplorativo: da EXPL_NOISE_START al floor (EXPL_NOISE_END)
-        # in EXPL_NOISE_ANNEAL_EPISODES episodi. A regime servono micro-variazioni di traiettoria,
-        # non sbandate a velocità di gara.
-        # In time-attack la policy ha già raggiunto la convergenza (chiude il giro): l'annealing — agganciato al
-        # numero ASSOLUTO di episodio — imporrebbe ancora ~0.065 a episodi bassi dopo un resume, cioè
-        # rumore da warmup su una policy matura, che la butta fuori alla prima curva veloce. Si va
-        # quindi diritti al floor (micro-variazioni attorno alla linea ottima), che è proprio lo scopo
-        # della fase di rifinitura dei tempi.
+        # Linear annealing of the exploration noise: from EXPL_NOISE_START to the floor (EXPL_NOISE_END)
+        # over EXPL_NOISE_ANNEAL_EPISODES episodes. At steady state micro-variations of the trajectory are needed,
+        # not slides at race speed.
+        # In time-attack the policy has already reached convergence (it closes the lap): the annealing — tied to the
+        # ABSOLUTE episode number — would still impose ~0.065 at low episodes after a resume, i.e.
+        # warmup noise on a mature policy, which throws it out at the first fast corner. So we go
+        # straight to the floor (micro-variations around the optimal line), which is exactly the purpose
+        # of the time-refinement phase.
         if expl_noise_override is not None:
             agent.expl_noise = expl_noise_override
         elif time_attack:
@@ -619,13 +619,13 @@ def train():
                 EXPL_NOISE_START - (EXPL_NOISE_START - noise_floor) * episode / EXPL_NOISE_ANNEAL_EPISODES
             )
 
-        # Gestione dello scongelamento dell'Actor dopo la fase di stabilizzazione post-rollback
+        # Handling of the Actor unfreezing after the post-rollback stabilization phase
         if agent.actor_frozen and episode >= start_episode + actor_freeze_episodes:
             agent.actor_frozen = False
             print(f"Actor scongelato dopo {actor_freeze_episodes} episodi: "
                   f"riavvio aggiornamenti Actor con gradienti del Critic stabilizzati.")
 
-        # Reset soft di default; relaunch completo periodico (vedi RELAUNCH_EVERY_EPISODES).
+        # Soft reset by default; periodic full relaunch (see RELAUNCH_EVERY_EPISODES).
         full_relaunch = (episode % RELAUNCH_EVERY_EPISODES == RELAUNCH_EPISODE_OFFSET)
         try:
             ob = env.reset(relaunch=full_relaunch)
@@ -638,17 +638,17 @@ def train():
             raise
         episode_transitions = []
 
-        # Lap recorder: nuovo giro, e tracciamento dell'osservazione grezza pre-step.
+        # Lap recorder: new lap, and tracking of the raw pre-step observation.
         lap_recorder.start_episode()
         if sector_timer is not None:
             sector_timer.start_lap(float(np.array(ob.get('distFromStart', 0.0)).flat[0]))
         cur_ob = ob
-        # Etichetta di fase (curriculum): time-attack se attiva, altrimenti warmup (Critic
-        # non ancora caldo) oppure online. Usata per i metadati del recorder e i log.
+        # Phase label (curriculum): time-attack if active, otherwise warmup (Critic
+        # not yet warm) or online. Used for the recorder metadata and the logs.
         current_phase = "time_attack" if time_attack else ("warmup" if global_step < 15000 else "online")
 
-        # Frame Stacking: concatenazione di 3 frame temporali distanziati (t-12, t-6, t)
-        # per fornire informazioni sulla dinamica temporale (velocità e accelerazione).
+        # Frame Stacking: concatenation of 3 time-spaced frames (t-12, t-6, t)
+        # to provide information about the temporal dynamics (speed and acceleration).
         f_state = flatten_state(ob)
         state_stack = deque([f_state]*13, maxlen=13)
         stacked_state = np.concatenate([state_stack[0], state_stack[6], state_stack[12]])
@@ -658,38 +658,38 @@ def train():
         termination_reason = "TIMEOUT"
         new_record = False
 
-        # Configurazione iniziale delle marce e delle variabili di telemetria.
+        # Initial configuration of the gears and the telemetry variables.
         current_gear = 1
-        steps_since_shift = 999  # consenti il primo cambio subito
+        steps_since_shift = 999  # allow the first shift immediately
         cur_speed_kmh = float(np.array(ob.get('speedX', 0.0)).flat[0]) * 50.0
         cur_rpm = float(np.array(ob.get('rpm', 0.0)).flat[0])
-        # Riferimento del tempo dell'ultimo giro per rilevare il completamento del tracciato.
+        # Reference of the last lap time to detect track completion.
         prev_last_lap = float(np.array(ob.get('lastLapTime', 0.0)).flat[0])
         torcs_lap_time = float(np.array(ob.get('curLapTime', 0.0)).flat[0])
         completed_lap_time = None
         episode_start_dist = float(np.array(ob.get('distFromStart', 0.0)).flat[0])
 
         while True:
-            # Selezione dell'azione tramite la policy corrente (con rumore esplorativo).
+            # Action selection via the current policy (with exploration noise).
             cont_action = agent.select_action(stacked_state, evaluate=False)
 
-            # Mappatura delle azioni continue: conversione di acceleratore e freno da [-1, 1] a [0, 1].
+            # Continuous-action mapping: conversion of throttle and brake from [-1, 1] to [0, 1].
             env_action = np.zeros(4)
             env_action[0:3] = cont_action
 
             torcs_action = env_action.copy()
             torcs_action[1] = np.clip((torcs_action[1] + 1.0) / 2.0, 0.0, 1.0)  # accel: [-1,1] → [0,1]
             torcs_action[2] = np.clip((torcs_action[2] + 1.0) / 2.0, 0.0, 1.0)  # brake: [-1,1] → [0,1]
-            # Mutual exclusion continua/moltiplicativa per prevenire stalli repentini
+            # Continuous/multiplicative mutual exclusion to prevent sudden stalls
             torcs_action[1] = torcs_action[1] * (1.0 - torcs_action[2])
 
-            # Calcolo algoritmico della marcia ottimale in base a velocità, giri al minuto e acceleratore.
+            # Algorithmic computation of the optimal gear based on speed, RPM and throttle.
             current_gear, _shifted = compute_gear(cur_speed_kmh, torcs_action[1], cur_rpm, current_gear, steps_since_shift)
             steps_since_shift = 0 if _shifted else steps_since_shift + 1
             torcs_action[3] = current_gear
             env_action[3] = current_gear
 
-            # Lap recorder: stato grezzo pre-step + azione realmente eseguita su TORCS.
+            # Lap recorder: raw pre-step state + action actually executed on TORCS.
             lap_recorder.record_step(cur_ob, torcs_action)
 
             next_ob, reward, env_done, info = env.step(torcs_action)
@@ -705,9 +705,9 @@ def train():
             torcs_lap_time = float(np.array(next_ob.get('curLapTime', 0.0)).flat[0])
             max_dist = max(max_dist, current_dist)
 
-            # Shaping per-step sulle transizioni ONLINE (la guida effettiva dell'agente):
-            #  - corridoio: margine dal bordo (stabilizzazione → giri completi affidabili);
-            #  - settori: premio per aver battuto i propri split (solo time-attack).
+            # Per-step shaping on the ONLINE transitions (the agent's actual driving):
+            #  - corridor: margin from the edge (stabilization → reliable complete laps);
+            #  - sectors: reward for beating one's own splits (time-attack only).
             if margin_coef > 0.0:
                 reward += margin_penalty(
                     float(np.array(next_ob.get('trackPos', 0.0)).flat[0]), coef=margin_coef)
@@ -723,16 +723,16 @@ def train():
                 done, termination_reason = True, "SUCCESS"
                 completed_lap_time = last_lap_time
                 max_dist = max(max_dist, TRACK_LENGTH_M)
-                # STABILIZZAZIONE: il completamento è premiato in modo PIATTO (solo LAP_SUCCESS_BONUS),
-                # così un giro lento ma pulito vale quanto un giro veloce ma rischioso → la policy
-                # impara prima a chiudere il giro. La pressione sul tempo (bonus proporzionale e
-                # record personale) è riservata al TIME-ATTACK, dove serve limare i decimi.
+                # STABILIZATION: the completion is rewarded FLATLY (only LAP_SUCCESS_BONUS),
+                # so a slow but clean lap is worth as much as a fast but risky lap → the policy
+                # first learns to close the lap. The time pressure (proportional bonus and
+                # personal record) is reserved for TIME-ATTACK, where the tenths need shaving.
                 reward += LAP_SUCCESS_BONUS
                 if time_attack:
                     reward += LAP_TIME_BONUS_PER_S * max(0.0, LAP_TIME_BONUS_REF_S - last_lap_time)
                 if last_lap_time < best_lap_time:
-                    # Bonus di RECORD PERSONALE: solo in time-attack (calcolato sul best PRECEDENTE);
-                    # in stabilizzazione si registra comunque il best lap, ma senza premio sul tempo.
+                    # PERSONAL RECORD bonus: time-attack only (computed on the PREVIOUS best);
+                    # in stabilization the best lap is recorded anyway, but without a time reward.
                     if time_attack:
                         reward += personal_best_bonus(best_lap_time, last_lap_time)
                     best_lap_time = last_lap_time
@@ -765,9 +765,9 @@ def train():
             step += 1
             global_step += 1
 
-            # Update Frequency 1:1: un aggiornamento ad ogni step di simulazione (standard TD3).
-            # L'expert buffer è sempre pieno → si aggiorna fin dal primo step (il Critic si
-            # pre-allena sui dati umani, come la fase offline del TD3+BC) e l'ancora BC è garantita.
+            # Update Frequency 1:1: one update at every simulation step (standard TD3).
+            # The expert buffer is always full → it updates from the first step (the Critic
+            # pre-trains on the human data, like the offline phase of TD3+BC) and the BC anchor is guaranteed.
             if len(expert_memory) > batch_size:
                 critic_loss_val, actor_loss_val, _ = agent.update(memory, elite_memory, expert_memory, batch_size, global_step)
                 critic_losses.append(critic_loss_val)
@@ -779,26 +779,26 @@ def train():
                     memory.push(t[0], t[1], t[2], t[3], t[4], expert=0.0)
 
                 # Elite Buffer Injection:
-                # Se la distanza percorsa supera la soglia (70% del record di distanza corrente),
-                # le transizioni dell'episodio vengono inserite nell'Elite Buffer per la Self-Imitation.
-                # Per evitare di memorizzare comportamenti errati (Causal Confusion), gli ultimi 50 passi
-                # prima di un crash non vengono contrassegnati come dati validi per l'imitazione.
+                # If the distance covered exceeds the threshold (70% of the current distance record),
+                # the episode transitions are inserted into the Elite Buffer for Self-Imitation.
+                # To avoid storing wrong behaviours (Causal Confusion), the last 50 steps
+                # before a crash are not marked as valid data for imitation.
                 if max_dist >= elite_threshold:
                     n_trans = len(episode_transitions)
                     for i, t in enumerate(episode_transitions):
                         is_danger = (termination_reason == "CRASH") and (i >= n_trans - 50)
                         elite_memory.push(t[0], t[1], t[2], t[3], t[4], expert=0.0 if is_danger else 1.0)
-                    elite_threshold = max(500.0, best_distance * 0.7)  # Soglia monotonicamente crescente
+                    elite_threshold = max(500.0, best_distance * 0.7)  # Monotonically increasing threshold
 
-                # Lap recorder: salva il giro solo se completato pulito (gate qualità interno).
+                # Lap recorder: saves the lap only if completed cleanly (internal quality gate).
                 if termination_reason == "SUCCESS":
                     lap_recorder.finish_lap(completed_lap_time, phase=current_phase,
                                             episode=episode, global_step=global_step)
                 else:
                     lap_recorder.discard()
 
-                # Time-attack: chiudi il giro a settori (logga dove perde tempo + giro ideale) se
-                # completato, altrimenti scarta il parziale conservando i best-settore già migliorati.
+                # Time-attack: close the sector lap (logs where it loses time + ideal lap) if
+                # completed, otherwise discard the partial keeping the already-improved sector bests.
                 if sector_timer is not None:
                     if termination_reason == "SUCCESS":
                         sector_timer.finish_lap(completed_lap_time)
@@ -806,7 +806,7 @@ def train():
                         sector_timer.discard_lap()
                 break
 
-        # Rilevamento del tempo sul giro fornito dai sensori di TORCS.
+        # Detection of the lap time provided by the TORCS sensors.
         lap_time = completed_lap_time if completed_lap_time is not None else torcs_lap_time
         time_str = datetime.now().strftime("%H:%M:%S")
         avg_critic_loss = np.mean(critic_losses) if len(critic_losses) > 0 else 0.0
@@ -841,17 +841,17 @@ def train():
         if (episode + 1) % 5 == 0 and global_step > 15000:
             def _rlog(m):
                 """
-                Helper specifico per la valutazione (EVAL) che stampa il messaggio a video
-                e lo appende al file di log principale.
+                Evaluation-specific (EVAL) helper that prints the message to the screen
+                and appends it to the main log file.
                 """
                 print(m)
                 with open(log_file, 'a', encoding='utf-8') as f: f.write(m + "\n")
             def _run_deterministic_eval():
                 """
-                Esegue un singolo episodio di valutazione deterministica (senza rumore).
+                Runs a single deterministic evaluation episode (without noise).
 
-                Ritorna una tupla (eval_dist, eval_lap_time, eval_reward); eval_lap_time è None
-                se il giro non è stato completato validamente.
+                Returns a tuple (eval_dist, eval_lap_time, eval_reward); eval_lap_time is None
+                if the lap was not validly completed.
                 """
                 eval_ob = env.reset(relaunch=True)
                 eval_stack = deque([flatten_state(eval_ob)]*13, maxlen=13)
@@ -859,32 +859,32 @@ def train():
                 eval_dist, eval_step, eval_reward = 0.0, 0, 0.0
                 eval_lap_completed = False
                 eval_lap_time = None
-                eval_current_gear = 1  # Utilizzo della marcia algoritmica per la valutazione.
+                eval_current_gear = 1  # Use of the algorithmic gear for the evaluation.
                 eval_steps_since_shift = 999
                 eval_cur_speed_kmh = float(np.array(eval_ob.get('speedX', 0.0)).flat[0]) * 50.0
                 eval_cur_rpm = float(np.array(eval_ob.get('rpm', 0.0)).flat[0])
-                # Cronometraggio del miglior giro VALIDO completato in questa valutazione deterministica.
+                # Timing of the best VALID lap completed in this deterministic evaluation.
                 eval_prev_last_lap = float(np.array(eval_ob.get('lastLapTime', 0.0)).flat[0])
                 eval_start_dist = float(np.array(eval_ob.get('distFromStart', 0.0)).flat[0])
-                # Stato per lo stop GEOMETRICO di fine giro: posizione sul tracciato e cronometro del giro
-                # allo step precedente, per rilevare il riattraversamento del traguardo a prescindere dal
-                # sensore lastLapTime (che lagga ~1 tick).
+                # State for the GEOMETRIC end-of-lap stop: track position and lap stopwatch
+                # at the previous step, to detect the finish-line re-crossing regardless of the
+                # lastLapTime sensor (which lags ~1 tick).
                 eval_prev_track_pos_m = eval_start_dist
                 eval_prev_cur_lap = float(np.array(eval_ob.get('curLapTime', 0.0)).flat[0])
-                eval_transitions = []  # transizioni del giro, per la cattura nell'elite se completato
+                eval_transitions = []  # lap transitions, for the elite capture if completed
 
                 agent.actor.eval()
                 while eval_step < args.max_steps:
                     eval_step += 1
-                    prev_eval_stacked = eval_stacked  # stato corrente PRIMA dello step (per la transizione)
+                    prev_eval_stacked = eval_stacked  # current state BEFORE the step (for the transition)
                     with torch.no_grad():
                         eval_action = agent.select_action(eval_stacked, evaluate=True)
                     eval_env = np.zeros(4)
                     eval_env[0:3] = eval_action
                     eval_env[1], eval_env[2] = np.clip((eval_env[1]+1)/2, 0, 1), np.clip((eval_env[2]+1)/2, 0, 1)
-                    # Mutual exclusion continua/moltiplicativa per EVAL
+                    # Continuous/multiplicative mutual exclusion for EVAL
                     eval_env[1] = eval_env[1] * (1.0 - eval_env[2])
-                    # Calcolo della marcia ottimale per la fase di valutazione.
+                    # Computation of the optimal gear for the evaluation phase.
                     eval_current_gear, _esh = compute_gear(eval_cur_speed_kmh, eval_env[1], eval_cur_rpm, eval_current_gear, eval_steps_since_shift)
                     eval_steps_since_shift = 0 if _esh else eval_steps_since_shift + 1
                     eval_env[3] = eval_current_gear
@@ -899,15 +899,15 @@ def train():
                     current_eval_dist = _track_progress_from_start(eval_start_dist, current_eval_track_pos_m)
                     eval_dist = max(eval_dist, current_eval_dist)
                     eval_cur_lap = float(np.array(eval_ob.get('curLapTime', 0.0)).flat[0])
-                    # Registra la transizione (per l'eventuale cattura nell'elite a giro completato)
+                    # Record the transition (for the possible elite capture on lap completion)
                     eval_transitions.append((prev_eval_stacked, eval_action.copy(), eval_r, eval_stacked, 1.0))
 
-                    # Stop GEOMETRICO di fine giro: indipendente dal sensore lastLapTime (che si aggiorna con
-                    # ~1 tick di ritardo, e il clamp della distanza maschererebbe uno sforamento nel 2° giro).
-                    # Se l'auto ha coperto >=90% del tracciato e poi il distFromStart "salta indietro" oltre
-                    # mezza pista (riattraversamento del traguardo), il giro è completo: ci si ferma SUBITO,
-                    # niente 2° giro. Tempo del giro dal sensore se aggiornato, altrimenti dal cronometro del
-                    # giro all'ultimo step prima del wrap.
+                    # GEOMETRIC end-of-lap stop: independent of the lastLapTime sensor (which updates with
+                    # ~1 tick of delay, and the distance clamp would mask an overrun into the 2nd lap).
+                    # If the car has covered >=90% of the track and then distFromStart "jumps back" beyond
+                    # half the track (finish-line re-crossing), the lap is complete: we stop IMMEDIATELY,
+                    # no 2nd lap. Lap time from the sensor if updated, otherwise from the lap stopwatch
+                    # at the last step before the wrap.
                     crossed_finish = (current_eval_track_pos_m + TRACK_LENGTH_M * 0.5 < eval_prev_track_pos_m)
                     if eval_dist >= TRACK_LENGTH_M * 0.9 and crossed_finish and not eval_info.get('crash', False):
                         eval_lap_completed = True
@@ -921,7 +921,7 @@ def train():
                     eval_prev_track_pos_m = current_eval_track_pos_m
                     eval_prev_cur_lap = eval_cur_lap
 
-                    # Arresto anticipato della valutazione al completamento del primo giro valido.
+                    # Early stop of the evaluation at the completion of the first valid lap.
                     eval_last_lap = float(np.array(eval_ob.get('lastLapTime', 0.0)).flat[0])
                     eval_lap_completed = bool(eval_info.get('lap_completed', False))
                     if not eval_lap_completed:
@@ -935,13 +935,13 @@ def train():
                     if eval_info.get('crash', False) or eval_done: break
                 agent.actor.train()
 
-                # Cattura del giro completo dell'eval nell'elite (self-imitation): se il giro è stato chiuso
-                # pulito, le sue transizioni deterministiche (la "linea pulita") entrano nell'elite marcate
-                # expert=1.0, come le iniezioni online. È la fonte di giri VELOCI per la self-imitation, che i
-                # giri auto-registrati (più lenti) non danno; man mano che la policy migliora, queste catture
-                # rimpiazzano in FIFO i semi lenti.
-                # Gated da --capture_eval_elite (default OFF): in stabilizzazione self-imitare la linea-rasoio
-                # dell'eval sovra-affila la policy e destabilizza l'esplorazione; riattivala nella limatura.
+                # Capture of the complete eval lap into the elite (self-imitation): if the lap was closed
+                # cleanly, its deterministic transitions (the "clean line") enter the elite marked
+                # expert=1.0, like the online injections. It is the source of FAST laps for the self-imitation, which the
+                # self-recorded laps (slower) do not provide; as the policy improves, these captures
+                # replace the slow seeds in FIFO.
+                # Gated by --capture_eval_elite (default OFF): in stabilization self-imitating the razor line
+                # of the eval over-sharpens the policy and destabilizes the exploration; reactivate it in the refinement.
                 if args.capture_eval_elite and eval_lap_completed and len(eval_transitions) > 0:
                     for (s, a, r, ns, m) in eval_transitions:
                         elite_memory.push(s, a, r, ns, m, expert=1.0)
@@ -957,9 +957,9 @@ def train():
                 return eval_dist, eval_lap_time, eval_reward
 
             _rlog("\n   [EVAL] Valutazione deterministica...")
-            # Run singolo: policy deterministica + simulatore deterministico danno risultati
-            # riproducibili al metro (verificato empiricamente: run ripetuti sempre identici,
-            # anche sui crash anomali), quindi il best-of-N non aggiunge informazione.
+            # Single run: a deterministic policy + deterministic simulator give results
+            # reproducible to the meter (empirically verified: repeated runs always identical,
+            # even on the anomalous crashes), so best-of-N adds no information.
             try:
                 eval_dist, eval_lap_time, eval_reward = _run_deterministic_eval()
             except snakeoil3.ServerTimeoutError as e:
@@ -986,14 +986,14 @@ def train():
             print(f"  {eval_msg}")
             with open(log_file, 'a', encoding='utf-8') as f: f.write(eval_msg + "\n")
 
-            # best_eval_dist contiene lo SCORE (nome mantenuto per compatibilità con i checkpoint):
-            # sotto 3608 coincide con la distanza, sopra cresce al migliorare del tempo sul giro.
+            # best_eval_dist contains the SCORE (name kept for checkpoint compatibility):
+            # below 3608 it coincides with the distance, above it grows as the lap time improves.
             if eval_score > best_eval_dist:
                 best_eval_dist = eval_score
                 safe_save(agent.actor.state_dict(), 'train_set/checkpoints/td3_det_best_dist_run.pth')
 
-            # Salvataggio persistente del record storico di score deterministico assoluto
-            # (distanza per giri incompleti, equivalente-tempo per giri completati).
+            # Persistent saving of the historical absolute deterministic-score record
+            # (distance for incomplete laps, time-equivalent for completed laps).
             det_best_dist_pth = 'train_set/checkpoints/td3_det_best_dist.pth'
             det_best_dist_txt = 'train_set/checkpoints/td3_det_best_dist.txt'
             prev_det_best_dist = safe_read_float(det_best_dist_txt, 0.0)
@@ -1008,7 +1008,7 @@ def train():
                     agent.refine_mode = False
                     agent.refine_bc_weight = 1.0
                     agent.actor_frozen = actor_freeze_episodes > 0
-                    start_episode = episode  # Congela l'Actor per la finestra configurata a partire da ora
+                    start_episode = episode  # Freeze the Actor for the configured window from now on
                     refine_evals_no_improve = 0
                     refine_collapse_count = 0
                     refine_best_mean = 0.0
@@ -1026,7 +1026,7 @@ def train():
                     else:
                         _rlog("  Rientro in training normale: congelamento Actor disattivato.")
 
-            # Salvataggio persistente del miglior giro deterministico valido (candidato per la submission).
+            # Persistent saving of the best valid deterministic lap (submission candidate).
             if eval_best_lap_in_run < float('inf'):
                 det_best_lap_pth = 'train_set/checkpoints/td3_det_best_lap.pth'
                 det_best_lap_txt = 'train_set/checkpoints/td3_det_best_lap.txt'
@@ -1038,8 +1038,8 @@ def train():
                     print(msg)
                     with open(log_file, 'a', encoding='utf-8') as f: f.write(msg + "\n")
 
-            # Gestione della macchina a stati dell'Auto-Refinement (attivazione refinement o rollback).
-            # Se l'Actor è congelato, le valutazioni vengono ignorate ai fini del calcolo del plateau.
+            # Handling of the Auto-Refinement state machine (refinement activation or rollback).
+            # If the Actor is frozen, the evaluations are ignored for the plateau computation.
             actor_is_frozen = getattr(agent, 'actor_frozen', False)
             if actor_is_frozen and not agent.refine_mode:
                 refine_evals_no_improve = 0
@@ -1050,17 +1050,17 @@ def train():
                 recent_eval_window.append(eval_score)
 
             if auto_refine_enabled and not agent.refine_mode and not actor_is_frozen:
-                # Rilevamento PLATEAU su STATISTICA (non sul singolo best, robusto ai colpi di
-                # fortuna): la MEDIA della finestra recente smette di salire. Serve la finestra piena.
+                # PLATEAU detection on a STATISTIC (not on the single best, robust to lucky
+                # strikes): the MEAN of the recent window stops rising. The full window is needed.
                 if len(recent_eval_window) >= REFINE_WINDOW:
                     cur_mean = sum(recent_eval_window) / len(recent_eval_window)
                     if cur_mean > refine_best_mean * _refine_frac(refine_best_mean, REFINE_IMPROVE_FRAC, REFINE_LAP_IMPROVE_FRAC):
-                        refine_best_mean = cur_mean          # la performance tipica sta ancora salendo
+                        refine_best_mean = cur_mean          # the typical performance is still rising
                         refine_evals_no_improve = 0
                     else:
-                        refine_evals_no_improve += 1          # tipica ferma → conta verso il plateau
+                        refine_evals_no_improve += 1          # typical flat → counts toward the plateau
                     if refine_evals_no_improve >= REFINE_PLATEAU_EVALS and (episode + 1) >= REFINE_MIN_EP:
-                        # Riferimento plateau = MEDIANA recente (modo 'buono' del bimodale), non il singolo max stocastico.
+                        # Plateau reference = recent MEDIAN ('good' mode of the bimodal), not the single stochastic max.
                         candidate_plateau_level = float(np.median(list(recent_eval_window)))
                         reset_msg = None
                         if refine_attempt_plateau_ref <= 0.0:
@@ -1098,7 +1098,7 @@ def train():
                                   f"raggiunto per il plateau {refine_attempt_plateau_ref:.0f}m. "
                                   "Training normale finché non emerge un plateau più alto.")
             elif agent.refine_mode and refine_plateau_level <= 0.0:
-                # Determinazione del livello di plateau iniziale per il refinement manuale tramite mediana.
+                # Determination of the initial plateau level for the manual refinement via the median.
                 if len(recent_eval_window) >= 4:
                     refine_plateau_level = float(np.median(list(recent_eval_window)))
                     if refine_attempt_plateau_ref <= 0.0:
@@ -1110,8 +1110,8 @@ def train():
             elif agent.refine_mode:
                 # In REFINEMENT.
                 refine_evals_count += 1
-                # Rilevamento e logging del superamento del plateau di riferimento (breakout).
-                # Soglia a doppio regime: +10% in regime distanza, +1% (≈0.7s di giro) in regime tempo.
+                # Detection and logging of the reference-plateau breakout.
+                # Dual-regime threshold: +10% in the distance regime, +1% (≈0.7s of lap) in the time regime.
                 breakout_frac = _refine_frac(refine_plateau_level, REFINE_BREAKOUT_FRAC, REFINE_LAP_BREAKOUT_FRAC)
                 breakout_detected = eval_score > refine_plateau_level * breakout_frac
                 if breakout_detected:
@@ -1122,8 +1122,8 @@ def train():
                     refine_breakout_logged = True
                     _rlog(f"  PLATEAU SUPERATO: eval score {eval_score:.0f}m "
                           f"> riferimento {refine_plateau_level:.0f}m (+{(eval_score/refine_plateau_level-1)*100:.1f}%)")
-                # Ripristino del training normale (con consolidamento dei pesi ed eventuale congelamento dell'Actor)
-                # se il breakout è stabile o vicino al miglior record assoluto.
+                # Restore of normal training (with weight consolidation and possible Actor freeze)
+                # if the breakout is stable or close to the best absolute record.
                 near_best_breakout = breakout_detected and prev_det_best_dist > 0.0 and eval_score >= prev_det_best_dist - REFINE_NEAR_BEST_MARGIN
                 stable_breakout = refine_good_eval_count >= REFINE_GOOD_EVALS_TO_CONSOLIDATE
                 if near_best_breakout or stable_breakout:
@@ -1156,7 +1156,7 @@ def train():
                               f"Actor congelato per {actor_freeze_episodes} episodi.")
                     else:
                         _rlog("  Rientro in training normale: congelamento Actor disattivato.")
-                # Attivazione del rollback preventivo in caso di crollo prestazionale prolungato.
+                # Activation of the preventive rollback in case of a prolonged performance collapse.
                 elif eval_score < refine_plateau_level * REFINE_COLLAPSE_FRAC:
                     refine_collapse_count += 1
                 else:
@@ -1175,13 +1175,13 @@ def train():
                     refine_collapse_count = 0
                     refine_evals_count = 0
                     refine_good_eval_count = 0
-                    refine_best_mean = 0.0          # Reset dei parametri per misurare nuovamente il plateau.
+                    refine_best_mean = 0.0          # Reset of the parameters to measure the plateau again.
                     refine_plateau_level = 0.0
                     _rlog(f"  REFINEMENT collassata (<{int(REFINE_COLLAPSE_FRAC*100)}% di {ref_lvl:.0f}m) "
                           f"→ ROLLBACK al miglior deterministico (td3_det_best_dist), peso Behavioral Cloning→1.0, "
                           f"aggiornamento Critic riattivato. Tentativi sul plateau {refine_attempt_plateau_ref:.0f}m: "
                           f"{refine_attempts}/{REFINE_MAX_ATTEMPTS}")
-                # Uscita per timeout se il refinement si protrae per 40 episodi senza miglioramenti.
+                # Timeout exit if the refinement drags on for 40 episodes without improvements.
                 elif refine_evals_count >= 8:
                     ref_lvl = refine_plateau_level
                     if refine_attempt_plateau_ref <= 0.0:

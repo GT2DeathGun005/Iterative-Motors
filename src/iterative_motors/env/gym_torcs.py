@@ -4,53 +4,57 @@ from . import snakeoil3_gym as snakeoil3
 import os
 import time
 
-# Directory di questo file (gym_torcs/) — usata per risolvere i path relativi
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__)) # Variabile che contiene il percorso assoluto della directory in cui si trova questo file (gym_torcs/), usata per risolvere i path relativi in modo robusto.
-_AUTOSTART_SH = os.path.join(_THIS_DIR, 'autostart.sh') # Path completo allo script di autostart.sh, che automatizza l'avvio di TORCS e la partenza della simulazione.
+# Directory of this file (gym_torcs/) — used to resolve relative paths
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__)) # Variable holding the absolute path of the directory in which this file (gym_torcs/) resides, used to resolve relative paths robustly.
+_AUTOSTART_SH = os.path.join(_THIS_DIR, 'autostart.sh') # Full path to the autostart.sh script, which automates the TORCS startup and the start of the simulation.
+_REQUIRED_OBS_KEYS = (
+    'focus', 'speedX', 'speedY', 'speedZ', 'opponents', 'rpm', 'track',
+    'wheelSpinVel', 'angle', 'trackPos', 'damage',
+)
 
 
 def _kill_torcs():
-    """Termina le istanze TORCS.
+    """Terminates the TORCS instances.
 
-    Di DEFAULT uccide *tutti* i processi torcs della macchina (`pkill -9 -f torcs`):
-    è il workaround operativo contro il memory leak osservato nei run lunghi di TORCS
-    ed è corretto per il flusso single-instance di training/test.
+    By DEFAULT it kills *all* the machine's torcs processes (`pkill -9 -f torcs`):
+    it is the operational workaround against the memory leak observed in long TORCS runs
+    and is correct for the single-instance training/test flow.
 
-    TODO(parallel): per velocizzare l'RL con N ambienti TORCS in parallelo (porte 3001+i,
-    display Xvfb separati) questo kill globale va sostituito con un teardown per-istanza
-    (PID/porta tracciati). È il punto da modificare quando si valuterà lo speedup; vedi anche
-    il seam ``EnvRunner`` e ``updates_per_step`` documentati in train (punto differito del piano).
+    TODO(parallel): to speed up the RL with N TORCS environments in parallel (ports 3001+i,
+    separate Xvfb displays) this global kill must be replaced with a per-instance teardown
+    (tracked PID/port). It is the point to modify when evaluating the speedup; see also
+    the ``EnvRunner`` seam and ``updates_per_step`` documented in train (deferred point of the plan).
     """
     if os.environ.get('TORCS_KILL_ALL', '1') != '0':
         os.system('pkill -9 -f torcs')
-        # Il pkill qui sopra uccide anche il wrapper xvfb-run (la sua command line
-        # contiene "torcs") prima che possa fare cleanup, lasciando orfano il server
-        # Xvfb: senza questa riga ogni relaunch accumulerebbe un processo Xvfb morto.
+        # The pkill above also kills the xvfb-run wrapper (its command line
+        # contains "torcs") before it can clean up, orphaning the Xvfb
+        # server: without this line every relaunch would accumulate a dead Xvfb process.
         os.system('pkill -9 -f xvfb-run; pkill -9 Xvfb')
 
 class TorcsEnv:
-    # Variabili usate per valutare la terminazione anticipata in caso di stallo della vettura
-    terminal_judge_start = 500  # 10 secondi dopo la quale si inizia a valutare se la vettura è in stallo
-    termination_limit_progress = 5  # Dopo 10 secondi, se la velocità/progresso in avanti scende sotto circa 5 m/s, consideriamo l'auto in stallo.
-    off_track_limit = 1.25  # Oltre questo valore il giro è considerato non valido.
-    off_track_penalty_base = 5.0  # Penalità terminale minima quando si supera off_track_limit.
-    off_track_penalty_extra = 5.0  # Penalità progressiva aggiuntiva, saturata entro +1.0 trackPos.
-    incomplete_lap_step_penalty = 5.0  # Penalità locale per fallimenti terminali non legati al tempo giro.
-    
-    default_speed = 50 # Velocità di riferimento per normalizzare speedX/Y/Z. Non è una velocità massima, ma un valore tipico di velocità in pista (50 m/s = 180 km/h) usato per scalare le osservazioni in modo che siano in un range più gestibile per l'allenamento degli agenti.
-    # cambiando questo valore si scalano tutte le osservazioni di velocità (speedX/Y/Z) e anche il calcolo del reward (progress), quindi va scelto in modo coerente con le velocità tipiche che si vogliono raggiungere in pista. 
-    # Un valore troppo basso potrebbe portare a osservazioni normalizzate troppo grandi, 
-    # mentre un valore troppo alto potrebbe portare a osservazioni troppo piccole.
-    # 50 m/s è una scelta buona perché rappresenta una velocità elevata ma raggiungibile in molte situazioni di gara.
+    # Variables used to evaluate the early termination in case the car stalls
+    terminal_judge_start = 500  # 10 seconds after which we start evaluating whether the car is stalled
+    termination_limit_progress = 5  # After 10 seconds, if the forward speed/progress drops below about 5 m/s, we consider the car stalled.
+    off_track_limit = 1.25  # Beyond this value the lap is considered invalid.
+    off_track_penalty_base = 5.0  # Minimum terminal penalty when off_track_limit is exceeded.
+    off_track_penalty_extra = 5.0  # Additional progressive penalty, saturated within +1.0 trackPos.
+    incomplete_lap_step_penalty = 5.0  # Local penalty for terminal failures not related to lap time.
+
+    default_speed = 50 # Reference speed to normalize speedX/Y/Z. It is not a maximum speed, but a typical on-track speed value (50 m/s = 180 km/h) used to scale the observations into a more manageable range for training the agents.
+    # changing this value rescales all the speed observations (speedX/Y/Z) and also the reward computation (progress), so it must be chosen consistently with the typical speeds one wants to reach on track.
+    # A value that is too low could lead to normalized observations that are too large,
+    # while a value that is too high could lead to observations that are too small.
+    # 50 m/s is a good choice because it represents a high but reachable speed in many race situations.
 
 
-    initial_reset = True    # Flag per indicare se è il primo reset (avvio) dell'ambiente. 
+    initial_reset = True    # Flag indicating whether it is the first reset (startup) of the environment.
 
-    # di default l'early termination è attivo, cioè l'episodio termina al primo contatto con muro/avversari o stallo.
+    # by default early termination is active, i.e. the episode ends at the first contact with a wall/opponents or a stall.
     def __init__(self, early_termination=True):
-        import shutil   # è una libreria utile all'elaborazione dei path nell'OS
+        import shutil   # a library useful for path processing in the OS
 
-        # Verifica che xvfb-run sia installato altrimenti lancia un errore di ambiente. 
+        # Check that xvfb-run is installed, otherwise raise an environment error.
         if shutil.which('xvfb-run') is None:
             raise EnvironmentError("xvfb-run non trovato. Installa il pacchetto 'xvfb' per l'esecuzione headless isolata di TORCS.")
 
@@ -60,30 +64,30 @@ class TorcsEnv:
 
 
         _kill_torcs()
-        time.sleep(1.5) #attende che il sistema operativo liberi la porta UDP usata da TORCS, altrimenti il successivo avvio fallisce.
+        time.sleep(1.5) #waits for the operating system to release the UDP port used by TORCS, otherwise the next startup fails.
 
-        # Stringa che usiamo per lanciare torcs, in modalità no damage e no fuel
+        # String we use to launch torcs, in no damage and no fuel mode
         torcs_cmd = 'torcs -nofuel -nodamage'
-        
 
-        # Se la variabile SHOW_GUI è settata a 1, avvia normalmente. Altrimenti usa Xvfb.
-        # setsid stacca TORCS dal terminale: il Ctrl+C dell'utente (SIGINT all'intero foreground
-        # process group) non deve uccidere il simulatore a metà episodio. La pulizia resta
-        # affidata a _kill_torcs (pkill per nome, indipendente dal process group).
+
+        # If the SHOW_GUI variable is set to 1, start normally. Otherwise use Xvfb.
+        # setsid detaches TORCS from the terminal: the user's Ctrl+C (SIGINT to the whole foreground
+        # process group) must not kill the simulator mid-episode. Cleanup remains
+        # delegated to _kill_torcs (pkill by name, independent of the process group).
         if os.environ.get('SHOW_GUI', '0') == '1':
             os.system(f'setsid sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1" &')
         else:
             xvfb_cmd = f'xvfb-run -a -s "-screen 0 640x480x24" sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1"'
             os.system(f"setsid {xvfb_cmd} &")
 
-        time.sleep(3.0)  # Attende Xvfb/TORCS e la macro di autostart.
+        time.sleep(3.0)  # Waits for Xvfb/TORCS and the autostart macro.
         self.action_space = spaces.Box(
             low=np.array([-1.0, 0.0, 0.0, 1.0], dtype=np.float32),
             high=np.array([1.0, 1.0, 1.0, 6.0], dtype=np.float32),
             dtype=np.float32,
         )
 
-        #Dizionario con tutte le informazioni che invia TORCS, ogni informazione ha le sue dimensioni (visibili da shape) e range di valori
+        #Dictionary with all the information TORCS sends; each piece of information has its own dimensions (visible from shape) and value range
         self.observation_space = spaces.Dict({
             'focus': spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32),
             'speedX': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
@@ -102,9 +106,9 @@ class TorcsEnv:
             'distRaced': spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32),
         })
 
-    # La funzione step prende in input l'azione dell'agente (u), la converte nel formato richiesto da TORCS, invia l'azione al server TORCS, riceve la nuova telemetria, calcola il reward e determina se l'episodio è terminato.
+    # The step function takes the agent's action (u), converts it into the format required by TORCS, sends the action to the TORCS server, receives the new telemetry, computes the reward and determines whether the episode has ended.
     def step(self, u):
-        # Converte l'azione dell'agente nel formato richiesto dal server TORCS.
+        # Converts the agent's action into the format required by the TORCS server.
         client = self.client
 
         this_action = self.agent_to_torcs(u)
@@ -117,68 +121,68 @@ class TorcsEnv:
         action_torcs['brake'] = this_action['brake']
         action_torcs['gear'] = this_action['gear']
 
-        # Snapshot pre-step: serve a rilevare se TORCS aggiorna lastLapTime al traguardo.
+        # Pre-step snapshot: used to detect whether TORCS updates lastLapTime at the finish line.
         prev_last_lap_time = float(np.array(client.S.d.get('lastLapTime', 0.0)).flat[0])
 
-        # Step fisico: invia l'azione e legge la nuova telemetria dal server.
+        # Physics step: sends the action and reads the new telemetry from the server.
         client.respond_to_server()
         client.get_servers_input()
 
         obs = client.S.d
 
-        # Converte la telemetria grezza TORCS nel dizionario normalizzato usato dagli script.
+        # Converts the raw TORCS telemetry into the normalized dictionary used by the scripts.
         self.observation = self.make_observaton(obs)
 
-        # ─── Reward Reshaping condiviso dal TD3+BC ───────────────────────
+        # ─── Reward Reshaping shared by the TD3+BC ───────────────────────
         sp_norm = obs['speedX'] / self.default_speed  # Range ~[0, 6]
         progress = sp_norm * np.cos(obs['angle'])
-        
-        # Inizializza last_steer se non esiste cioè setta lo sterzo diritto al primo step
+
+        # Initialize last_steer if it does not exist, i.e. set the steering straight at the first step
         if not hasattr(self, 'last_steer'):
             self.last_steer = 0.0
 
-        # calcola la variazione di sterzo rispetto allo step precedente,
-        # usata per penalizzare i cambi di direzione bruschi (zigzag) e
-        # incentivare uno stile di guida più fluido. La penalità è proporzionale
-        # alla variazione assoluta dello sterzo, con un coefficiente di 0.05 (usato sotto) che 
-        # bilancia l'importanza di questo termine nel reward complessivo.
+        # computes the steering change relative to the previous step,
+        # used to penalize abrupt direction changes (zigzag) and
+        # encourage a smoother driving style. The penalty is proportional
+        # to the absolute steering change, with a coefficient of 0.05 (used below) that
+        # balances the importance of this term in the overall reward.
         steer_change = this_action['steer'] - self.last_steer
         self.last_steer = this_action['steer']
 
-        # Calcolo della penalità per la posizione sul tracciato:
-        # - Nessuna penalità se |trackPos| < 1.0 (vettura entro i bordi della pista)
-        # - Penalità crescente (rampa quadratica) >= 1.0 e <= 1.25 (punisce il modello se va troppo fuori)
-        # - Oltre 1.25 il giro è invalido e sotto viene aggiunta una penalità terminale graduata.
+        # Computation of the track-position penalty:
+        # - No penalty if |trackPos| < 1.0 (car within the track edges)
+        # - Increasing penalty (quadratic ramp) >= 1.0 and <= 1.25 (punishes the model if it goes too far out)
+        # - Beyond 1.25 the lap is invalid and below it a graduated terminal penalty is added.
         tp = abs(float(obs['trackPos']))
         pos_penalty = -2.0 * (max(0.0, tp - 1.0) ** 2)
 
 
-        # Calcolo della reward complessiva per ogni step:
-        # - La reward principale è il progresso in avanti
-        # - A questo si aggiunge la penalità per la posizione fuori pista (pos_penalty)
-        # - E si sottrae una penalità per i cambi di sterzo bruschi (zigzag) 
-        # La scelta di mettere la reward in questo file è stata effettuata per convenienza
-        # Avremmo potuto metterla in TD3+BC ma così è più semplice accedere alle variabili necessarie per il calcolo della stessa
-        # Quali obs, last_steer, ecc... 
-        # Calcola la reward come combinazione lineare delle componenti 
+        # Computation of the overall reward for each step:
+        # - The main reward is the forward progress
+        # - To this is added the off-track position penalty (pos_penalty)
+        # - And a penalty for abrupt steering changes (zigzag) is subtracted
+        # The choice to put the reward in this file was made for convenience
+        # We could have put it in TD3+BC but this way it is easier to access the variables needed to compute it
+        # Such as obs, last_steer, etc...
+        # Computes the reward as a linear combination of the components
         reward = (progress * 1.5) + pos_penalty - (0.05 * abs(steer_change))
 
-        # Estrae il lap time dell'ultimo giro completato 
+        # Extracts the lap time of the last completed lap
         last_lap_time = float(np.array(obs.get('lastLapTime', 0.0)).flat[0])
 
-        # Il giro è completato se laptime è > 0 e il tempo è cambiato dallo step prima e 
-        # siamo oltre i 10 Secondi di valutazione per la terminazione anticipata (terminal_judge_start)
+        # The lap is completed if laptime is > 0 and the time changed from the previous step and
+        # we are past the 10 seconds of evaluation for early termination (terminal_judge_start)
         lap_completed = (
             last_lap_time > 0.0
             and abs(last_lap_time - prev_last_lap_time) > 0.01
             and self.time_step > self.terminal_judge_start
         )
 
-        # Dizionario di info che contiene informazioni diagnostiche sull'episodio,
-        # come se c'è stato un crash, se la vettura è andata fuori pista,
-        # se il giro è stato completato, il tempo del giro, e la ragione della terminazione
-        # (se applicabile). Queste informazioni sono utili per l'analisi e il debug dell'allenamento
-        # degli agenti.
+        # Info dictionary containing diagnostic information about the episode,
+        # such as whether there was a crash, whether the car went off track,
+        # whether the lap was completed, the lap time, and the termination reason
+        # (if applicable). This information is useful for analysis and debugging of the
+        # agents' training.
         info = {
             'crash': False,
             'off_track': False,
@@ -188,93 +192,93 @@ class TorcsEnv:
         }
 
 
-        # Variabile che indica se l'episodio deve essere terminato. 
+        # Variable indicating whether the episode must be terminated.
         episode_terminate = False
-        
 
-        # Se attiva l'early termination, valutiamo le condizioni di terminazione anticipata
+
+        # If early termination is active, we evaluate the early-termination conditions
         if self.early_termination:
-            # Giro NON valido: oltre |trackPos| > 1.25 (taglio curva / muro). È lo stesso limite
-            # usato in raccolta dati (cordoli consentiti fino a 1.25, oltre = invalido).
+            # INVALID lap: beyond |trackPos| > 1.25 (corner cut / wall). It is the same limit
+            # used in data collection (curbs allowed up to 1.25, beyond = invalid).
             if tp > self.off_track_limit:
-                excess = min(tp - self.off_track_limit, 1.0) #calcola di quanto è fuori pista, è limitato a 1 perché con valore 1 hai la massima penalità di uscita di pista
-                reward -= self.off_track_penalty_base + (self.off_track_penalty_extra * excess) # Aggiornamento della reward contando la penalità
-                 
-                # Aggiorna le flag di info per indicare che c'è stato un crash per uscita di pista
+                excess = min(tp - self.off_track_limit, 1.0) #computes how far off track it is, capped at 1 because with value 1 you get the maximum off-track penalty
+                reward -= self.off_track_penalty_base + (self.off_track_penalty_extra * excess) # Updating the reward by counting the penalty
+
+                # Update the info flags to indicate there was a crash due to going off track
                 info['crash'] = True
                 info['off_track'] = True
                 info['lap_completed'] = False
                 info['lap_time'] = 0.0
                 info['termination_reason'] = 'OFF_TRACK'
                 episode_terminate = True
-                client.R.d['meta'] = True # Flag per segnalare che l'episodio deve terminare
+                client.R.d['meta'] = True # Flag to signal that the episode must terminate
 
 
-            # Valuta se la vettura è in stallo:
-            # - se dopo 10 secondi (terminal_judge_start) non ha completato il giro
-            # - Se l'episodio non è terminato 
-            # - se il giro non è completato
+            # Evaluate whether the car is stalled:
+            # - if after 10 seconds (terminal_judge_start) it has not completed the lap
+            # - If the episode has not terminated
+            # - if the lap is not completed
             if not episode_terminate and not lap_completed and self.terminal_judge_start < self.time_step:
-                # Se il progresso istantaneo in avanti è insufficiente, consideriamo l'auto in stallo e terminiamo l'episodio.
+                # If the instantaneous forward progress is insufficient, we consider the car stalled and terminate the episode.
                 if progress < (self.termination_limit_progress / 50.0):
-                    reward -= self.incomplete_lap_step_penalty  #Aggiorna la reward contando la penalità per stallo
-                    
-                    # Aggiorna le flag di info per indicare che c'è stato un crash per stallo 
-                    info['crash'] = True    
+                    reward -= self.incomplete_lap_step_penalty  #Updates the reward by counting the stall penalty
+
+                    # Update the info flags to indicate there was a crash due to a stall
+                    info['crash'] = True
                     info['termination_reason'] = 'STALL'
                     episode_terminate = True
                     client.R.d['meta'] = True
 
-            # Valuta se la vettura ha fatto uno spin:
-            # - se l'episodio non è terminato
-            # - se il giro non è completato
-            # - se il coseno dell'angolo tra la vettura e l'asse della pista è negativo
+            # Evaluate whether the car has spun:
+            # - if the episode has not terminated
+            # - if the lap is not completed
+            # - if the cosine of the angle between the car and the track axis is negative
             if not episode_terminate and not lap_completed and np.cos(obs['angle']) < 0:
-                reward -= self.incomplete_lap_step_penalty  #Aggiorna la reward contando la penalità per sbin (la stessa di quella di stallo)
-                
-                # Aggiorna le flag di info 
+                reward -= self.incomplete_lap_step_penalty  #Updates the reward by counting the spin penalty (the same as the stall one)
+
+                # Update the info flags
                 info['crash'] = True
                 info['termination_reason'] = 'SPIN'
                 episode_terminate = True
                 client.R.d['meta'] = True
 
-            # Valuta se il giro è completato: se il giro è completato ma l'episodio non è ancora terminato, allora termina l'episodio con successo.
-            # La reward bonus di fine giro viene applicata in TD3+BC, qui applichiamo solo la terminazione dell'episodio.
+            # Evaluate whether the lap is completed: if the lap is completed but the episode has not terminated yet, then terminate the episode successfully.
+            # The lap-end bonus reward is applied in TD3+BC; here we only apply the episode termination.
             if not episode_terminate and lap_completed:
-                
+
                 # Flag update
                 episode_terminate = True
                 client.R.d['meta'] = True
 
-        # Se l'episodio è terminato cambia la flag initial run a False
-        # e rispondi al server inviando il dizionario R con meta=True, che è il segnale per 
-        # TORCS di terminare l'episodio e prepararsi per il reset.
+        # If the episode has terminated, change the initial run flag to False
+        # and respond to the server by sending the R dictionary with meta=True, which is the signal for
+        # TORCS to terminate the episode and prepare for the reset.
         if client.R.d['meta'] is True:
             self.initial_run = False
             client.respond_to_server()
 
-        self.time_step += 1 # Incrementa il contatore dei passi
+        self.time_step += 1 # Increments the step counter
 
-        return self.get_obs(), reward, client.R.d['meta'] or client.so is None, info # restituisce lo stato, il reward, se l'episodio è terminato e informazioni aggiuntive.
+        return self.get_obs(), reward, client.R.d['meta'] or client.so is None, info # returns the state, the reward, whether the episode has ended and additional information.
 
-    # La funzione reset riavvia l'episodio. Se la flag initial_reset è True, riavvia TORCS e pulisce le variabili di stato. 
-    # Se la flag initial_reset è False, imposta la flag R.d['meta'] a True per segnalare a TORCS di terminare l'episodio corrente   e prepararsi per il reset.
+    # The reset function restarts the episode. If the initial_reset flag is True, it restarts TORCS and clears the state variables.
+    # If the initial_reset flag is False, it sets the R.d['meta'] flag to True to signal TORCS to terminate the current episode and prepare for the reset.
     def reset(self, relaunch=False):
         self.time_step = 0
 
-        # Se initial_reset è False, imposta la flag R.d['meta'] a True per segnalare a TORCS di terminare l'episodio corrente e prepararsi per il reset.
+        # If initial_reset is False, set the R.d['meta'] flag to True to signal TORCS to terminate the current episode and prepare for the reset.
         if self.initial_reset is not True:
-            # Se il socket del client è morto (server TORCS non risponde o processo terminato),
-            # un reset soft resterebbe bloccato per sempre in setup_connection ad aspettare
-            # un server che non esiste più: si forza il relaunch completo.
+            # If the client socket is dead (TORCS server not responding or process terminated),
+            # a soft reset would block forever in setup_connection waiting for
+            # a server that no longer exists: a full relaunch is forced.
             if getattr(self.client, 'so', None) is None:
                 relaunch = True
             self.client.R.d['meta'] = True
             self.client.respond_to_server()
 
-            # Se la flag relaunch è True, riavvia TORCS e pulisce le variabili di stato.
+            # If the relaunch flag is True, restart TORCS and clear the state variables.
             if relaunch is True:
-                # Chiudiamo esplicitamente il socket UDP aperto prima del relaunch.
+                # We explicitly close the open UDP socket before the relaunch.
                 if hasattr(self, 'client') and self.client is not None:
                     try:
                         self.client.so.close()
@@ -283,27 +287,41 @@ class TorcsEnv:
                 self.reset_torcs()
                 print("### TORCS is RELAUNCHED ###")
 
-        # La connessione può fallire se TORCS resta bloccato al menu (la macro xte di
-        # autostart può perdere il timing all'avvio): in quel caso si forza un relaunch
-        # completo del simulatore e si riprova, invece di attendere un server che non
-        # arriverà mai. Se invece l'attesa è stata abortita da una richiesta di stop
-        # dell'utente, l'eccezione viene propagata subito al chiamante.
+        # The connection can fail if TORCS stays stuck at the menu (the autostart xte
+        # macro can lose timing at startup): in that case a full simulator relaunch is
+        # forced and retried. Even an "identified" connection can then fail to produce
+        # the first telemetry packet: without this validation we ended up with a
+        # KeyError on raw_obs['focus'].
         connect_attempts = 3
         for attempt in range(1, connect_attempts + 1):
             try:
-                self.client = snakeoil3.Client(p=3001, vision=False)  # Socket UDP SCR standard.
+                self.client = snakeoil3.Client(p=3001, vision=False)  # Standard SCR UDP socket.
+                self.client.MAX_STEPS = np.inf
+                self.client.get_servers_input()
+
+                obs = self.client.S.d
+                missing = [key for key in _REQUIRED_OBS_KEYS if key not in obs]
+                if getattr(self.client, 'so', None) is None or missing:
+                    if attempt == connect_attempts:
+                        raise snakeoil3.ServerTimeoutError(
+                            "Il server TORCS si è connesso ma non ha inviato telemetria valida "
+                            f"(chiavi mancanti: {', '.join(missing) if missing else 'socket chiuso'})."
+                        )
+                    print(
+                        "### Telemetria iniziale TORCS incompleta "
+                        f"(tentativo {attempt}/{connect_attempts}); relaunch completo ###"
+                    )
+                    self.reset_torcs()
+                    continue
+
                 break
             except snakeoil3.ServerTimeoutError as e:
                 if e.aborted or attempt == connect_attempts:
                     raise
                 print(f"### Server TORCS non raggiungibile (tentativo {attempt}/{connect_attempts}): relaunch completo ###")
                 self.reset_torcs()
-        self.client.MAX_STEPS = np.inf
 
-        client = self.client
-        client.get_servers_input()
-
-        obs = client.S.d
+        obs = self.client.S.d
         self.observation = self.make_observaton(obs)
 
         self.last_u = None
@@ -320,19 +338,19 @@ class TorcsEnv:
 
     def reset_torcs(self):
         _kill_torcs()
-        time.sleep(1.5)  # Garantisce che il sistema operativo liberi la porta UDP
-        
+        time.sleep(1.5)  # Ensures the operating system releases the UDP port
+
         torcs_cmd = 'torcs -nofuel -nodamage'
-        
-        # Se la variabile SHOW_GUI è settata a 1, avvia normalmente. Altrimenti usa Xvfb.
-        # setsid: vedi __init__ — TORCS non deve ricevere il Ctrl+C destinato al training.
+
+        # If the SHOW_GUI variable is set to 1, start normally. Otherwise use Xvfb.
+        # setsid: see __init__ — TORCS must not receive the Ctrl+C intended for the training.
         if os.environ.get('SHOW_GUI', '0') == '1':
             os.system(f'setsid sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1" &')
         else:
             xvfb_cmd = f'xvfb-run -a -s "-screen 0 640x480x24" sh -c "(sleep 1.5 && sh {_AUTOSTART_SH}) & exec {torcs_cmd} > /dev/null 2>&1"'
             os.system(f"setsid {xvfb_cmd} &")
 
-        time.sleep(3.0)  # Tempo combinato per avvio e macro
+        time.sleep(3.0)  # Combined time for startup and macro
 
     def agent_to_torcs(self, u):
         action = np.asarray(u, dtype=np.float32).flatten()

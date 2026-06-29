@@ -1,21 +1,21 @@
-"""Reti neurali condivise di Iterative Motors: backbone, Actor (RL), PolicyNetwork (BC), Critic.
+"""Iterative Motors shared neural networks: backbone, Actor (RL), PolicyNetwork (BC), Critic.
 
-Questo modulo centralizza TUTTE le architetture neurali del progetto, che prima erano
-duplicate in tre file diversi (training BC, training TD3+BC, valutazione). Avere un'unica
-definizione elimina il rischio di disallineamenti tra le tre fasi e garantisce che i pesi
-addestrati in una fase siano caricabili nelle altre.
+This module centralizes ALL the project's neural architectures, which used to be duplicated
+across three different files (BC training, TD3+BC training, evaluation). Having a single
+definition removes the risk of misalignment between the three phases and guarantees that weights
+trained in one phase are loadable in the others.
 
-Tutte le reti che producono comandi di guida condividono lo stesso "corpo" (backbone) e la
-stessa testa continua: ciò che cambia è solo la funzione di attivazione delle uscite.
+All networks producing driving commands share the same "body" (backbone) and the same continuous
+head: only the output activation function changes.
 
 ------------------------------------------------------------------------------------------
-CONTRATTO DELLE CHIAVI state_dict — NON MODIFICARE SENZA MIGRARE I CHECKPOINT
+state_dict KEY CONTRACT — DO NOT MODIFY WITHOUT MIGRATING THE CHECKPOINTS
 ------------------------------------------------------------------------------------------
-I checkpoint storici salvati in ``train_set/checkpoints/`` (l'"archivio intoccabile" dei
-record) devono continuare a caricarsi senza conversioni. Per questo il backbone e la testa
-sono costruiti ESATTAMENTE come nel codice originale, producendo le seguenti chiavi:
+The historical checkpoints saved in ``train_set/checkpoints/`` (the "untouchable archive" of
+records) must keep loading without conversions. For this reason the backbone and the head are
+built EXACTLY as in the original code, producing the following keys:
 
-    Actor / PolicyNetwork (stessa struttura):
+    Actor / PolicyNetwork (same structure):
         backbone.0.{weight,bias}    backbone.1.{weight,bias}      # Linear(87,512) + LayerNorm
         backbone.3.{weight,bias}    backbone.4.{weight,bias}      # Linear(512,512) + LayerNorm
         backbone.6.{weight,bias}    backbone.7.{weight,bias}      # Linear(512,512) + LayerNorm
@@ -24,10 +24,10 @@ sono costruiti ESATTAMENTE come nel codice originale, producendo le seguenti chi
     Critic:
         q1.0/2/4.{weight,bias}      q2.0/2/4.{weight,bias}
 
-Gli indici "mancanti" del backbone (2, 5, 8, 11) sono i layer ReLU, privi di parametri e
-quindi assenti dallo state_dict. Poiché Actor e PolicyNetwork hanno le stesse chiavi, i pesi
-della BC e quelli del TD3+BC sono interscambiabili: differiscono solo le attivazioni di uscita
-applicate a runtime (vedi sotto).
+The "missing" backbone indices (2, 5, 8, 11) are the ReLU layers, which have no parameters and
+are therefore absent from the state_dict. Since Actor and PolicyNetwork have the same keys, the BC
+and TD3+BC weights are interchangeable: only the output activations applied at runtime differ
+(see below).
 """
 
 import os
@@ -39,22 +39,22 @@ from ..common.constants import STACK_DIM
 
 
 def make_backbone(state_dim: int = STACK_DIM, hidden_size: int = 512) -> nn.Sequential:
-    """Costruisce il backbone condiviso: 4 blocchi {Linear -> LayerNorm -> ReLU}.
+    """Builds the shared backbone: 4 blocks of {Linear -> LayerNorm -> ReLU}.
 
-    La profondità (4 strati) e la larghezza (512 neuroni) sono state scelte sulla base della
-    letteratura sull'offline RL (Fujimoto & Gu 2021; Beeson & Montana 2022): abbastanza capacità
-    da catturare relazioni non lineari tra i 19 sensori, la velocità e l'assetto della vettura,
-    senza eccedere al punto da memorizzare il dataset (overfitting).
+    The depth (4 layers) and width (512 neurons) were chosen based on the offline-RL literature
+    (Fujimoto & Gu 2021; Beeson & Montana 2022): enough capacity to capture non-linear relations
+    among the 19 sensors, the speed and the car attitude, without being so much as to memorize the
+    dataset (overfitting).
 
-    La Layer Normalization dopo ogni Linear stabilizza l'addestramento mantenendo media 0 e
-    varianza 1 per feature, evitando che alcune dimensioni dominino il gradiente; la ReLU
-    introduce non linearità attivandosi solo per input positivi.
+    The Layer Normalization after each Linear stabilizes training by keeping mean 0 and variance 1
+    per feature, preventing some dimensions from dominating the gradient; the ReLU introduces
+    non-linearity by activating only for positive inputs.
 
     Args:
-        state_dim: dimensione dell'input (default 87 = 3 frame impilati da 29 sensori).
-        hidden_size: neuroni per strato nascosto (default 512).
+        state_dim: input size (default 87 = 3 stacked frames of 29 sensors).
+        hidden_size: neurons per hidden layer (default 512).
     Returns:
-        Un ``nn.Sequential`` con chiavi ``backbone.{0,1,3,4,6,7,9,10}`` (vedi contratto in alto).
+        An ``nn.Sequential`` with keys ``backbone.{0,1,3,4,6,7,9,10}`` (see the contract above).
     """
     return nn.Sequential(
         nn.Linear(state_dim, hidden_size), nn.LayerNorm(hidden_size), nn.ReLU(),
@@ -65,11 +65,11 @@ def make_backbone(state_dim: int = STACK_DIM, hidden_size: int = 512) -> nn.Sequ
 
 
 def make_q_net(state_dim: int = STACK_DIM, action_dim: int = 3, hidden_size: int = 512) -> nn.Sequential:
-    """Costruisce una singola rete Q del Critic: {Linear -> ReLU -> Linear -> ReLU -> Linear(.,1)}.
+    """Builds a single Critic Q-network: {Linear -> ReLU -> Linear -> ReLU -> Linear(.,1)}.
 
-    Prende in input la concatenazione di stato (87D) e azione (3D) e produce un singolo scalare,
-    la stima del valore atteso Q(s, a). Il Critic ne usa due indipendenti (Twin Q) per ridurre
-    la sovrastima del valore (vedi ``Critic``).
+    It takes the concatenation of state (87D) and action (3D) and produces a single scalar, the
+    estimate of the expected value Q(s, a). The Critic uses two independent ones (Twin Q) to reduce
+    value overestimation (see ``Critic``).
     """
     return nn.Sequential(
         nn.Linear(state_dim + action_dim, hidden_size), nn.ReLU(),
@@ -78,19 +78,19 @@ def make_q_net(state_dim: int = STACK_DIM, action_dim: int = 3, hidden_size: int
 
 
 class Actor(nn.Module):
-    """Policy deterministica dell'agente RL (TD3+BC): da stato 87D a comandi continui 3D.
+    """Deterministic policy of the RL agent (TD3+BC): from 87D state to 3D continuous commands.
 
-    L'input è lo stato concatenato a 87 dimensioni (3 stack temporali di 29 sensori a t-12,
-    t-6, t). Il backbone estrae le caratteristiche di guida; la testa continua produce 3 uscite
-    portate in [-1, 1] da una Tanh:
+    The input is the concatenated 87-dimensional state (3 temporal stacks of 29 sensors at t-12,
+    t-6, t). The backbone extracts the driving features; the continuous head produces 3 outputs
+    brought into [-1, 1] by a Tanh:
 
-        - uscita 0: sterzo  (negativo = sinistra, positivo = destra)
-        - uscita 1: acceleratore (rimappato a [0, 1] dal mapping delle azioni a valle)
-        - uscita 2: freno       (rimappato a [0, 1] dal mapping delle azioni a valle)
+        - output 0: steering (negative = left, positive = right)
+        - output 1: throttle (remapped to [0, 1] by the downstream action mapping)
+        - output 2: brake    (remapped to [0, 1] by the downstream action mapping)
 
-    A differenza della ``PolicyNetwork`` della BC, qui anche acceleratore e freno usano la Tanh:
-    è la rappresentazione su cui il Critic ha imparato a stimare Q, e il mapping a pedali [0, 1]
-    avviene solo al momento di inviare il comando a TORCS (vedi ``action_mapping.rl_to_pedals``).
+    Unlike the BC ``PolicyNetwork``, here throttle and brake also use Tanh: it is the representation
+    the Critic learned to estimate Q on, and the mapping to pedals [0, 1] happens only when sending
+    the command to TORCS (see ``action_mapping.rl_to_pedals``).
     """
 
     def __init__(self, state_dim: int = STACK_DIM, hidden_size: int = 512):
@@ -99,24 +99,25 @@ class Actor(nn.Module):
         self.continuous_head = nn.Linear(hidden_size, 3)  # steer, accel, brake
 
     def forward(self, state):
-        """Azione deterministica grezza (senza rumore): Tanh applicata a tutti e 3 i canali.
+        """Raw deterministic action (no noise): Tanh applied to all 3 channels.
 
-        È la π(s) usata sia in valutazione sia, internamente, nel calcolo della loss dell'Actor
-        del TD3+BC (massimizzazione di Q(s, π(s))).
+        It is the π(s) used both in evaluation and, internally, in the TD3+BC Actor-loss
+        computation (maximization of Q(s, π(s))).
         """
         features = self.backbone(state)
         mean = self.continuous_head(features)
         return torch.tanh(mean)
 
     def sample(self, state, evaluate=False, noise_std=0.1):
-        """Azione da eseguire sull'ambiente, deterministica o con rumore esplorativo.
+        """Action to execute on the environment, deterministic or with exploration noise.
 
-        - ``evaluate=True``: ritorna l'azione deterministica pura prodotta dalla rete, per una
-          guida stabile e riproducibile (valutazione/submission).
-        - ``evaluate=False``: aggiunge rumore gaussiano (deviazione standard ``noise_std``,
-          clippato a [-2σ, +2σ]) per l'esplorazione off-policy. La σ viene annealata dal training
-          loop (da EXPL_NOISE_START a EXPL_NOISE_END, o al floor del time-attack) perché a regime
-          servono micro-variazioni di traiettoria, non sbandate. L'azione finale è saturata in [-1, 1].
+        - ``evaluate=True``: returns the pure deterministic action produced by the network, for
+          stable and reproducible driving (evaluation/submission).
+        - ``evaluate=False``: adds Gaussian noise (standard deviation ``noise_std``, clipped to
+          [-2σ, +2σ]) for off-policy exploration. σ is annealed by the training loop (from
+          EXPL_NOISE_START to EXPL_NOISE_END, or to the time-attack floor) because at steady state
+          micro-variations of the trajectory are needed, not slides. The final action is saturated
+          to [-1, 1].
         """
         action = self.forward(state)
         if not evaluate:
@@ -126,14 +127,14 @@ class Actor(nn.Module):
         return action
 
     def load_bc_weights(self, bc_path):
-        """Inizializza l'Actor (warm-start) dai pesi pre-addestrati in Behavioral Cloning.
+        """Initialize the Actor (warm-start) from the BC pre-trained weights.
 
-        È il ponte tra le due fasi: l'Actor del TD3+BC eredita backbone e testa continua della BC
-        così da partire "sapendo già guidare". Poiché la BC usa la Sigmoid [0, 1] per gas/freno
-        mentre l'Actor usa la Tanh [-1, 1], i pesi e i bias dei canali 1:3 della testa vengono
-        moltiplicati per 0.5: è la trasformazione lineare y = 0.5·x che preserva l'ordine di
-        grandezza delle uscite iniziali nel nuovo intervallo. ``strict=False`` ignora eventuali
-        chiavi extra (es. una vecchia ``gear_head`` non più usata).
+        It is the bridge between the two phases: the TD3+BC Actor inherits the backbone and the
+        continuous head from the BC so it starts "already knowing how to drive". Since the BC uses
+        the Sigmoid [0, 1] for throttle/brake while the Actor uses Tanh [-1, 1], the weights and
+        biases of channels 1:3 of the head are multiplied by 0.5: it is the linear transformation
+        y = 0.5·x that preserves the order of magnitude of the initial outputs in the new range.
+        ``strict=False`` ignores any extra keys (e.g. an old ``gear_head`` no longer used).
         """
         if not os.path.exists(bc_path):
             return
@@ -146,11 +147,11 @@ class Actor(nn.Module):
         print(f"Pesi BC caricati con successo da {bc_path} (compensato scaling 0.5 per accel/brake).")
 
     def load_actor_weights(self, path, device):
-        """Carica i pesi dell'Actor da un file (checkpoint completo o solo-Actor).
+        """Load the Actor weights from a file (full checkpoint or Actor-only).
 
-        Filtra le chiavi tenendo solo i parametri presenti nel modello corrente con forma
-        compatibile: così è possibile caricare anche file che contengono altri componenti
-        (es. il Critic) o che provengono da varianti dell'architettura, ignorando il resto.
+        Filters the keys keeping only the parameters present in the current model with a compatible
+        shape: this makes it possible to load even files that contain other components (e.g. the
+        Critic) or that come from architecture variants, ignoring the rest.
         """
         if not os.path.exists(path):
             return
@@ -168,21 +169,21 @@ class Actor(nn.Module):
 
 
 class PolicyNetwork(nn.Module):
-    """Rete della Behavioral Cloning e dell'inferenza in valutazione.
+    """Behavioral Cloning and evaluation-inference network.
 
-    Stessa identica architettura dell'``Actor`` (quindi stesse chiavi state_dict, pesi
-    interscambiabili), ma con due modalità di uscita pensate per coprire entrambi i tipi di
-    checkpoint senza dover istanziare classi diverse:
+    Exactly the same architecture as the ``Actor`` (hence the same state_dict keys, interchangeable
+    weights), but with two output modes designed to cover both checkpoint types without having to
+    instantiate different classes:
 
-      - ``forward`` (attivazione BC): lo sterzo (canale 0) passa per una Tanh in [-1, 1], mentre
-        acceleratore e freno (canali 1, 2) passano per una Sigmoid in [0, 1]. È la forma con cui
-        la BC viene addestrata, perché coincide esattamente col codominio delle azioni umane
-        registrate (sterzo in [-1, 1], pedali in [0, 1]).
-      - ``sample`` (attivazione RL): Tanh su tutti e 3 i canali ([-1, 1]). Serve a valutare un
-        checkpoint TD3+BC con la stessa classe usata per la BC.
+      - ``forward`` (BC activation): steering (channel 0) goes through a Tanh in [-1, 1], while
+        throttle and brake (channels 1, 2) go through a Sigmoid in [0, 1]. It is the form the BC is
+        trained with, because it matches exactly the codomain of the recorded human actions
+        (steering in [-1, 1], pedals in [0, 1]).
+      - ``sample`` (RL activation): Tanh on all 3 channels ([-1, 1]). It serves to evaluate a
+        TD3+BC checkpoint with the same class used for the BC.
 
-    In ``test_agent`` la scelta tra ``forward`` e ``sample`` dipende dal tipo di pesi caricati
-    (BC oppure RL), rilevato dal nome del file o dall'argomento ``--kind``.
+    In ``test_agent`` the choice between ``forward`` and ``sample`` depends on the type of weights
+    loaded (BC or RL), detected from the file name or from the ``--kind`` argument.
     """
 
     def __init__(self, state_dim: int = STACK_DIM, hidden_size: int = 512):
@@ -191,7 +192,7 @@ class PolicyNetwork(nn.Module):
         self.continuous_head = nn.Linear(hidden_size, 3)
 
     def forward(self, state):
-        """Attivazione BC: Tanh sullo sterzo ([-1, 1]), Sigmoid su acceleratore/freno ([0, 1])."""
+        """BC activation: Tanh on steering ([-1, 1]), Sigmoid on throttle/brake ([0, 1])."""
         features = self.backbone(state)
         cont_out = self.continuous_head(features)
         steer = torch.tanh(cont_out[:, 0:1])
@@ -199,19 +200,19 @@ class PolicyNetwork(nn.Module):
         return torch.cat([steer, accel_brake], dim=1)
 
     def sample(self, state, evaluate: bool = False):
-        """Attivazione RL deterministica: Tanh su tutti e 3 i canali (uscite in [-1, 1])."""
+        """Deterministic RL activation: Tanh on all 3 channels (outputs in [-1, 1])."""
         features = self.backbone(state)
         mean = self.continuous_head(features)
         return torch.tanh(mean)
 
 
 class Critic(nn.Module):
-    """Twin Critic Network per la stima del valore Q(s, a) nel TD3+BC.
+    """Twin Critic Network for estimating the value Q(s, a) in TD3+BC.
 
-    Implementa due reti Q indipendenti (Q1 e Q2), addestrate da zero, che ricevono in input la
-    concatenazione dello stato 87D e dell'azione 3D. L'uso di due stime distinte combatte
-    l'Overestimation Bias tipico dei metodi actor-critic: nel calcolo del target di Bellman si
-    usa il MINIMO tra Q1 e Q2, ottenendo una stima del valore più conservativa e stabile.
+    Implements two independent Q-networks (Q1 and Q2), trained from scratch, that receive the
+    concatenation of the 87D state and the 3D action. Using two distinct estimates counters the
+    Overestimation Bias typical of actor-critic methods: the Bellman target uses the MINIMUM of Q1
+    and Q2, yielding a more conservative and stable value estimate.
     """
 
     def __init__(self, state_dim: int = STACK_DIM, action_dim: int = 3, hidden_size: int = 512):
@@ -220,6 +221,6 @@ class Critic(nn.Module):
         self.q2 = make_q_net(state_dim, action_dim, hidden_size)
 
     def forward(self, state, action):
-        """Ritorna la coppia di stime (Q1(s, a), Q2(s, a))."""
+        """Returns the pair of estimates (Q1(s, a), Q2(s, a))."""
         xu = torch.cat([state, action], 1)
         return self.q1(xu), self.q2(xu)

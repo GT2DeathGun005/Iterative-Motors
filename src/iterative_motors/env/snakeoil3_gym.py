@@ -6,18 +6,18 @@
 # extentions used in the Simulated Car Racing competitions.
 # http://scr.geccocompetitions.com/
 #
-# Iterative Motors usa questo file come client UDP SCR a basso livello. Tutta la logica di
-# guida vive in gym_torcs.py, td3_bc.py, test_agent.py e gearing.py; qui restano
-# solo parsing della telemetria, formato dell'azione e gestione socket.
+# Iterative Motors uses this file as the low-level SCR UDP client. All the driving
+# logic lives in gym_torcs.py, td3_bc.py, test_agent.py and gearing.py; here remain
+# only telemetry parsing, action format and socket handling.
 #
-# Il client espone:
-# - ServerState.d: dizionario con la telemetria ricevuta da TORCS.
-# - DriverAction.d: dizionario con accel/brake/gear/steer/meta da inviare.
-# Campi principali letti:
+# The client exposes:
+# - ServerState.d: dictionary with the telemetry received from TORCS.
+# - DriverAction.d: dictionary with accel/brake/gear/steer/meta to send.
+# Main fields read:
 #    angle, curLapTime, damage, distFromStart, distRaced, focus,
 #    fuel, gear, lastLapTime, opponents, racePos, rpm,
 #    speedX, speedY, speedZ, track, trackPos, wheelSpinVel, z
-# Campi principali scritti:
+# Main fields written:
 #    accel, brake, clutch, gear, steer, focus, meta
 
 # for Python3-based torcs python robot client
@@ -30,12 +30,12 @@ PI= 3.14159265359
 
 data_size = 2**17
 
-# Directory di questo file (env/) — usata per risolvere i path relativi
+# Directory of this file (env/) — used to resolve relative paths
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _AUTOSTART_SH = os.path.join(_THIS_DIR, 'autostart.sh')
 
-# Angoli dei 19 sensori track: devono coincidere con la BC augmentation.
-# Costruiti dalla costante condivisa (fallback al literale se importato fuori dal package).
+# Angles of the 19 track sensors: they must match the BC augmentation.
+# Built from the shared constant (fallback to the literal if imported outside the package).
 try:
     from iterative_motors.common.constants import SENSOR_ANGLES_DEG as _ANG
 except Exception:
@@ -98,16 +98,16 @@ def bargraph(x,mn,mx,w,c='X'):
     pnc= int(posnonpu/upw)*'_'
     return '[%s]' % (nnc+npc+ppc+pnc)
 
-# Hook opzionale impostato dal processo chiamante (es. td3_bc.py): callable senza argomenti
-# che ritorna True quando l'utente ha richiesto lo stop. Permette di abortire l'attesa
-# del server TORCS invece di restare bloccati per sempre su "Waiting for server".
+# Optional hook set by the calling process (e.g. td3_bc.py): a callable with no arguments
+# that returns True when the user has requested the stop. It allows aborting the wait
+# for the TORCS server instead of being blocked forever on "Waiting for server".
 abort_check = None
 
 class ServerTimeoutError(Exception):
-    """Il server TORCS non ha risposto entro il limite di tentativi di connessione.
+    """The TORCS server did not respond within the connection-attempt limit.
 
-    aborted=True indica che l'attesa è stata interrotta da una richiesta di stop
-    dell'utente (via abort_check), non da un timeout del server.
+    aborted=True indicates that the wait was interrupted by a user stop request
+    (via abort_check), not by a server timeout.
     """
     def __init__(self, message, aborted=False):
         super().__init__(message)
@@ -140,7 +140,7 @@ class Client():
         self.setup_connection()
 
     def _note_missed_packet(self):
-        """Gestisce timeout UDP ripetuti senza bloccare il training all'infinito."""
+        """Handles repeated UDP timeouts without blocking the training forever."""
         self.missed_packets += 1
         print('.', end=' ', flush=True)
         if self.missed_packets >= 5:
@@ -159,14 +159,14 @@ class Client():
         # == Initialize Connection To Server ==
         self.so.settimeout(1)
 
-        # Attesa LIMITATA: se TORCS non espone il server SCR entro max_attempts secondi
-        # (es. la macro di autostart ha perso il timing e il gioco è fermo al menu),
-        # si solleva ServerTimeoutError così il wrapper TorcsEnv può rilanciare il
-        # simulatore invece di attendere all'infinito.
+        # LIMITED wait: if TORCS does not expose the SCR server within max_attempts seconds
+        # (e.g. the autostart macro lost timing and the game is stuck at the menu),
+        # a ServerTimeoutError is raised so the TorcsEnv wrapper can relaunch the
+        # simulator instead of waiting forever.
         attempts = 0
-        max_attempts = 30  # ~30 s: ogni tentativo fallito consuma il timeout del socket (1 s)
+        max_attempts = 30  # ~30 s: each failed attempt consumes the socket timeout (1 s)
         while True:
-            # Angoli dei 19 sensori track (dalla costante condivisa SENSOR_ANGLES_DEG).
+            # Angles of the 19 track sensors (from the shared constant SENSOR_ANGLES_DEG).
             a = TRACK_SENSOR_STR
 
             initmsg='%s(init %s)' % (self.sid,a)
@@ -206,8 +206,8 @@ class Client():
                         'episodes=','track=','stage=',
                         'debug','help','version'])
         except getopt.error:
-            # Quando usato come libreria (es. da td3_bc.py/test_agent.py), sys.argv contiene
-            # argomenti dello script chiamante: ignora silenziosamente.
+            # When used as a library (e.g. from td3_bc.py/test_agent.py), sys.argv contains
+            # arguments of the calling script: ignore silently.
             return
         try:
             for opt in opts:
@@ -237,8 +237,8 @@ class Client():
         if not self.so: return
         sockdata = str()
 
-        # Svuota il buffer del socket leggendo tutti i pacchetti pendenti (non-blocking)
-        # per garantire che leggiamo solo la telemetria più recente (risolve il control lag UDP).
+        # Drain the socket buffer by reading all pending packets (non-blocking)
+        # to ensure we read only the most recent telemetry (fixes the UDP control lag).
         self.so.setblocking(False)
         last_packet = None
         while True:
@@ -254,7 +254,7 @@ class Client():
         if last_packet is not None:
             sockdata = last_packet.decode('utf-8')
         else:
-            # Se il buffer era vuoto, facciamo una lettura bloccante singola per il prossimo pacchetto
+            # If the buffer was empty, we do a single blocking read for the next packet
             try:
                 data, addr = self.so.recvfrom(data_size)
                 sockdata = data.decode('utf-8')
@@ -265,7 +265,7 @@ class Client():
         while True:
             if '***identified***' in sockdata:
                 print("Client connected on %d.............." % self.port)
-                # Leggiamo il prossimo pacchetto (bloccante)
+                # We read the next packet (blocking)
                 try:
                     data, addr = self.so.recvfrom(data_size)
                     sockdata = data.decode('utf-8')
@@ -286,7 +286,7 @@ class Client():
                 self.shutdown()
                 return
             elif not sockdata: # Empty?
-                # Riprova leggendo il prossimo pacchetto
+                # Retry by reading the next packet
                 try:
                     data, addr = self.so.recvfrom(data_size)
                     sockdata = data.decode('utf-8')

@@ -1,159 +1,161 @@
 # Iterative Motors
 
-Iterative Motors è un progetto di guida autonoma per TORCS, nato per la **IBM AI Racing League**.
-L'obiettivo: costruire un agente che superi le prestazioni umane sul giro. Il modello non guida
-"da zero": prima **imita** un pilota reale tramite Behavioral Cloning (BC), poi spinge oltre quella
-base con Reinforcement Learning **TD3+BC**, generando giri sempre più veloci e ripetibili.
+Iterative Motors is an autonomous-driving project for TORCS, built for the **IBM AI Racing League**.
+The goal: an agent that beats human lap performance. The model does not learn "from scratch": first
+it **imitates** a real driver via Behavioral Cloning (BC), then it pushes past that baseline with
+Reinforcement Learning (**TD3+BC**), producing faster and more repeatable laps.
 
-Il miglior tempo umano nel dataset è **69.54s**; l'obiettivo è batterlo e avvicinare il record della
-pista (**~65s**).
+The best human lap in the dataset is **69.54 s**; our agent's best deterministic lap is **68.838 s**,
+and we are pushing toward the track limit (**~65 s**).
 
-Per i dettagli tecnici completi vedi **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+For the full technical details see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
-## Caratteristiche principali
+## Key features
 
-- Simulatore TORCS controllato via protocollo SCR/UDP (senza modificarne la fisica — regola IBM League).
-- Raccolta dati umana con controller PS5 DualSense o tastiera.
-- Stato sensoriale 29D con frame stacking temporale (t-12, t-6, t → 87D); marcia gestita a parte.
-- Behavioral Cloning con loss pesata per sterzo/freno/acceleratore.
-- Data augmentation Bojarski-style con **clamp on-track** (non insegna a guidare fuori pista) e
-  perturbazione angolare ampliata (~10°).
-- Fine-tuning TD3+BC: Actor con warm-start da BC, Twin Critic, campionamento ibrido expert/online/elite.
-- **Flywheel dati**: la TD3 registra i propri giri puliti (`laps_auto/`) per riaddestrare una BC più forte.
-- **Reward a due regimi**: stabilizzazione (penalità di corridoio + completamento piatto → chiudere quasi
-  ogni giro) e time-attack (bonus tempo + **reward telemetrica a settori** → limare i decimi battendo i
-  propri split, fino al giro ideale teorico).
-- Cambio marcia deterministico separato dalla rete; checkpoint atomici con backup e resume robusto.
-- Valutazione deterministica con auto-detect del miglior checkpoint.
-- **Orchestratore unico `run.sh`** per l'intera pipeline, con cruscotto di stato.
+- TORCS simulator driven over the SCR/UDP protocol (without changing its physics — IBM League rule).
+- Human data collection with a PS5 DualSense controller or keyboard.
+- 29-D sensor state with temporal frame stacking (t-12, t-6, t → 87-D); gearing handled separately.
+- Behavioral Cloning with a per-channel weighted loss (steering / throttle / brake).
+- Bojarski-style data augmentation with an **on-track clamp** (never teaches the car to drive off
+  track) and a widened angular perturbation (~10°).
+- TD3+BC fine-tuning: Actor warm-started from BC, Twin Critic, hybrid expert/online/elite sampling.
+- **Data flywheel**: the agent records its own clean laps (`laps_auto/`) to retrain a stronger BC.
+- **Two-regime reward**: stabilization (corridor margin penalty + flat completion → finish almost
+  every lap) and time-attack (time bonus + **per-sector split telemetry** → shave tenths by beating
+  its own splits, toward a theoretical ideal lap).
+- Deterministic gear shifting decoupled from the network; atomic checkpoints with backups and robust resume.
+- Deterministic evaluation with automatic best-checkpoint detection.
+- **Single orchestrator `run.sh`** for the whole pipeline, with a status dashboard.
 
-## Struttura del progetto
+## Project layout
 
 ```text
 .
-|-- run.sh                          # orchestratore unico della pipeline (CLI controller)
-|-- src/iterative_motors/           # PACKAGE: logica del progetto
-|   |-- common/                    # costanti, stato/normalizzazione, checkpoint
-|   |-- env/                       # wrapper TORCS, client SCR, gearing, autostart
-|   |-- models/                    # reti (Actor/PolicyNetwork/Critic) e mapping azioni
-|   |-- data/                      # replay buffer, dataset HDF5, lap recorder, raccolta dati
-|   |-- bc/                        # data augmentation + training Behavioral Cloning
-|   |-- rl/                        # agente TD3+BC, reward/time-attack, training loop
-|   `-- eval/                      # test deterministico dell'agente
-|-- train_set/                      # dataset (laps/, laps_auto/), checkpoint, log (NON in git)
-`-- telemetry/                      # CSV generati dai test
+|-- run.sh                          # single pipeline orchestrator (CLI controller)
+|-- requirements.txt                # Python dependencies (tested versions)
+|-- src/iterative_motors/           # PACKAGE: project logic
+|   |-- common/                    # constants, state/normalization, checkpointing
+|   |-- env/                       # TORCS wrapper, SCR client, gearing, autostart
+|   |-- models/                    # networks (Actor/PolicyNetwork/Critic) and action mapping
+|   |-- data/                      # replay buffer, HDF5 dataset, lap recorder, data collection
+|   |-- bc/                        # data augmentation + Behavioral Cloning training
+|   |-- rl/                        # TD3+BC agent, reward/time-attack, training loop
+|   `-- eval/                      # deterministic agent test
+|-- train_set/                      # dataset (laps/, laps_auto/), checkpoints, logs (NOT in git)
+`-- telemetry/                      # CSVs produced by tests
 ```
 
-Gli entrypoint vivono nel package e si lanciano via `run.sh` o come moduli
-(`PYTHONPATH=src python -m iterative_motors.<sottopacchetto>.<modulo>`).
+Entry points live in the package and are launched via `run.sh` or as modules
+(`PYTHONPATH=src python -m iterative_motors.<subpackage>.<module>`).
 
-## Prerequisiti
+## Requirements
 
-Linux con:
-- Python 3; TORCS con server SCR; `xvfb-run` (headless); `xte` (autostart menu TORCS, pacchetto `xautomation`);
-- librerie Python: `torch`, `numpy`, `h5py`, `pygame`, `gym`.
+Linux with:
+- Python 3; TORCS with the SCR server; `xvfb-run` (headless); `xte` (TORCS autostart menu, package `xautomation`);
+- Python libraries: see `requirements.txt` (`torch`, `numpy`, `h5py`, `pygame`, `gym`).
 
 ```bash
 sudo apt install torcs xvfb xautomation
 python -m venv .venv && source .venv/bin/activate
-pip install numpy torch h5py pygame gym   # per CUDA usare il comando ufficiale PyTorch
+pip install -r requirements.txt          # for CUDA, see the note in requirements.txt
 ```
 
-## Uso rapido (via orchestratore)
+## Quick start (via the orchestrator)
 
 ```bash
-./run.sh             # menu interattivo con frecce + Enter
-./run.sh help        # elenco completo dei comandi diretti
-./run.sh status      # cruscotto: processi attivi, dataset, record, ultimi log
+./run.sh             # interactive menu (arrows + Enter)
+./run.sh help        # full list of direct commands
+./run.sh status      # dashboard: running tasks, dataset, records, last logs
 ```
 
-Il menu di `run.sh` funziona come un piccolo pit wall: mostra una Formula 1 in ASCII, riepilogo
-di processi/dataset/record e opzioni selezionabili con le frecce. Quando avvii un comando, propone
-preset comuni e un campo libero per argomenti/env var, per esempio `SHOW_GUI=1 --laps 1`. I comandi
-diretti restano disponibili per automazione e script.
+The `run.sh` menu works like a small pit wall: an ASCII Formula 1, a summary of
+processes/dataset/records, and arrow-selectable options. When you start a command it suggests common
+presets and a free field for args/env vars, e.g. `SHOW_GUI=1 --laps 1`. The direct commands remain
+available for automation and scripting.
 
-### 1. Raccogliere dimostrazioni umane
+### 1. Collect human demonstrations
 
 ```bash
-./run.sh collect --device controller     # oppure --device keyboard
+./run.sh collect --device controller     # or --device keyboard
 ```
 
-I giri validi finiscono in `train_set/laps/lap_NNN.h5`. Opzioni utili: `--segment_only` (solo
-segmenti di curve), `--zones "670:900,2380:2530"` (zone specifiche).
+Valid laps land in `train_set/laps/lap_NNN.h5`. Useful options: `--segment_only` (corner segments
+only), `--zones "670:900,2380:2530"` (specific zones).
 
-### 2. Addestrare la Behavioral Cloning
+### 2. Train Behavioral Cloning
 
 ```bash
 ./run.sh bc
 ```
 
-Produce `train_set/checkpoints/bc_policy.pth` e `state_norm.npz` (background; segui con
-`./run.sh logs bc` e `./run.sh status`).
+Produces `train_set/checkpoints/bc_policy.pth` and `state_norm.npz` (runs in the background; follow
+with `./run.sh logs bc` and `./run.sh status`).
 
-### 3. Fine-tuning TD3+BC + raccolta giri (harvest)
+### 3. TD3+BC fine-tuning + lap harvesting
 
 ```bash
 ./run.sh td3 --episodes 2500
 ```
 
-Il launcher `td3` applica i **default di stabilizzazione**: trust region `--trust_region 0.3` (ancora
-l'Actor al supporto dati sui campioni non-expert, anti-collasso della policy) e `IM_EXPL_NOISE=0.04`
-(rumore esplorativo fisso, scavalca l'annealing). Entrambi sovrascrivibili (es. `--trust_region 0`,
+The `td3` launcher applies the **stabilization defaults**: trust region `--trust_region 0.3` (anchors
+the Actor to the data support on non-expert samples, anti policy-collapse) and `IM_EXPL_NOISE=0.04`
+(fixed exploration noise, overrides annealing). Both overridable (e.g. `--trust_region 0`,
 `IM_EXPL_NOISE=0.02`).
 
-**Nessun filtro sui tempi** in questa fase: conta solo *completare* il giro, non la velocità. Il
-launcher carica quindi TUTTI i giri umani (`--expert_max_lap_time 0`), semina l'elite con TUTTI i giri
-auto (`--reseed_elite_max_lap_time 999`) e registra ogni giro pulito a prescindere dal tempo
-(`IM_RECORD_MAX_LAP_TIME=999`). I filtri-velocità tornano automaticamente nel time-attack.
+**No time filters** in this phase: only *finishing* the lap matters, not speed. The launcher
+therefore loads ALL human laps (`--expert_max_lap_time 0`), seeds the elite with ALL self-recorded
+laps (`--reseed_elite_max_lap_time 999`) and records every clean lap regardless of time
+(`IM_RECORD_MAX_LAP_TIME=999`). The speed filters return automatically in time-attack.
 
-La reward privilegia il **completamento robusto**: penalità di corridoio (margine dal bordo,
-`IM_MARGIN_PENALTY`) e bonus di completamento *piatto* (niente pressione sul tempo, riservata al
-time-attack). Tieni `--capture_eval_elite` **spento**: self-imitare la linea-rasoio dell'eval sovra-affila
-la policy, l'opposto di quello che serve per stabilizzare (vedi §7 di ARCHITECTURE.md).
+The reward favors **robust completion**: a corridor penalty (margin from the track edge,
+`IM_MARGIN_PENALTY`) and a *flat* completion bonus (no time pressure — that is reserved for
+time-attack). Keep `--capture_eval_elite` **off**: self-imitating the razor-edge eval line
+over-sharpens the policy, the opposite of what stabilization needs (see §7 of ARCHITECTURE.md).
 
-Durante il training l'agente registra automaticamente i propri giri completi e puliti in
-`train_set/laps_auto/` (disattivabile con `IM_RECORD_LAPS=0`). Stop pulito: `./run.sh stop td3`
-(salva il checkpoint prima di uscire).
+During training the agent automatically records its own clean, completed laps in
+`train_set/laps_auto/` (disable with `IM_RECORD_LAPS=0`). Clean stop: `./run.sh stop td3` (saves a
+checkpoint before exiting).
 
-### 4. Arricchire la BC (flywheel) e time-attack
+### 4. Enrich the BC (flywheel) and time-attack
 
 ```bash
-# Ri-addestra la BC su giri umani + auto-raccolti
+# Retrain the BC on human + self-recorded laps
 ./run.sh bc-enriched --output train_set/checkpoints/enriched/bc_policy.pth
 
-# Fase time-attack: l'agente ottimizza il tempo battendo il proprio record
+# Time-attack: the agent optimizes lap time by beating its own record
 ./run.sh time-attack --episodes 4000
 ```
 
-In time-attack si riattiva la pressione sul tempo (bonus tempo + record personale) e si aggiunge la
-**reward telemetrica a settori** (`rl/sector_timer.py`): l'agente è premiato per battere i propri split
-di settore, e a fine giro il log mostra dove perde tempo (`S07(+0.22s) ...`) e il **giro ideale teorico**
-(somma dei migliori parziali). I best-settore sono persistiti in `checkpoints/td3_sector_best.json` e
-sopravvivono ai restart; tarabili con `IM_TA_SECTORS`, `IM_TA_SECTOR_K`, `IM_TA_SECTOR_CAP`.
+In time-attack the time pressure (time bonus + personal-record bonus) is re-enabled and a **per-sector
+split telemetry** reward is added (`rl/sector_timer.py`): the agent is rewarded for beating its own
+sector splits, and at lap completion the log shows where it loses time (`S07(+0.22s) …`) and the
+**theoretical ideal lap** (the sum of the best splits). The best splits are persisted to
+`checkpoints/td3_sector_best.json` and survive restarts; tunable via `IM_TA_SECTORS`,
+`IM_TA_SECTOR_K`, `IM_TA_SECTOR_CAP`.
 
-Per adottare la BC arricchita in una nuova lineage TD3: copia i nuovi `bc_policy.pth` +
-`state_norm.npz` da `enriched/` in `train_set/checkpoints/`, azzera i checkpoint TD3 (i record
-deterministici restano protetti) e rilancia `./run.sh td3`.
+To adopt the enriched BC in a new TD3 lineage: copy the new `bc_policy.pth` + `state_norm.npz` from
+`enriched/` into `train_set/checkpoints/`, reset the TD3 checkpoints (the deterministic records stay
+protected), and relaunch `./run.sh td3`.
 
-### 5. Testare l'agente
+### 5. Test the agent
 
 ```bash
-./run.sh test --laps 3                # auto-detect del miglior checkpoint
-SHOW_GUI=1 ./run.sh test --laps 1     # con finestra TORCS visibile
+./run.sh test --laps 3                # auto-detect the best checkpoint
+SHOW_GUI=1 ./run.sh test --laps 1     # with the TORCS window visible
 ./run.sh test --weights train_set/checkpoints/td3_det_best_lap.pth --laps 5
 ```
 
-I CSV di telemetria vengono scritti in `telemetry/`.
+Telemetry CSVs are written to `telemetry/`.
 
-## Idea del modello
+## The idea behind the model
 
-La policy vede 3 istanti temporali dello stato sensoriale (input 87D) e produce sterzo, acceleratore
-e freno; la marcia è calcolata da `gearing.py`. La BC dà la competenza iniziale; il TD3+BC conserva
-quell'ancora esperta ma ottimizza la reward racing (avanzare, restare in pista, fluidità, completare
-il giro, abbassare il tempo). Il flywheel dei dati reimmette i giri migliori dell'agente nel dataset
-BC, alzando progressivamente il punto di partenza.
+The policy sees 3 temporal frames of the sensor state (87-D input) and outputs steering, throttle and
+brake; the gear is computed by `gearing.py`. BC provides the initial competence; TD3+BC keeps that
+expert anchor while optimizing the racing reward (advance, stay on track, smoothness, finish the lap,
+lower the time). The data flywheel feeds the agent's best laps back into the BC dataset, raising the
+starting point on every iteration.
 
-## Riferimenti
+## References
 
 - Lillicrap et al., *Continuous Control with Deep RL*, 2015 — https://arxiv.org/abs/1509.02971
 - Fujimoto, van Hoof, Meger, *Addressing Function Approximation Error in Actor-Critic Methods*, 2018 — https://arxiv.org/abs/1802.09477

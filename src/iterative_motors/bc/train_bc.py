@@ -1,42 +1,42 @@
 """
-Behavioral Cloning (Imitation Learning) — TORCS Giro Secco
+Behavioral Cloning (Imitation Learning) — TORCS Hot Lap
 
-Addestra una PolicyNetwork su spazi di dimensione continua sulle dimostrazioni umane (HDF5).
+Trains a PolicyNetwork on continuous-dimensional spaces from the human demonstrations (HDF5).
 
 Features:
-  - Supporto multi-file: accetta sia un singolo .h5 sia una directory di lap_[0-9]*.h5 (solo giri completi)
-  - Supporto hardware per CPU e GPU tramite pytorch per un training più veloce su sistemi con GPU 
-  - Split del dataset in train e validation set (80/20) con Early Stopping per evitare overfitting
-  - Il Cosine LR scheduler modifica dinamicamente il learning rate durante il training per una migliore convergenza del modello.
-    Grazie a questa feature il learning rate varia seguendo l'andamento del coseno, se avessimo usato altri tipi di scheduler
-    il modello avrebbe potuto convergere più lentamente o non convergere affatto alla fine del training. In questo modo il learning rate è
-    molto alto all'inizio, si riduce gradualmente fino a diventare il valore minimo impostato ovvero 1e-6.
-  
-  - Bojarski-style data augmentation per cercare di mitigare il covariate shift tra training e inferenza, è impostato per perturbare nei seguenti modi:
-      - Perturbazione laterale: aggiunge una perturbazione laterale casuale compresa tra -0.4 e +0.4 (40% della trackpos), simulando la posizione della vettura in pista.
-      - Perturbazione angolare: aggiunge una perturbazione angolare casuale compresa tra -0.08 e +0.08 radianti (~4.5°), simulando l'angolo della vettura rispetto alla pista.
-      In questo modo si insegna alla rete a recuperare da stati fuori distribuzione, migliorando la sua capacità di generalizzazione.
-      Il valore delle perturbazioni è stato scelto empiricamente (probabilmente modificarli in valori più appropriati permetterebbe di migliorare le performance del bc),
-      ma la scarsità della BC è stata corretta dall'RL con il TD3+BC.
+  - Multi-file support: accepts either a single .h5 or a directory of lap_[0-9]*.h5 (complete laps only)
+  - CPU and GPU hardware support via pytorch for faster training on GPU systems
+  - Dataset split into train and validation sets (80/20) with Early Stopping to avoid overfitting
+  - The Cosine LR scheduler dynamically modifies the learning rate during training for better model convergence.
+    Thanks to this feature the learning rate varies following the cosine trend; had we used other scheduler types
+    the model might have converged more slowly or not at all by the end of training. This way the learning rate is
+    very high at the start and gradually decreases to the minimum value set, i.e. 1e-6.
 
-NOTA: I dati HDF5 sono già normalizzati da data_collection.flatten_state():
+  - Bojarski-style data augmentation to try to mitigate the covariate shift between training and inference; it is set to perturb in the following ways:
+      - Lateral perturbation: adds a random lateral perturbation between -0.4 and +0.4 (40% of the trackpos), simulating the car's position on track.
+      - Angular perturbation: adds a random angular perturbation between -0.08 and +0.08 radians (~4.5°), simulating the car's angle relative to the track.
+      This teaches the network to recover from out-of-distribution states, improving its generalization ability.
+      The perturbation values were chosen empirically (changing them to more appropriate values would probably improve the BC performance),
+      but the weakness of the BC was corrected by the RL with TD3+BC.
+
+NOTE: The HDF5 data is already normalized by data_collection.flatten_state():
   - track[19]: /200 (via gym_torcs.make_observaton)
   - speedX/Y/Z: /50 (via gym_torcs.make_observaton, default_speed=50)
   - wheelSpinVel[4]: /100 (via data_collection.flatten_state)
   - rpm: /10000 (via data_collection.flatten_state)
-  - distFromStart: Raccolta ma rimossa dal dataset perché non volevamo che la rete imparasse a correlare l'azione con la distanza dal traguardo (causando un potenziale train-test mismatch).
+  - distFromStart: Collected but removed from the dataset because we did not want the network to learn to correlate the action with the distance from the finish line (causing a potential train-test mismatch).
 
 
-Mapping delle azioni prodotte dalla rete neurale e poi inviate a TORCS:
+Mapping of the actions produced by the neural network and then sent to TORCS:
 
-  Indice Torcs | Azione              | Range        | Funzione di attivazione rete
+  Torcs Index  | Action              | Range        | Network activation function
   ----------------------------------------------------------------------------------
-  [0]          | sterzata            | [-1, 1]      | Tanh output (perfetta perché come codominio ha [-1, 1], come le azioni registrate)
-  [1]          | accelerazione       | [0, 1]       | Sigmoid output (perfetta perché come codominio ha [0, 1], come le azioni registrate)
-  [2]          | freno               | [0, 1]       | Sigmoid output (perfetta perché come codominio ha [0, 1], come le azioni registrate)
+  [0]          | steering            | [-1, 1]      | Tanh output (perfect because its codomain is [-1, 1], like the recorded actions)
+  [1]          | acceleration        | [0, 1]       | Sigmoid output (perfect because its codomain is [0, 1], like the recorded actions)
+  [2]          | brake               | [0, 1]       | Sigmoid output (perfect because its codomain is [0, 1], like the recorded actions)
 
-NOTA: la marcia non viene predetta dalla rete, nel dataset è presente come dato ma viene ignorato. 
-Il cambio è affidato allo script gearing.py che si occupa di selezionare la marcia appropriata in base a giri del motore e velocità.
+NOTE: the gear is not predicted by the network; it is present in the dataset as data but is ignored.
+Gear shifting is delegated to the gearing.py script which selects the appropriate gear based on engine revs and speed.
 """
 
 import os
@@ -44,14 +44,14 @@ import sys
 import glob
 import argparse
 import numpy as np
-import h5py #libreria usata per leggere i file h5
+import h5py #library used to read h5 files
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, random_split
 from datetime import datetime
 
-# Iterative Motors: rete della BC condivisa dal package.
+# Iterative Motors: BC network shared by the package.
 _SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir))
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
@@ -66,65 +66,63 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 
-
-
 # ──────────────────────────────────────────────────────────────────────
 #  Trainer
 # ──────────────────────────────────────────────────────────────────────
 
 class BehaviorCloningTrainer:
-    """Addestra la PolicyNetwork
+    """Trains the PolicyNetwork
 
-    Funzionalità:
-        - Loss continua pesata per sterzo, acceleratore e freno:
-            - Viene utilizzato l'errore quadratico medio (MSE) pesato per ogni azione.
-            - I pesi sono assegnati per dare più importanza ad azioni critiche e meno frequenti:
-                - Sterzo: peso base 1.0 (con un boost di 3x in curva per migliorare la traiettoria). La curva viene rilevata se la rotazione dello sterzo è superiore a STEER_CURVE_THRESHOLD ora impostata a 0.10 (10% del massimo della rotazione).
-                    Tale iperparametro probabilmente andrà aumentato per migliorare la BC e adattato al circuito. 
-                - Acceleratore: peso base 1.0.
-                - Freno: peso base 5.0 (con un boost dinamico del 25x quando il pilota frena, per costringere la rete ad apprendere le staccate).
+    Functionality:
+        - Continuous loss weighted for steering, throttle and brake:
+            - A weighted mean squared error (MSE) is used for each action.
+            - The weights are assigned to give more importance to critical and less frequent actions:
+                - Steering: base weight 1.0 (with a 3x boost in corners to improve the trajectory). A corner is detected if the steering rotation exceeds STEER_CURVE_THRESHOLD, now set to 0.10 (10% of the maximum rotation).
+                    This hyperparameter will probably need to be increased to improve the BC and adapted to the circuit.
+                - Throttle: base weight 1.0.
+                - Brake: base weight 5.0 (with a dynamic 25x boost when the driver brakes, to force the network to learn the braking points).
 
-      - Validation split 80/20 con Early Stopping configurabile
-            - Il dataset viene diviso in due parti: 80% per il training e 20% per la validazione
-            - L'early stopping impedisce l'overfitting fermando l'allenamento quando la validation loss smette di migliorare (evita di sprecare risorse computazionali)
-      
+      - 80/20 validation split with configurable Early Stopping
+            - The dataset is split into two parts: 80% for training and 20% for validation
+            - Early stopping prevents overfitting by stopping training when the validation loss stops improving (avoids wasting compute resources)
+
       - Cosine Annealing LR scheduler
-        - Il Learning Rate (LR) viene ridotto gradualmente durante l'allenamento seguendo una curva coseno
-      
-      - Bojarski-style Data augmentation con rumore gaussiano strutturato sugli stati
-        - Viene aggiunto un rumore gaussiano agli stati per aumentare la robustezza del modello
-      
-      - Salvataggio dei pesi del modello basato sulla migliore validation loss
-        - Durante le varie epoche di allenamento, la rete neurale viene salvata solo qualora il suo punteggio sulla validation loss sia migliore rispetto ai precedenti.
+        - The Learning Rate (LR) is gradually reduced during training following a cosine curve
+
+      - Bojarski-style data augmentation with structured Gaussian noise on the states
+        - Gaussian noise is added to the states to increase the model's robustness
+
+      - Saving the model weights based on the best validation loss
+        - During the various training epochs, the neural network is saved only if its validation-loss score is better than the previous ones.
     """
 
-    # Pesi della loss rivisti (Iterative Motors): il vecchio freno (base 5 × boost 25 = fino a
-    # 125× lo sterzo) rendeva la loss quasi un solo regressore di frenata, peggiorando la
-    # precisione di sterzo. Ridotti a un picco ~24× (base 3 × boost 8); più enfasi in curva.
-    STEER_CURVE_THRESHOLD = 0.07  # soglia sterzo per curva (nel range [-1,1])
-    STEER_BOOST_FACTOR = 4.0      # moltiplicatore dell'errore sullo sterzo in curva
-    BRAKE_ACTIVE_THRESHOLD = 0.05  # soglia sopra la quale consideriamo che l'umano stia frenando
-    BRAKE_BOOST_FACTOR = 8.0       # moltiplicatore dell'errore sul freno quando attivo
+    # Revised loss weights (Iterative Motors): the old brake (base 5 × boost 25 = up to
+    # 125× the steering) made the loss almost a single braking regressor, worsening the
+    # steering precision. Reduced to a ~24× peak (base 3 × boost 8); more emphasis in corners.
+    STEER_CURVE_THRESHOLD = 0.07  # steering threshold for a corner (in the [-1,1] range)
+    STEER_BOOST_FACTOR = 4.0      # error multiplier for the steering in corners
+    BRAKE_ACTIVE_THRESHOLD = 0.05  # threshold above which we consider the human to be braking
+    BRAKE_BOOST_FACTOR = 8.0       # error multiplier for the brake when active
 
-    # I default globali vengono sovrascritti dagli argomenti CLI passati da main().
+    # The global defaults are overridden by the CLI arguments passed from main().
 
     def __init__(self, model: nn.Module, dataset: Dataset,
                  batch_size: int = BATCH_SIZE, lr: float = LR, device: str = DEVICE,
                  state_mean=None, state_std=None, aug_cfg: AugmentConfig = None):
 
-        ## Controllo del device e spostamento del modello su GPU se disponibile
+        ## Device check and moving the model to GPU if available
         self.device = torch.device(device)
         self.model = model.to(self.device)
-        # Configurazione della data augmentation Bojarski-style (default = AugmentConfig()).
+        # Bojarski-style data augmentation configuration (default = AugmentConfig()).
         self.aug_cfg = aug_cfg or AugmentConfig()
         print(f"  Modello spostato su: {self.device}")
 
 
-        # Preparazione dei parametri di normalizzazione (mean e std), la normalizzazione verrà applicata dopo l'augmentation e prima del forward pass alla rete
-        # I parametri verranno salvati in state_norm.npz e riutilizzati se già presenti
-        # Tale approccio è stato convalidato da Fujimoto & Gu 2021, che hanno dimostrato che normalizzare ciascuna feature
-        # usando le statistiche globali (media e deviazione standard) calcolate preventivamente sull'intero dataset
-        # stabilizza l'addestramento dell'offline RL e ne migliora le prestazioni.
+        # Preparation of the normalization parameters (mean and std); normalization will be applied after augmentation and before the forward pass to the network
+        # The parameters will be saved in state_norm.npz and reused if already present
+        # This approach was validated by Fujimoto & Gu 2021, who showed that normalizing each feature
+        # using the global statistics (mean and standard deviation) computed in advance over the entire dataset
+        # stabilizes offline-RL training and improves its performance.
         if state_mean is not None:
             self.state_mean = torch.tensor(state_mean, dtype=torch.float32, device=self.device)
             self.state_std = torch.tensor(state_std, dtype=torch.float32, device=self.device)
@@ -132,14 +130,14 @@ class BehaviorCloningTrainer:
             self.state_mean, self.state_std = None, None
 
 
-        # Ottimizzatore Adam (Adaptive Moment Estimation) con learning rate lr e weight decay 1e-5
-        # Adam è uno standard negli addestramenti di reti neurali, decide cose e quanto modificare il peso dei neuroni durante l'apprendimento.
-        # weight_decay è un parametro che serve a penalizzare i pesi troppo grandi del modello, evitando l'overfitting.
+        # Adam optimizer (Adaptive Moment Estimation) with learning rate lr and weight decay 1e-5
+        # Adam is a standard in neural-network training; it decides what and how much to change the neuron weights during learning.
+        # weight_decay is a parameter that penalizes overly large model weights, avoiding overfitting.
         self.optimizer = optim.Adam(
             self.model.parameters(), lr=lr, weight_decay=1e-5
         )
 
-        # Split del dataset (con seed fisso per la riproducibilità) in training e validation set (80% training, 20% validation)
+        # Dataset split (with a fixed seed for reproducibility) into training and validation sets (80% training, 20% validation)
         total = len(dataset)
         val_size = max(1, int(total * 0.2))
         train_size = total - val_size
@@ -148,10 +146,10 @@ class BehaviorCloningTrainer:
             generator=torch.Generator().manual_seed(42)
         )
 
-        # Un DataLoader è un iteratore che permette di scorrere il dataset
-        # shuffle=True fa sì che i dati vengano mescolati ad ogni epoca (evita che l'agente impari i dati in ordine)
-        # num_workers=2 fa sì che i dati vengano caricati in parallelo (accelera l'addestramento)
-        # pin_memory se true fa sì che i dati vengano copiati nella memoria della GPU (accelera l'addestramento)
+        # A DataLoader is an iterator that allows scrolling through the dataset
+        # shuffle=True makes the data be shuffled at each epoch (prevents the agent from learning the data in order)
+        # num_workers=2 makes the data be loaded in parallel (speeds up training)
+        # pin_memory if true makes the data be copied into the GPU memory (speeds up training)
         self.train_loader = DataLoader(
             self.train_dataset, batch_size=batch_size,
             shuffle=True, num_workers=2, pin_memory=(device != "cpu")
@@ -166,24 +164,24 @@ class BehaviorCloningTrainer:
         print(f"Dataset split: {train_size} train / {val_size} val")
 
 
-    # Funzione che calcola l'errore commesso dalla rete rispetto alle azioni del pilota umano.
-    # È chiamata combined perché combina più errori (mse per steer, accel, brake) in un solo valore finale
-    # pred_continuous: azioni predette dalla rete neurale
-    # target_actions: azioni del pilota umano
+    # Function that computes the error made by the network relative to the human driver's actions.
+    # It is called combined because it combines several errors (mse for steer, accel, brake) into a single final value
+    # pred_continuous: actions predicted by the neural network
+    # target_actions: human driver's actions
     def _combined_loss(self, pred_continuous, target_actions):
-    
+
         targets_cont = target_actions[:, 0:3]
         sq_error = (pred_continuous - targets_cont) ** 2
 
-        # Pesi per canale continuo: [steer, accel, brake] (freno base ridotto 5 -> 3)
+        # Weights per continuous channel: [steer, accel, brake] (brake base reduced 5 -> 3)
         channel_weights = torch.tensor([1.0, 1.0, 3.0], device=pred_continuous.device)
 
-        # Boost freno dinamico se l'umano frena
+        # Dynamic brake boost if the human brakes
         brake_target = targets_cont[:, 2]
         is_braking = (brake_target > self.BRAKE_ACTIVE_THRESHOLD).float()
         brake_boost = 1.0 + (self.BRAKE_BOOST_FACTOR - 1.0) * is_braking
 
-        # Boost sterzo in curva
+        # Steering boost in corners
         steer_target = targets_cont[:, 0].abs()
         is_curve = (steer_target > self.STEER_CURVE_THRESHOLD).float()
         steer_boost = 1.0 + (self.STEER_BOOST_FACTOR - 1.0) * is_curve
@@ -193,7 +191,7 @@ class BehaviorCloningTrainer:
         weighted_sq[:, 2] = weighted_sq[:, 2] * brake_boost
         return weighted_sq.mean()
 
-    # Funzione che definisce un'epoca di addestramento, ad ogni epoca i pesi della rete vengono modificati per minimizzare l'errore.
+    # Function that defines one training epoch; at each epoch the network weights are modified to minimize the error.
     def train_epoch(self) -> float:
         self.model.train()
         total_loss = 0.0
@@ -202,72 +200,72 @@ class BehaviorCloningTrainer:
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
-            # Reshape temporaneo per applicare l'augmentation su ciascuno dei 3 frame in modo coerente
+            # Temporary reshape to apply the augmentation on each of the 3 frames coherently
             batch_size = states.size(0)
             states = states.view(batch_size, 3, 29)
 
-            # Data augmentation Bojarski-style (parametri configurabili in AugmentConfig).
+            # Bojarski-style data augmentation (parameters configurable in AugmentConfig).
             states, targets = augment_batch(states, targets, self.aug_cfg)
 
-            # Standardizzazione dello stato e flattening finale:
-            # - La normalizzazione (z-score) viene applicata in questa fase poiché l'augmentation precedente
-            #   deve operare sulle grandezze fisiche reali (metri, radianti, km/h).
-            # - Ripristiniamo la dimensionalità piatta (87D) richiesta in input dalla rete neurale.
+            # State standardization and final flattening:
+            # - Normalization (z-score) is applied at this stage since the previous augmentation
+            #   must operate on the real physical quantities (meters, radians, km/h).
+            # - We restore the flat dimensionality (87D) required as input by the neural network.
             if self.state_mean is not None:
                 states = (states - self.state_mean) / (self.state_std + 1e-3)
             states = states.view(batch_size, 87)
 
-            self.optimizer.zero_grad() #azzera i gradienti del passo precedente
-            pred_cont = self.model(states) #passa il batch alla rete neurale per essere processato
-            loss = self._combined_loss(pred_cont, targets) #calcola la loss
-            loss.backward() #calcola i gradienti
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) #clippa i gradienti per evitare esplosione del gradiente se superano 1.0
-            self.optimizer.step() #aggiorna i pesi della rete neurale
+            self.optimizer.zero_grad() #zeroes the gradients from the previous step
+            pred_cont = self.model(states) #passes the batch to the neural network to be processed
+            loss = self._combined_loss(pred_cont, targets) #computes the loss
+            loss.backward() #computes the gradients
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) #clips the gradients to avoid gradient explosion if they exceed 1.0
+            self.optimizer.step() #updates the neural-network weights
 
-            total_loss += loss.item() #somma la loss per calcolare la media finale
+            total_loss += loss.item() #accumulates the loss to compute the final average
 
-        return total_loss / len(self.train_loader) #ritorna la loss media sul batch
+        return total_loss / len(self.train_loader) #returns the average loss over the batch
 
-    #Questo metodo viene chiamato per calcolare la loss sulla validation set. 
-    #Viene chiamato alla fine di ogni epoch per valutare le performance del modello. 
-    @torch.no_grad()    # non serve calcolare i gradienti per la validation
+    #This method is called to compute the loss on the validation set.
+    #It is called at the end of each epoch to evaluate the model's performance.
+    @torch.no_grad()    # no need to compute gradients for the validation
     def validate(self) -> float:
-        self.model.eval() #metti il modello in validation mode
+        self.model.eval() #put the model in validation mode
         total_loss = 0.0
 
-        for states, targets in self.val_loader: #cicla sul validation set
+        for states, targets in self.val_loader: #iterate over the validation set
             states = states.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
-            # Stessa normalizzazione del training (nessuna augmentation in validazione)
-            # Normalizzazione e Forward Pass
+            # Same normalization as training (no augmentation in validation)
+            # Normalization and Forward Pass
             if self.state_mean is not None:
                 states = states.view(states.size(0), 3, 29)
                 states = (states - self.state_mean) / (self.state_std + 1e-3)
                 states = states.view(states.size(0), 87)
 
-            pred_cont = self.model(states) #calcola la predizione del modello
-            loss = self._combined_loss(pred_cont, targets) #calcola la loss
-            total_loss += loss.item() #somma la loss per calcolare la media finale
+            pred_cont = self.model(states) #computes the model's prediction
+            loss = self._combined_loss(pred_cont, targets) #computes the loss
+            total_loss += loss.item() #accumulates the loss to compute the final average
 
-        return total_loss / len(self.val_loader) #ritorna la loss media sul batch
+        return total_loss / len(self.val_loader) #returns the average loss over the batch
 
-    # Metodo che coordina il processo di addestramento del modello in BC
+    # Method that coordinates the BC model training process
     def train(self, max_epochs: int = 200,
               checkpoint_path: str = "train_set/checkpoints/bc_policy.pth",
               patience: int = 50, log_path: str = None):
 
-        # Log su file per tenere traccia del training
+        # File logging to keep track of the training
         logf = open(log_path, "a", encoding="utf-8") if log_path else None
 
-        # Funzione di utilità per il logging, stampa la riga passata, va a capo e la salva sul file di log
+        # Logging utility function: prints the given line, adds a newline and saves it to the log file
         def _log(line: str):
             print(line)
             if logf:
                 logf.write(line + "\n")
                 logf.flush()
 
-        # Inizializzazione del training
+        # Training initialization
         try:
             _log(f"\n  Inizio training Behavioral Cloning su {self.device}...")
             _log(f"  Max epochs: {max_epochs} | Early Stopping patience: {patience}\n")
@@ -279,19 +277,19 @@ class BehaviorCloningTrainer:
 
             patience_counter = 0
 
-            # Ciclo principale di addestramento
+            # Main training loop
             for epoch in range(max_epochs):
-                train_loss = self.train_epoch() # Lancia l'epoca di addestramento
-                val_loss = self.validate() # Valida il risultato sul validation set
-                lr = self.optimizer.param_groups[0]['lr'] # prendiamo il learning rate
-                scheduler.step() # aggiorna il learning rate
+                train_loss = self.train_epoch() # Run the training epoch
+                val_loss = self.validate() # Validate the result on the validation set
+                lr = self.optimizer.param_groups[0]['lr'] # take the learning rate
+                scheduler.step() # update the learning rate
 
                 improved = ""
-                if val_loss < self.best_val_loss: # Se la loss sul validation set è migliore della migliore loss precedente
-                    self.best_val_loss = val_loss # Aggiorna la migliore loss precedente
-                    torch.save(self.model.state_dict(), checkpoint_path) # Salva il checkpoint del modello
-                    improved = " saved" # Aggiunge " saved" alla stringa da stampare
-                    patience_counter = 0 # Resetta il contatore di patience
+                if val_loss < self.best_val_loss: # If the validation-set loss is better than the previous best loss
+                    self.best_val_loss = val_loss # Update the previous best loss
+                    torch.save(self.model.state_dict(), checkpoint_path) # Save the model checkpoint
+                    improved = " saved" # Append " saved" to the string to print
+                    patience_counter = 0 # Reset the patience counter
                 else:
                     patience_counter += 1
 
@@ -301,7 +299,7 @@ class BehaviorCloningTrainer:
                     f"LR: {lr:.2e}{improved}"
                 )
 
-                # Early Stopping: se la loss sul validation set non migliora per 'patience' epoche, interrompe il training
+                # Early Stopping: if the validation-set loss does not improve for 'patience' epochs, stop training
                 if patience_counter >= patience:
                     _log(f"\n  Early Stopping: nessun miglioramento per {patience} epoche.")
                     break
@@ -309,7 +307,7 @@ class BehaviorCloningTrainer:
             _log(f"\n  Training completato. Best val loss: {self.best_val_loss:.6f}")
             _log(f"  Miglior checkpoint: {checkpoint_path}")
             _log(f"  Fine: {datetime.now().isoformat()}")
-        finally: # chiude il file di log quando il training è completato o in caso di errore
+        finally: # closes the log file when training is complete or in case of an error
             if logf:
                 logf.close()
 
@@ -319,27 +317,27 @@ class BehaviorCloningTrainer:
 # ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # Definisce la funzione che gestisce gli argomenti da riga di comando e li passa al modello per regolarne il comportamento
+    # Defines the function that handles the command-line arguments and passes them to the model to regulate its behaviour
     parser = argparse.ArgumentParser(
         description="Behavioral Cloning per l'addestramento dell'agente"
     )
-    
-    # argomento per modificare la directory dei dati di addestramento 
+
+    # argument to change the training-data directory
     parser.add_argument(
         "--dataset", type=str, default="train_set/laps",
         help="Path al dataset HDF5 (file singolo, o directory: il BC carica SOLO i giri interi lap_[0-9]*.h5, i segmenti lap_seg_*.h5 sono esclusi)"
     )
-    
-    # argomento per modificare il numeor di epoche di addestramento
+
+    # argument to change the number of training epochs
     parser.add_argument("--epochs", type=int, default=300, help="Max epoche")
-    
-    # argomento per modificare la batch size
+
+    # argument to change the batch size
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size")
-    
-    # argomento per modificare il learning rate
+
+    # argument to change the learning rate
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
-    
-    # argomento per modificare il path di output
+
+    # argument to change the output path
     parser.add_argument(
         "--output", type=str, default="train_set/checkpoints/bc_policy.pth",
         help="Path di output per i pesi del modello (state_norm.npz viene salvato nella stessa cartella)"
@@ -350,10 +348,10 @@ def main():
              "umano per l'arricchimento (flywheel dati). La normalizzazione viene ricalcolata sull'unione."
     )
 
-    args = parser.parse_args() #legge gli argomenti da riga di comando
+    args = parser.parse_args() #reads the command-line arguments
     auto_dirs = [args.auto_laps] if args.auto_laps else []
 
-    # Controlla se è disponibile una GPU, altrimenti usa la CPU
+    # Check whether a GPU is available, otherwise use the CPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n{'=' * 64}")
     print(f"  BEHAVIORAL CLONING ")
@@ -364,23 +362,23 @@ def main():
     print(f"  Stride Type: static (k=6, 0.24s)")
     print(f"{'=' * 64}\n")
 
-    # Caricamento dataset (umano + eventuali giri auto-raccolti per l'arricchimento)
+    # Dataset loading (human + any self-recorded laps for enrichment)
     print("  Caricamento dataset...")
     dataset, total_samples = load_dataset(args.dataset, extra_dirs=auto_dirs)
 
-    # Rileva le dimensioni del dataset
+    # Detect the dataset dimensions
     sample_state, _sample_action = dataset[0]
     state_dim = sample_state.shape[0]
     print(f"  Dimensioni: state={state_dim}, action_dim=4 (steer, accel, brake, gear registrata)")
 
-    # Assicurati che la directory di output esista
+    # Make sure the output directory exists
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
     if os.path.isdir(args.dataset):
         _h5s = sorted(glob.glob(os.path.join(args.dataset, "**/lap_[0-9]*.h5"), recursive=True))
     else:
         _h5s = [args.dataset]
-    # Includi anche i giri auto-raccolti nel calcolo della normalizzazione (coerenza con il dataset).
+    # Also include the self-recorded laps in the normalization computation (consistency with the dataset).
     for _ad in auto_dirs:
         if _ad and os.path.isdir(_ad):
             _h5s.extend(sorted(glob.glob(os.path.join(_ad, "**/lap_*.h5"), recursive=True)))
@@ -398,12 +396,12 @@ def main():
     np.savez(_norm_path, mean=state_mean, std=state_std)
     print(f"  Normalizzazione stati salvata: {_norm_path} (mean/std su {len(_all_states)} stati 29D)")
 
-    # Crea la rete neurale
+    # Create the neural network
     model = PolicyNetwork(state_dim=state_dim)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Parametri totali: {total_params:,}")
 
-    # Crea il trainer della rete neurale
+    # Create the neural-network trainer
     trainer = BehaviorCloningTrainer(
         model=model,
         dataset=dataset,
@@ -414,7 +412,7 @@ def main():
         state_std=state_std
     )
 
-    # Avvia l'addestramento
+    # Start the training
     trainer.train(max_epochs=args.epochs, checkpoint_path=args.output, patience=100)
 
     print("\n  Addestramento Behavioral Cloning completato.")

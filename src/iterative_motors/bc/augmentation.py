@@ -1,13 +1,12 @@
-"""Data augmentation Bojarski-style per la Behavioral Cloning.
+"""Bojarski-style data augmentation for Behavioral Cloning.
 
-Simula viewpoint shift laterali/angolari sugli stati 29D (per ciascuno dei 3 frame
-impilati) e corregge i target per insegnare il rientro verso il centro pista. Tutti i
-parametri sono in ``AugmentConfig`` (CLI/config), così da poterli tarare.
+Simulates lateral/angular viewpoint shifts on the 29D states (for each of the 3 stacked frames)
+and corrects the targets to teach recovery toward the track center. All parameters are in
+``AugmentConfig`` (CLI/config), so they can be tuned.
 
-``on_track_limit`` (clamp on-track): se impostato, il trackPos perturbato non supera mai
-il bordo (|trackPos| <= limite), quindi la rete impara il recupero verso il centro da pose
-*ancora in pista*, mai a guidare fuori pista. Con ``None`` il clamp è disattivato
-(comportamento storico).
+``on_track_limit`` (on-track clamp): if set, the perturbed trackPos never exceeds the edge
+(|trackPos| <= limit), so the network learns recovery toward the center from poses *still on
+track*, never to drive off track. With ``None`` the clamp is disabled (historical behaviour).
 """
 
 import math
@@ -17,34 +16,34 @@ import torch
 
 from ..common.constants import SENSOR_ANGLES_DEG, STATE_DIM
 
-# Angoli dei 19 raggi in radianti (coerenti col client SCR), per la perturbazione geometrica.
+# Angles of the 19 rays in radians (consistent with the SCR client), for the geometric perturbation.
 _ALPHA_RAD = tuple(math.radians(a) for a in SENSOR_ANGLES_DEG)
 _DEG45_RAD = math.radians(45.0)
 
 
 @dataclass
 class AugmentConfig:
-    """Parametri della data augmentation Bojarski-style.
+    """Bojarski-style data-augmentation parameters.
 
-    Default aggiornati (Iterative Motors): clamp on-track attivo e perturbazione angolare
-    più ampia (~10°). Rispetto allo storico (σ angolo 0.04 / clip 0.08 ≈ 4.5°, nessun clamp)
-    questo (a) evita di insegnare a guidare fuori pista — il trackPos perturbato resta entro
-    |0.95| — e (b) amplia il recupero da disallineamenti realistici di metà curva.
+    Updated defaults (Iterative Motors): on-track clamp active and wider angular perturbation
+    (~10°). Compared to the historical version (angle σ 0.04 / clip 0.08 ≈ 4.5°, no clamp) this
+    (a) avoids teaching to drive off track — the perturbed trackPos stays within |0.95| — and
+    (b) widens recovery from realistic mid-corner misalignments.
     """
-    pos_sigma: float = 0.22            # std perturbazione laterale (trackPos)
-    pos_clip: float = 0.45             # clip della perturbazione laterale
-    angle_sigma: float = 0.09          # std perturbazione angolare (rad)
-    angle_clip: float = 0.175          # clip della perturbazione angolare (rad) ~10°
-    aug_prob: float = 0.55            # frazione di campioni a cui applicare l'augmentation
-    w_half_min: float = 4.0           # semi-larghezza pista minima (m)
-    w_half_max: float = 10.0          # semi-larghezza pista massima (m)
-    dy_scale: float = 0.5             # scala dello spostamento laterale fisico
-    steer_corr_pos_gain: float = 0.30  # guadagno correzione sterzo per spostamento laterale
-    steer_corr_angle_gain: float = 1.6  # guadagno correzione sterzo per disallineamento angolare
-    accel_reduce_gain: float = 0.15    # riduzione acceleratore proporzionale alla perturbazione
-    angle_combine_weight: float = 5.0  # peso dell'angolo nella perturbazione combinata
-    on_track_limit: float = 0.95       # clamp on-track del trackPos perturbato (None = off)
-    # Overspeed recovery (frenata preventiva in ingresso curva ad alta velocità)
+    pos_sigma: float = 0.22            # lateral perturbation std (trackPos)
+    pos_clip: float = 0.45             # clip of the lateral perturbation
+    angle_sigma: float = 0.09          # angular perturbation std (rad)
+    angle_clip: float = 0.175          # clip of the angular perturbation (rad) ~10°
+    aug_prob: float = 0.55            # fraction of samples to which the augmentation is applied
+    w_half_min: float = 4.0           # minimum track half-width (m)
+    w_half_max: float = 10.0          # maximum track half-width (m)
+    dy_scale: float = 0.5             # scale of the physical lateral shift
+    steer_corr_pos_gain: float = 0.30  # steering-correction gain for the lateral shift
+    steer_corr_angle_gain: float = 1.6  # steering-correction gain for the angular misalignment
+    accel_reduce_gain: float = 0.15    # throttle reduction proportional to the perturbation
+    angle_combine_weight: float = 5.0  # weight of the angle in the combined perturbation
+    on_track_limit: float = 0.95       # on-track clamp of the perturbed trackPos (None = off)
+    # Overspeed recovery (preventive braking entering a high-speed corner)
     overspeed_prob: float = 0.5
     overspeed_speed_kmh: float = 90.0
     overspeed_steer_thr: float = 0.10
@@ -56,15 +55,15 @@ class AugmentConfig:
 
 
 def augment_batch(states, targets, cfg: AugmentConfig):
-    """Applica l'augmentation a un batch di stati (B,3,29) e ai target (B,3). Modifica in-place.
+    """Applies the augmentation to a batch of states (B,3,29) and targets (B,3). Modifies in-place.
 
-    Ritorna (states, targets). Lo stato è raw-scaled (non z-scored): la normalizzazione va
-    applicata DOPO questa funzione.
+    Returns (states, targets). The state is raw-scaled (not z-scored): normalization must be applied
+    AFTER this function.
     """
     batch_size = states.size(0)
     device = states.device
 
-    # Perturbazioni laterale e angolare, con gating (frazione aug_prob dei campioni).
+    # Lateral and angular perturbations, with gating (aug_prob fraction of the samples).
     delta_pos = torch.clamp(torch.randn(batch_size, device=device) * cfg.pos_sigma, -cfg.pos_clip, cfg.pos_clip)
     delta_angle = torch.clamp(torch.randn(batch_size, device=device) * cfg.angle_sigma, -cfg.angle_clip, cfg.angle_clip)
     aug_mask = (torch.rand(batch_size, device=device) < cfg.aug_prob).float()
@@ -73,23 +72,23 @@ def augment_batch(states, targets, cfg: AugmentConfig):
 
     alpha = torch.tensor(_ALPHA_RAD, device=device)
 
-    # Spostamento laterale effettivo (clampato on-track se richiesto); l'ultimo frame (t)
-    # fornisce il valore usato per la correzione dei target, coerente con la posa corrente.
+    # Effective lateral shift (clamped on-track if requested); the last frame (t) provides the
+    # value used for the target correction, consistent with the current pose.
     dpos_eff_last = delta_pos
     for f_idx in range(3):
         frame_states = states[:, f_idx, :]
 
         angle = frame_states[:, 0]
-        L_0 = frame_states[:, 1] * 200.0    # sensore -45°
-        L_18 = frame_states[:, 19] * 200.0  # sensore +45°
+        L_0 = frame_states[:, 1] * 200.0    # sensor -45°
+        L_18 = frame_states[:, 19] * 200.0  # sensor +45°
         W_L = L_18 * torch.sin(angle + _DEG45_RAD)
         W_R = L_0 * torch.sin(_DEG45_RAD - angle)
         W_half = torch.clamp((W_L + W_R) / 2.0, cfg.w_half_min, cfg.w_half_max)
 
         orig_pos = frame_states[:, 20]
         if cfg.on_track_limit is not None:
-            # Clamp on-track: il trackPos perturbato resta entro i bordi; la perturbazione
-            # effettiva è la differenza realizzata (non spinge mai oltre il limite).
+            # On-track clamp: the perturbed trackPos stays within the edges; the effective
+            # perturbation is the realized difference (it never pushes beyond the limit).
             target_pos = torch.clamp(orig_pos + delta_pos, -cfg.on_track_limit, cfg.on_track_limit)
             dpos_eff = target_pos - orig_pos
         else:
@@ -101,26 +100,26 @@ def augment_batch(states, targets, cfg: AugmentConfig):
         frame_states[:, 20] = target_pos
         frame_states[:, 0] = frame_states[:, 0] + delta_angle
 
-        # Perturbazione geometricamente coerente dei 19 raggi (laterale + angolare).
+        # Geometrically consistent perturbation of the 19 rays (lateral + angular).
         perturbed_angle = frame_states[:, 0]
         beta = perturbed_angle.unsqueeze(1) + alpha.unsqueeze(0)
         dL = -dy.unsqueeze(1) * torch.sin(beta)
         frame_states[:, 1:20] = torch.clamp(frame_states[:, 1:20] + dL / 200.0, 0.0, 1.0)
 
-    # Correzione del target di sterzo (rientro verso il centro + riallineamento angolare).
+    # Steering target correction (recovery toward the center + angular realignment).
     targets[:, 0] = targets[:, 0] - cfg.steer_corr_pos_gain * dpos_eff_last - cfg.steer_corr_angle_gain * delta_angle
     targets[:, 0] = torch.clamp(targets[:, 0], -1.0, 1.0)
 
-    # Parzializzazione dell'acceleratore in funzione dell'entità della perturbazione.
+    # Throttle partialization as a function of the perturbation magnitude.
     combined_perturbation = dpos_eff_last.abs() + delta_angle.abs() * cfg.angle_combine_weight
     targets[:, 1] = targets[:, 1] * (1.0 - cfg.accel_reduce_gain * combined_perturbation)
     targets[:, 1] = torch.clamp(targets[:, 1], 0.0, 1.0)
 
-    # Overspeed recovery: alta velocità in ingresso curva -> meno gas, più freno.
+    # Overspeed recovery: high speed entering a corner -> less throttle, more brake.
     if torch.rand(1).item() < cfg.overspeed_prob:
         speedX_latest = states[:, 2, 21] * 50.0
         steer_target_abs = targets[:, 0].abs()
-        sensor_front_latest = states[:, 2, 10]  # raggio a 0°
+        sensor_front_latest = states[:, 2, 10]  # ray at 0°
         is_speed_critical = (speedX_latest > cfg.overspeed_speed_kmh) & (
             (steer_target_abs > cfg.overspeed_steer_thr) | (sensor_front_latest < cfg.overspeed_front_thr)
         )
